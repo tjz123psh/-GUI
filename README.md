@@ -53,6 +53,7 @@ git clone https://github.com/tjz123psh/-GUI.git ~/.local/src/rjsupplicant-gui
 - 从 `RG_Supplicant_For_Linux*.zip` 安装官方客户端
 - 生成 `~/.local/bin/rjsupplicant` wrapper
 - 官方客户端就绪时，生成 `/etc/systemd/system/rjsupplicant.service`
+- 在 GUI 中点击“开机自启”会按当前账号、网卡、DHCP 设置重写 service 并启用
 
 官方客户端 zip 会自动从这些位置查找：
 

@@ -230,7 +230,7 @@ pub fn build(app: &adw::Application) {
     let enable_btn = action_button(
         "system-run-symbolic",
         "开机自启",
-        "启用并立即启动 rjsupplicant.service",
+        "按当前账号、网卡和 DHCP 设置重写并启用 rjsupplicant.service",
         false,
         false,
     );
@@ -375,13 +375,30 @@ fn connect_actions(
     refresh_btn.connect_clicked(move |_| refresh_status(&refresh_ui));
 
     let enable_ui = ui.clone();
-    enable_btn.connect_clicked(move |_| match system::enable_service() {
-        Ok(()) => {
-            append_log(&enable_ui, "已请求启用开机自启。");
-            toast(&enable_ui, "已请求启用自启");
-            refresh_status(&enable_ui);
+    enable_btn.connect_clicked(move |_| {
+        let Some(settings) = collect_settings(&enable_ui) else {
+            return;
+        };
+
+        if let Err(err) = config::save(&settings) {
+            toast(&enable_ui, &format!("设置保存失败：{err}"));
+            return;
         }
-        Err(err) => toast(&enable_ui, &format!("启用自启失败：{err}")),
+
+        match system::enable_service(&settings) {
+            Ok(()) => {
+                append_log(
+                    &enable_ui,
+                    &format!(
+                        "已按当前设置启用开机自启：账号={}，网卡={}，DHCP={}。",
+                        settings.username, settings.nic, settings.dhcp
+                    ),
+                );
+                toast(&enable_ui, "已启用自启");
+                refresh_status(&enable_ui);
+            }
+            Err(err) => toast(&enable_ui, &format!("启用自启失败：{err}")),
+        }
     });
 
     let disable_ui = ui.clone();

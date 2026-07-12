@@ -1,8 +1,11 @@
 use crate::config::{self, SERVICE, Settings};
 use anyhow::{Context, Result};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+
+const SERVICE_PATH: &str = "/etc/systemd/system/rjsupplicant.service";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommandSpec {
@@ -63,9 +66,10 @@ pub fn disconnect() -> Result<()> {
     run_elevated(Action::Disconnect, &spec.program, &spec.args)
 }
 
-pub fn enable_service() -> Result<()> {
+pub fn enable_service(settings: &Settings) -> Result<()> {
+    install_service(settings)?;
     let spec = enable_service_command();
-    run_elevated(Action::EnableService, &spec.program, &spec.args)
+    run_elevated_wait(Action::EnableService, &spec.program, &spec.args)
 }
 
 pub fn disable_service() -> Result<()> {
@@ -100,6 +104,100 @@ fn run_elevated(action: Action, program: &str, args: &[String]) -> Result<()> {
     let mut terminal_args = vec!["sudo".to_string(), program.to_string()];
     terminal_args.extend(args.iter().cloned());
     run_terminal(action_label(&action), &terminal_args)
+}
+
+fn run_elevated_wait(action: Action, program: &str, args: &[String]) -> Result<()> {
+    if command_exists("pkexec") {
+        let status = Command::new("pkexec")
+            .arg(program)
+            .args(args)
+            .status()
+            .with_context(|| format!("无法启动系统授权：{}", action_label(&action)))?;
+
+        if status.success() {
+            return Ok(());
+        }
+
+        anyhow::bail!("{} 执行失败：{}", action_label(&action), status);
+    }
+
+    run_elevated(action, program, args)
+}
+
+fn install_service(settings: &Settings) -> Result<()> {
+    if !config::client_path().exists() || !config::client_binary_path().exists() {
+        anyhow::bail!("官方客户端未安装，请先运行 scripts/install.sh 并放入官方客户端 zip");
+    }
+
+    write_root_file(SERVICE_PATH, &service_file(settings))?;
+    run_elevated_wait(
+        Action::EnableService,
+        "systemctl",
+        &["daemon-reload".to_string()],
+    )
+}
+
+fn write_root_file(path: &str, content: &str) -> Result<()> {
+    if !command_exists("pkexec") {
+        anyhow::bail!("找不到 pkexec，无法写入 {}", path);
+    }
+
+    let mut child = Command::new("pkexec")
+        .arg("tee")
+        .arg(path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()
+        .with_context(|| format!("无法请求管理员授权写入 {}", path))?;
+
+    child
+        .stdin
+        .as_mut()
+        .context("无法写入 systemd 服务内容")?
+        .write_all(content.as_bytes())?;
+
+    let status = child.wait()?;
+    if status.success() {
+        return Ok(());
+    }
+
+    anyhow::bail!("写入 {} 失败：{}", path, status);
+}
+
+pub fn service_file(settings: &Settings) -> String {
+    let dhcp = if settings.dhcp { "1" } else { "0" };
+    let save = if settings.save_password { "1" } else { "0" };
+    let client = config::path_string(&config::client_path());
+    let workdir = config::path_string(
+        config::client_binary_path()
+            .parent()
+            .unwrap_or_else(|| Path::new("/")),
+    );
+
+    format!(
+        "[Unit]\n\
+         Description=Ruijie RG-SU wired authentication client\n\
+         After=NetworkManager.service network-online.target\n\
+         Wants=NetworkManager.service network-online.target\n\
+         \n\
+         [Service]\n\
+         Type=simple\n\
+         ExecStart={} -a 1 -d {} -n {} -u {} -S {}\n\
+         ExecStop={} -q\n\
+         Restart=on-failure\n\
+         RestartSec=10\n\
+         WorkingDirectory={}\n\
+         \n\
+         [Install]\n\
+         WantedBy=multi-user.target\n",
+        client,
+        dhcp,
+        settings.nic.trim(),
+        settings.username.trim(),
+        save,
+        client,
+        workdir
+    )
 }
 
 pub fn authenticate_command(settings: &Settings, password: &str) -> CommandSpec {
@@ -347,5 +445,15 @@ mod tests {
                 ]
             }
         );
+    }
+
+    #[test]
+    fn builds_service_file_from_current_settings() {
+        let content = service_file(&settings());
+
+        assert!(content.contains("ExecStart="));
+        assert!(content.contains("-a 1 -d 1 -n enp4s0 -u 20260001 -S 1"));
+        assert!(content.contains("ExecStop="));
+        assert!(content.contains("WantedBy=multi-user.target"));
     }
 }

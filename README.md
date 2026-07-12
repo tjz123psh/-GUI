@@ -1,6 +1,8 @@
 # rjsupplicant-gui
 
-GDUFS 有线锐捷认证的原生 GTK/libadwaita 客户端壳。
+面向 Arch Linux 的 GDUFS 有线锐捷认证原生 GTK/libadwaita 客户端。
+
+这个仓库的目标是：在 Arch Linux 重装后，通过一条安装脚本完成 GUI、官方客户端 wrapper、桌面入口和 systemd 服务的安装，不需要手动考虑文件放在哪里。
 
 它不重写锐捷协议，而是调用安装脚本生成的官方 Linux 客户端 wrapper：
 

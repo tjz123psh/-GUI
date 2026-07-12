@@ -52,7 +52,7 @@ git clone https://github.com/tjz123psh/-GUI.git ~/.local/src/rjsupplicant-gui
 - 安装桌面入口，并删除旧的终端启动器入口
 - 从 `RG_Supplicant_For_Linux*.zip` 安装官方客户端
 - 生成 `~/.local/bin/rjsupplicant` wrapper
-- 生成 `/etc/systemd/system/rjsupplicant.service`
+- 官方客户端就绪时，生成 `/etc/systemd/system/rjsupplicant.service`
 
 官方客户端 zip 会自动从这些位置查找：
 

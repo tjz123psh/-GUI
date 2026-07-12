@@ -28,7 +28,7 @@ pub enum Action {
 
 pub fn load_status() -> ClientStatus {
     ClientStatus {
-        client_installed: config::client_path().exists(),
+        client_installed: config::client_path().exists() && config::client_binary_path().exists(),
         service_enabled: command_text("systemctl", &["is-enabled", SERVICE])
             .unwrap_or_else(|| "unknown".to_string()),
         service_active: command_text("systemctl", &["is-active", SERVICE])

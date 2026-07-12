@@ -25,6 +25,20 @@ need_cmd() {
   command -v "$1" >/dev/null 2>&1
 }
 
+current_arch_dir() {
+  if [[ "$(getconf LONG_BIT)" == "64" ]]; then
+    printf '%s\n' "${APP_DIR}/x64"
+  else
+    printf '%s\n' "${APP_DIR}/x86"
+  fi
+}
+
+official_client_ready() {
+  local arch_dir
+  arch_dir="$(current_arch_dir)"
+  [[ -x "${BIN_DIR}/rjsupplicant" && -x "${arch_dir}/rjsupplicant" ]]
+}
+
 install_system_deps() {
   if [[ "${SKIP_SYSTEM_DEPS:-0}" == "1" ]]; then
     log "跳过系统依赖安装。"
@@ -65,7 +79,7 @@ install_official_client() {
   local zip_path
   zip_path="$(find_official_zip || true)"
   if [[ -z "${zip_path}" ]]; then
-    if [[ -x "${BIN_DIR}/rjsupplicant" && -x "${APP_DIR}/x64/rjsupplicant" || -x "${APP_DIR}/x86/rjsupplicant" ]]; then
+    if official_client_ready; then
       log "官方客户端已存在，跳过安装。"
       return
     fi
@@ -106,9 +120,13 @@ EOF
 
 install_service() {
   local service_tmp
-  local arch_dir="${APP_DIR}/x64"
-  if [[ "$(getconf LONG_BIT)" != "64" ]]; then
-    arch_dir="${APP_DIR}/x86"
+  local arch_dir
+  arch_dir="$(current_arch_dir)"
+
+  if ! official_client_ready; then
+    log "官方客户端未就绪，跳过 systemd 服务安装。"
+    log "放入官方客户端 zip 后重新运行 scripts/install.sh，会自动生成 ${SERVICE_NAME}。"
+    return
   fi
 
   service_tmp="$(mktemp)"

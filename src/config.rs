@@ -76,13 +76,16 @@ pub fn client_path() -> PathBuf {
     bin_dir().join("rjsupplicant")
 }
 
+pub fn client_binary_path() -> PathBuf {
+    data_dir().join(arch_dir()).join("rjsupplicant")
+}
+
 pub fn data_dir() -> PathBuf {
     data_home().join("rjsupplicant")
 }
 
 pub fn log_path() -> PathBuf {
-    let arch_dir = if is_64_bit() { "x64" } else { "x86" };
-    data_dir().join(arch_dir).join("log/run.log")
+    data_dir().join(arch_dir()).join("log/run.log")
 }
 
 pub fn path_string(path: &Path) -> String {
@@ -109,6 +112,10 @@ fn home_dir() -> PathBuf {
 
 fn is_64_bit() -> bool {
     std::mem::size_of::<usize>() == 8
+}
+
+fn arch_dir() -> &'static str {
+    if is_64_bit() { "x64" } else { "x86" }
 }
 
 fn clean_value(value: &str) -> String {

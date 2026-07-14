@@ -1,987 +1,1647 @@
 use crate::{config, system};
 use adw::prelude::*;
+use gtk::{gio, glib};
 use gtk4 as gtk;
 use libadwaita as adw;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::time::Duration;
+
+#[derive(Clone)]
+struct StageUi {
+    dot: gtk::Box,
+    value: gtk::Label,
+}
+
+struct SidebarUi {
+    root: gtk::Box,
+    compact_root: gtk::Box,
+    status_label: gtk::Label,
+    all_buttons: Vec<gtk::Button>,
+    status_buttons: Vec<gtk::Button>,
+    auth_buttons: Vec<gtk::Button>,
+    runtime_buttons: Vec<gtk::Button>,
+    logs_buttons: Vec<gtk::Button>,
+    settings_buttons: Vec<gtk::Button>,
+    about_buttons: Vec<gtk::Button>,
+}
 
 #[derive(Clone)]
 struct AppUi {
-    username: gtk::Entry,
-    password: gtk::PasswordEntry,
-    nic: gtk::DropDown,
-    dhcp: gtk::Switch,
-    save_password: gtk::Switch,
-    status: gtk::Label,
-    status_hint: gtk::Label,
-    log: gtk::TextView,
+    window: adw::ApplicationWindow,
+    stack: adw::ViewStack,
+    username: adw::EntryRow,
+    password: adw::PasswordEntryRow,
+    nic: adw::ComboRow,
+    nic_model: gtk::StringList,
+    dhcp: adw::SwitchRow,
+    save_password: adw::SwitchRow,
+    autostart: adw::SwitchRow,
+    link_panel: gtk::Box,
+    status_icon: gtk::Image,
+    status_title: gtk::Label,
+    status_detail: gtk::Label,
+    status_badge: gtk::Label,
+    status_spinner: adw::Spinner,
+    cable_stage: StageUi,
+    client_stage: StageUi,
+    process_stage: StageUi,
+    uptime_stage: StageUi,
+    client_row: adw::ActionRow,
+    interface_row: adw::ActionRow,
+    service_row: adw::ActionRow,
+    action_btn: gtk::Button,
+    disconnect_btn: gtk::Button,
+    save_btn: gtk::Button,
+    header_refresh_btn: gtk::Button,
+    log_refresh_btn: gtk::Button,
+    live_log_btn: gtk::Button,
+    diagnostics_btn: gtk::Button,
+    connectivity_btn: gtk::Button,
+    restart_btn: gtk::Button,
+    client_folder_btn: gtk::Button,
+    help_btn: gtk::Button,
+    sidebar_status: gtk::Label,
+    client_banner: adw::Banner,
+    log_buffer: gtk::TextBuffer,
+    log_preview: gtk::TextView,
+    log_full: gtk::TextView,
     toasts: adw::ToastOverlay,
     nics: Rc<RefCell<Vec<String>>>,
+    last_status: Rc<RefCell<Option<system::ClientStatus>>>,
+    busy: Rc<Cell<bool>>,
+    refreshing: Rc<Cell<bool>>,
+    autostart_guard: Rc<Cell<bool>>,
 }
 
 pub fn build(app: &adw::Application) {
-    let settings = config::load();
-    let nics = Rc::new(RefCell::new(system::wired_interfaces()));
-    let toasts = adw::ToastOverlay::new();
+    if let Some(window) = app.active_window() {
+        window.present();
+        return;
+    }
 
+    let settings = config::load();
+    let interface_names = system::wired_interfaces();
+    let selected = preferred_nic_index(&interface_names, &settings.nic);
+    let nics = Rc::new(RefCell::new(interface_names));
+    let nic_model =
+        gtk::StringList::new(&nics.borrow().iter().map(String::as_str).collect::<Vec<_>>());
+
+    let toasts = adw::ToastOverlay::new();
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("锐捷有线认证")
-        .default_width(980)
-        .default_height(720)
+        .default_width(960)
+        .default_height(760)
+        .width_request(420)
+        .height_request(520)
         .content(&toasts)
         .build();
 
-    let shell = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .css_classes(["app-shell"])
+    let toolbar = adw::ToolbarView::new();
+    toolbar.add_css_class("app-shell");
+    toasts.set_child(Some(&toolbar));
+
+    let stack = adw::ViewStack::new();
+    stack.set_hexpand(true);
+    stack.set_vexpand(true);
+    let header_switcher = adw::ViewSwitcher::builder()
+        .stack(&stack)
+        .policy(adw::ViewSwitcherPolicy::Wide)
+        .visible(false)
         .build();
-    toasts.set_child(Some(&shell));
+    let bottom_switcher = adw::ViewSwitcherBar::builder()
+        .stack(&stack)
+        .reveal(false)
+        .css_classes(["navigation-bar"])
+        .build();
 
-    shell.append(&app_header());
+    let header = adw::HeaderBar::new();
+    header.set_title_widget(Some(&gtk::Box::new(gtk::Orientation::Horizontal, 0)));
+    let header_refresh_btn = icon_button("view-refresh-symbolic", "刷新状态");
+    header.pack_end(&header_refresh_btn);
+    toolbar.add_top_bar(&header);
+    toolbar.add_bottom_bar(&bottom_switcher);
 
-    let page = gtk::ScrolledWindow::builder()
+    let client_banner = adw::Banner::builder()
+        .title("未安装官方锐捷客户端，连接功能不可用")
+        .button_label("查看安装方法")
+        .revealed(false)
+        .build();
+    toolbar.add_top_bar(&client_banner);
+
+    let sidebar = sidebar_navigation();
+    let app_body = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .hexpand(true)
         .vexpand(true)
+        .build();
+    app_body.append(&sidebar.root);
+    app_body.append(&sidebar.compact_root);
+    app_body.append(&stack);
+    toolbar.set_content(Some(&app_body));
+
+    let connection_page = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
+        .vexpand(true)
         .build();
-    shell.append(&page);
-
-    let root = gtk::Box::builder()
+    let connection_content = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
-        .spacing(18)
-        .margin_top(18)
-        .margin_bottom(18)
-        .margin_start(24)
-        .margin_end(24)
+        .spacing(16)
+        .margin_top(16)
+        .margin_bottom(16)
+        .margin_start(16)
+        .margin_end(16)
         .build();
-    page.set_child(Some(&root));
-
-    root.append(&brand_header());
-    root.append(&hero_panel());
-
-    let main_grid = gtk::Grid::builder()
-        .column_spacing(18)
-        .row_spacing(18)
-        .hexpand(true)
+    let connection_clamp = adw::Clamp::builder()
+        .maximum_size(1500)
+        .tightening_threshold(1250)
+        .child(&connection_content)
         .build();
-    root.append(&main_grid);
-
-    let form_panel = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(0)
-        .hexpand(true)
-        .css_classes(["panel"])
-        .build();
-    main_grid.attach(&form_panel, 0, 0, 1, 1);
-
-    form_panel.append(&section_header(
-        "账号与认证",
-        "密码留空时使用官方客户端已保存的密码；只有首次保存或修改时才填写。",
-    ));
-
-    let username = gtk::Entry::builder()
-        .placeholder_text("请输入校园网账号")
-        .text(&settings.username)
-        .width_request(260)
-        .css_classes(["compact-input"])
-        .build();
-    form_panel.append(&setting_row(
-        "avatar-default-symbolic",
-        "校园网账号",
-        "用于有线网络认证的校园网账号",
-        &username,
-        false,
-    ));
-
-    let password = gtk::PasswordEntry::builder()
-        .placeholder_text("不修改则留空")
-        .show_peek_icon(true)
-        .width_request(260)
-        .css_classes(["compact-input"])
-        .build();
-    form_panel.append(&setting_row(
-        "dialog-password-symbolic",
-        "本次修改密码",
-        "留空会复用官方客户端保存的密码，不会覆盖密码",
-        &password,
-        false,
-    ));
-
-    let nic_model = gtk::StringList::new(
-        &nics
-            .borrow()
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<&str>>(),
-    );
-    let nic = gtk::DropDown::builder()
-        .model(&nic_model)
-        .width_request(150)
-        .css_classes(["compact-select"])
-        .build();
-    select_default_nic(&nic, &nics.borrow(), &settings.nic);
-    form_panel.append(&setting_row(
+    connection_page.set_child(Some(&connection_clamp));
+    stack.add_titled_with_icon(
+        &connection_page,
+        Some("connection"),
+        "连接",
         "network-wired-symbolic",
-        "有线网卡",
-        "通常是 eno1，插线后可刷新确认",
-        &nic,
-        false,
-    ));
+    );
 
-    let dhcp = gtk::Switch::builder()
-        .active(settings.dhcp)
-        .valign(gtk::Align::Center)
-        .build();
-    form_panel.append(&setting_row(
-        "network-workgroup-symbolic",
-        "DHCP",
-        "学校有线网一般保持开启",
-        &dhcp,
-        false,
-    ));
-
-    let save_password = gtk::Switch::builder()
-        .active(settings.save_password)
-        .valign(gtk::Align::Center)
-        .build();
-    form_panel.append(&setting_row(
-        "changes-allow-symbolic",
-        "保存密码到官方客户端",
-        "开启后，本次填写的密码会交给官方客户端保存",
-        &save_password,
-        true,
-    ));
-
-    let side_panel = gtk::Box::builder()
+    let link_panel = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
-        .spacing(14)
-        .width_request(340)
-        .css_classes(["panel"])
+        .spacing(20)
+        .css_classes(["link-panel", "state-idle"])
         .build();
-    main_grid.attach(&side_panel, 1, 0, 1, 1);
+    connection_content.append(&link_panel);
 
-    side_panel.append(&status_card());
-
-    let status = gtk::Label::builder()
-        .label("客户端：检查中\n服务：检查中\n网卡：eno1")
-        .halign(gtk::Align::Start)
-        .margin_start(18)
-        .margin_end(18)
-        .wrap(true)
-        .css_classes(["status-copy"])
+    let link_top = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(24)
         .build();
-    let status_hint = gtk::Label::builder()
-        .label("准备就绪")
-        .halign(gtk::Align::Start)
-        .margin_start(18)
-        .margin_end(18)
-        .wrap(true)
-        .css_classes(["hint"])
-        .build();
-    side_panel.append(&status);
-    side_panel.append(&status_hint);
+    link_panel.append(&link_top);
 
-    let buttons = gtk::Grid::builder()
-        .column_spacing(12)
-        .row_spacing(12)
-        .margin_top(4)
-        .margin_bottom(18)
-        .margin_start(18)
-        .margin_end(18)
+    let status_icon = gtk::Image::from_icon_name("network-offline-symbolic");
+    status_icon.set_pixel_size(28);
+    let icon_wrap = gtk::Box::builder()
+        .halign(gtk::Align::Center)
+        .valign(gtk::Align::Center)
+        .css_classes(["link-icon"])
+        .build();
+    icon_wrap.append(&status_icon);
+    link_top.append(&icon_wrap);
+
+    let status_copy = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(5)
         .hexpand(true)
+        .valign(gtk::Align::Center)
         .build();
-    side_panel.append(&buttons);
+    link_top.append(&status_copy);
+    status_copy.append(
+        &gtk::Label::builder()
+            .label("eno1 · 有线认证")
+            .halign(gtk::Align::Start)
+            .css_classes(["technical-label"])
+            .build(),
+    );
 
-    let auth_btn = action_button(
+    let status_title_line = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(10)
+        .build();
+    status_copy.append(&status_title_line);
+    let status_title = gtk::Label::builder()
+        .label("正在读取链路状态")
+        .halign(gtk::Align::Start)
+        .hexpand(true)
+        .wrap(true)
+        .xalign(0.0)
+        .css_classes(["status-title"])
+        .build();
+    status_title_line.append(&status_title);
+    let status_spinner = adw::Spinner::builder()
+        .width_request(18)
+        .height_request(18)
+        .visible(true)
+        .build();
+    status_title_line.append(&status_spinner);
+    let status_badge = gtk::Label::builder()
+        .label("检查中")
+        .valign(gtk::Align::Center)
+        .css_classes(["state-badge", "badge-idle"])
+        .build();
+    status_title_line.append(&status_badge);
+    let status_detail = gtk::Label::builder()
+        .label("正在检查网线、官方客户端和认证进程")
+        .halign(gtk::Align::Start)
+        .wrap(true)
+        .xalign(0.0)
+        .css_classes(["status-detail"])
+        .build();
+    status_copy.append(&status_detail);
+
+    let action_btn = text_action_button(
         "network-transmit-receive-symbolic",
         "连接网络",
-        "使用当前账号、网卡和 DHCP 设置发起有线认证",
-        true,
-        false,
+        &["primary-action", "suggested-action"],
     );
-    let save_btn = action_button(
-        "document-save-symbolic",
-        "保存设置",
-        "只保存账号、网卡和开关设置，不保存密码",
-        false,
-        false,
-    );
-    let refresh_btn = action_button(
-        "view-refresh-symbolic",
-        "刷新状态",
-        "重新读取客户端、systemd 服务和日志状态",
-        false,
-        false,
-    );
-    let disconnect_btn = action_button(
+    let disconnect_btn = text_action_button(
         "network-offline-symbolic",
         "断开连接",
-        "退出正在运行的锐捷认证客户端",
-        false,
-        false,
+        &["secondary-action"],
     );
-    let logs_btn = action_button(
-        "text-x-generic-symbolic",
-        "实时日志",
-        "打开 rjsupplicant.service 的实时日志窗口",
-        false,
-        false,
-    );
-    let enable_btn = action_button(
-        "system-run-symbolic",
-        "开机自启",
-        "按当前账号、网卡和 DHCP 设置重写并启用 rjsupplicant.service",
-        false,
-        false,
-    );
-    let disable_btn = action_button(
-        "window-close-symbolic",
-        "取消自启",
-        "禁用并停止 rjsupplicant.service",
-        false,
-        true,
-    );
+    let action_wrap = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(12)
+        .homogeneous(true)
+        .width_request(460)
+        .halign(gtk::Align::End)
+        .valign(gtk::Align::Center)
+        .build();
+    action_wrap.append(&action_btn);
+    action_wrap.append(&disconnect_btn);
+    link_top.append(&action_wrap);
 
-    buttons.attach(&auth_btn, 0, 0, 2, 1);
-    buttons.attach(&save_btn, 0, 1, 1, 1);
-    buttons.attach(&refresh_btn, 1, 1, 1, 1);
-    buttons.attach(&disconnect_btn, 0, 2, 1, 1);
-    buttons.attach(&logs_btn, 1, 2, 1, 1);
-    buttons.attach(&enable_btn, 0, 3, 1, 1);
-    buttons.attach(&disable_btn, 1, 3, 1, 1);
+    let stage_rail = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(10)
+        .homogeneous(true)
+        .css_classes(["stage-rail"])
+        .build();
+    link_panel.append(&stage_rail);
+    let (cable_widget, cable_stage) = stage_widget("network-wired-symbolic", "网线");
+    let (client_widget, client_stage) = stage_widget("application-x-executable-symbolic", "客户端");
+    let (process_widget, process_stage) =
+        stage_widget("network-transmit-receive-symbolic", "认证进程");
+    let (uptime_widget, uptime_stage) =
+        stage_widget("preferences-system-time-symbolic", "运行时长");
+    stage_rail.append(&cable_widget);
+    stage_rail.append(&client_widget);
+    stage_rail.append(&process_widget);
+    stage_rail.append(&uptime_widget);
 
+    let columns = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(28)
+        .hexpand(true)
+        .build();
+    connection_content.append(&columns);
+
+    let form_column = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(14)
+        .hexpand(true)
+        .css_classes(["dashboard-card"])
+        .build();
+    columns.append(&form_column);
+
+    let credentials_group = adw::PreferencesGroup::builder()
+        .title("认证信息")
+        .description("连接时自动保存账号和连接选项；密码不会保存在本应用中")
+        .build();
+    form_column.append(&credentials_group);
+    let username = adw::EntryRow::builder()
+        .title("校园网账号")
+        .text(&settings.username)
+        .input_purpose(gtk::InputPurpose::FreeForm)
+        .build();
+    credentials_group.add(&username);
+    let password = adw::PasswordEntryRow::builder()
+        .title("本次使用的新密码（可选）")
+        .build();
+    credentials_group.add(&password);
+    let nic = adw::ComboRow::builder()
+        .title("有线网卡")
+        .subtitle("仅显示物理以太网接口")
+        .model(&nic_model)
+        .selected(selected as u32)
+        .build();
+    credentials_group.add(&nic);
+
+    let connection_group = adw::PreferencesGroup::builder().title("连接方式").build();
+    form_column.append(&connection_group);
+    let dhcp = adw::SwitchRow::builder()
+        .title("自动获取网络地址")
+        .subtitle("校园有线网络通常需要 DHCP")
+        .build();
+    dhcp.set_active(settings.dhcp);
+    connection_group.add(&dhcp);
+    let save_password = adw::SwitchRow::builder()
+        .title("交给官方客户端保存密码")
+        .subtitle("关闭后，本次密码仅用于当前认证")
+        .build();
+    save_password.set_active(settings.save_password);
+    connection_group.add(&save_password);
+    let autostart = adw::SwitchRow::builder()
+        .title("开机自动认证")
+        .subtitle("按当前账号和网卡写入系统服务")
+        .build();
+
+    let save_btn = gtk::Button::builder()
+        .label("保存设置")
+        .tooltip_text("保存账号、网卡和连接选项，不包含密码")
+        .halign(gtk::Align::End)
+        .css_classes(["flat"])
+        .build();
+    form_column.append(&save_btn);
+
+    let side_preview = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(14)
+        .width_request(360)
+        .hexpand(true)
+        .css_classes(["dashboard-card"])
+        .build();
+    columns.append(&side_preview);
+    side_preview.append(&section_heading("开机认证", "系统启动时自动认证"));
+    let service_switch_group = adw::PreferencesGroup::new();
+    service_switch_group.add(&autostart);
+    side_preview.append(&service_switch_group);
+    side_preview.append(&section_heading("运行说明", "官方客户端的权限与状态边界"));
+
+    let status_group = adw::PreferencesGroup::new();
+    side_preview.append(&status_group);
+    let client_row = status_row("application-x-executable-symbolic", "官方客户端");
+    let interface_row = status_row("network-wired-symbolic", "有线链路");
+    let service_row = status_row("system-run-symbolic", "开机认证");
+    status_group.add(&client_row);
+    status_group.add(&interface_row);
+    status_group.add(&service_row);
+
+    let quick_column = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(12)
+        .width_request(360)
+        .hexpand(true)
+        .css_classes(["dashboard-card", "quick-card"])
+        .build();
+    columns.append(&quick_column);
+    quick_column.append(&section_heading("快捷操作", "常用诊断和客户端工具"));
+    let connectivity_btn = quick_action_button(
+        "network-transmit-receive-symbolic",
+        "测试网络连通性",
+        "检测当前网络是否可以访问公网",
+    );
+    let restart_btn = quick_action_button(
+        "view-refresh-symbolic",
+        "重启认证服务",
+        "重新启动 rjsupplicant.service",
+    );
+    let client_folder_btn = quick_action_button(
+        "folder-open-symbolic",
+        "打开客户端目录",
+        "查看官方客户端和日志文件",
+    );
+    let help_btn = quick_action_button(
+        "help-browser-symbolic",
+        "查看帮助文档",
+        "打开学校有线认证说明",
+    );
+    for button in [
+        &connectivity_btn,
+        &restart_btn,
+        &client_folder_btn,
+        &help_btn,
+    ] {
+        quick_column.append(button);
+    }
+
+    let log_buffer = gtk::TextBuffer::new(None);
+    let log_preview = log_view(&log_buffer);
     let log_panel = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(10)
-        .css_classes(["panel", "log-panel"])
+        .css_classes(["dashboard-card", "recent-log-card"])
         .build();
-    root.append(&log_panel);
+    connection_content.append(&log_panel);
+    let preview_header = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(12)
+        .build();
+    log_panel.append(&preview_header);
+    let preview_copy = section_heading("最近日志", "用于判断认证成功、密码错误或网卡异常");
+    preview_copy.set_hexpand(true);
+    preview_header.append(&preview_copy);
+    let diagnostics_btn = gtk::Button::builder()
+        .label("实时日志")
+        .valign(gtk::Align::Center)
+        .css_classes(["outline-accent"])
+        .build();
+    preview_header.append(&diagnostics_btn);
+    let preview_scroller = gtk::ScrolledWindow::builder()
+        .min_content_height(110)
+        .max_content_height(150)
+        .vexpand(false)
+        .child(&log_preview)
+        .css_classes(["log-frame"])
+        .build();
+    log_panel.append(&preview_scroller);
 
-    log_panel.append(&section_header("运行日志", "最近的认证服务输出"));
+    let diagnostics_page = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(18)
+        .margin_top(24)
+        .margin_bottom(24)
+        .margin_start(24)
+        .margin_end(24)
+        .build();
+    let diagnostics_clamp = adw::Clamp::builder()
+        .maximum_size(1400)
+        .tightening_threshold(1100)
+        .child(&diagnostics_page)
+        .build();
+    stack.add_titled_with_icon(
+        &diagnostics_clamp,
+        Some("diagnostics"),
+        "诊断",
+        "utilities-terminal-symbolic",
+    );
 
-    let log = gtk::TextView::builder()
-        .editable(false)
-        .cursor_visible(false)
-        .monospace(true)
+    let diagnostics_header = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(12)
+        .build();
+    diagnostics_page.append(&diagnostics_header);
+    let diagnostics_copy = section_heading("诊断日志", "用于判断密码错误、网卡异常和服务启动问题");
+    diagnostics_copy.set_hexpand(true);
+    diagnostics_header.append(&diagnostics_copy);
+    let log_refresh_btn = gtk::Button::builder()
+        .label("刷新")
+        .icon_name("view-refresh-symbolic")
+        .valign(gtk::Align::Center)
+        .build();
+    let live_log_btn = gtk::Button::builder()
+        .label("实时日志")
+        .valign(gtk::Align::Center)
+        .build();
+    diagnostics_header.append(&log_refresh_btn);
+    diagnostics_header.append(&live_log_btn);
+
+    let log_full = log_view(&log_buffer);
+    let full_log_scroller = gtk::ScrolledWindow::builder()
         .vexpand(true)
-        .css_classes(["log-view"])
+        .min_content_height(360)
+        .child(&log_full)
+        .css_classes(["log-frame", "full-log"])
         .build();
-    log.buffer().set_text("准备就绪。");
+    diagnostics_page.append(&full_log_scroller);
 
-    let log_scroller = gtk::ScrolledWindow::builder()
-        .min_content_height(180)
-        .vexpand(true)
-        .child(&log)
-        .build();
-    log_panel.append(&log_scroller);
+    let connection_action = gio::SimpleAction::new("show-connection", None);
+    let connection_stack = stack.clone();
+    connection_action
+        .connect_activate(move |_, _| connection_stack.set_visible_child_name("connection"));
+    app.add_action(&connection_action);
+    app.set_accels_for_action("app.show-connection", &["<Control>1"]);
+
+    let diagnostics_action = gio::SimpleAction::new("show-diagnostics", None);
+    let diagnostics_stack = stack.clone();
+    diagnostics_action
+        .connect_activate(move |_, _| diagnostics_stack.set_visible_child_name("diagnostics"));
+    app.add_action(&diagnostics_action);
+    app.set_accels_for_action("app.show-diagnostics", &["<Control>2"]);
 
     let ui = AppUi {
+        window,
+        stack,
         username,
         password,
         nic,
+        nic_model,
         dhcp,
         save_password,
-        status,
-        status_hint,
-        log,
+        autostart,
+        link_panel,
+        status_icon,
+        status_title,
+        status_detail,
+        status_badge,
+        status_spinner,
+        cable_stage,
+        client_stage,
+        process_stage,
+        uptime_stage,
+        client_row,
+        interface_row,
+        service_row,
+        action_btn,
+        disconnect_btn,
+        save_btn,
+        header_refresh_btn,
+        log_refresh_btn,
+        live_log_btn,
+        diagnostics_btn,
+        connectivity_btn,
+        restart_btn,
+        client_folder_btn,
+        help_btn,
+        sidebar_status: sidebar.status_label.clone(),
+        client_banner,
+        log_buffer,
+        log_preview,
+        log_full,
         toasts,
         nics,
+        last_status: Rc::new(RefCell::new(None)),
+        busy: Rc::new(Cell::new(false)),
+        refreshing: Rc::new(Cell::new(false)),
+        autostart_guard: Rc::new(Cell::new(false)),
     };
 
-    connect_actions(
-        &ui,
-        &auth_btn,
-        &save_btn,
-        &disconnect_btn,
-        &refresh_btn,
-        &enable_btn,
-        &disable_btn,
-        &logs_btn,
+    install_breakpoints(
+        &ui.window,
+        &connection_clamp,
+        &sidebar,
+        &columns,
+        &link_top,
+        &action_wrap,
+        &ui.action_btn,
+        &header_switcher,
+        &bottom_switcher,
+        &connection_content,
+        &diagnostics_page,
     );
+    connect_actions(&ui);
+    connect_sidebar(&ui, &sidebar, &connection_page);
+    update_controls(&ui);
     refresh_status(&ui);
-
-    window.present();
+    ui.window.present();
 }
 
-fn connect_actions(
-    ui: &AppUi,
-    auth_btn: &gtk::Button,
-    save_btn: &gtk::Button,
-    disconnect_btn: &gtk::Button,
-    refresh_btn: &gtk::Button,
-    enable_btn: &gtk::Button,
-    disable_btn: &gtk::Button,
-    logs_btn: &gtk::Button,
+#[allow(clippy::too_many_arguments)]
+fn install_breakpoints(
+    window: &adw::ApplicationWindow,
+    connection_clamp: &adw::Clamp,
+    sidebar: &SidebarUi,
+    columns: &gtk::Box,
+    link_top: &gtk::Box,
+    action_wrap: &gtk::Box,
+    action_btn: &gtk::Button,
+    header_switcher: &adw::ViewSwitcher,
+    bottom_switcher: &adw::ViewSwitcherBar,
+    connection_content: &gtk::Box,
+    diagnostics_page: &gtk::Box,
 ) {
-    let auth_ui = ui.clone();
-    auth_btn.connect_clicked(move |_| {
-        let Some(settings) = collect_settings(&auth_ui) else {
-            return;
-        };
+    let standard_condition = adw::BreakpointCondition::new_and(
+        adw::BreakpointCondition::new_length(
+            adw::BreakpointConditionLengthType::MinWidth,
+            720.0,
+            adw::LengthUnit::Sp,
+        ),
+        adw::BreakpointCondition::new_length(
+            adw::BreakpointConditionLengthType::MaxWidth,
+            1099.0,
+            adw::LengthUnit::Sp,
+        ),
+    );
+    let standard = adw::Breakpoint::new(standard_condition);
+    standard.add_setter(&sidebar.root, "visible", Some(&false.to_value()));
+    standard.add_setter(&sidebar.compact_root, "visible", Some(&true.to_value()));
+    standard.add_setter(
+        columns,
+        "orientation",
+        Some(&gtk::Orientation::Vertical.to_value()),
+    );
+    standard.add_setter(
+        link_top,
+        "orientation",
+        Some(&gtk::Orientation::Vertical.to_value()),
+    );
+    standard.add_setter(action_wrap, "width-request", Some(&(-1_i32).to_value()));
+    standard.add_setter(action_wrap, "halign", Some(&gtk::Align::Fill.to_value()));
+    standard.add_setter(action_btn, "hexpand", Some(&true.to_value()));
+    standard.add_setter(connection_clamp, "maximum-size", Some(&820_i32.to_value()));
+    window.add_breakpoint(standard);
 
-        if let Err(err) = config::save(&settings) {
-            toast(&auth_ui, &format!("设置保存失败：{err}"));
-            return;
-        }
+    let expanded_condition = adw::BreakpointCondition::new_and(
+        adw::BreakpointCondition::new_length(
+            adw::BreakpointConditionLengthType::MinWidth,
+            1100.0,
+            adw::LengthUnit::Sp,
+        ),
+        adw::BreakpointCondition::new_length(
+            adw::BreakpointConditionLengthType::MaxWidth,
+            1399.0,
+            adw::LengthUnit::Sp,
+        ),
+    );
+    let expanded = adw::Breakpoint::new(expanded_condition);
+    expanded.add_setter(&sidebar.root, "visible", Some(&false.to_value()));
+    expanded.add_setter(&sidebar.compact_root, "visible", Some(&true.to_value()));
+    window.add_breakpoint(expanded);
 
-        match system::authenticate(&settings, auth_ui.password.text().as_str()) {
-            Ok(()) => {
-                let password_note = if auth_ui.password.text().is_empty() {
-                    "未传入密码，使用已保存密码"
-                } else {
-                    "已传入本次填写的密码"
-                };
-                append_log(
-                    &auth_ui,
-                    &format!(
-                        "已请求连接：账号={}，网卡={}，{}。",
-                        settings.username, settings.nic, password_note
-                    ),
-                );
-                auth_ui.password.set_text("");
-                toast(&auth_ui, "已发起认证");
-                refresh_status(&auth_ui);
-            }
-            Err(err) => toast(&auth_ui, &format!("认证启动失败：{err}")),
+    let compact = adw::Breakpoint::new(
+        adw::BreakpointCondition::parse("max-width: 719sp").expect("valid breakpoint"),
+    );
+    compact.add_setter(
+        link_top,
+        "orientation",
+        Some(&gtk::Orientation::Vertical.to_value()),
+    );
+    compact.add_setter(&sidebar.root, "visible", Some(&false.to_value()));
+    compact.add_setter(&sidebar.compact_root, "visible", Some(&false.to_value()));
+    compact.add_setter(
+        columns,
+        "orientation",
+        Some(&gtk::Orientation::Vertical.to_value()),
+    );
+    compact.add_setter(connection_clamp, "maximum-size", Some(&820_i32.to_value()));
+    compact.add_setter(action_wrap, "width-request", Some(&(-1_i32).to_value()));
+    compact.add_setter(action_wrap, "halign", Some(&gtk::Align::Fill.to_value()));
+    compact.add_setter(action_btn, "hexpand", Some(&true.to_value()));
+    compact.add_setter(header_switcher, "visible", Some(&false.to_value()));
+    compact.add_setter(bottom_switcher, "reveal", Some(&true.to_value()));
+    for widget in [connection_content, diagnostics_page] {
+        compact.add_setter(widget, "margin-start", Some(&16_i32.to_value()));
+        compact.add_setter(widget, "margin-end", Some(&16_i32.to_value()));
+        compact.add_setter(widget, "margin-top", Some(&16_i32.to_value()));
+        compact.add_setter(widget, "margin-bottom", Some(&16_i32.to_value()));
+    }
+    window.add_breakpoint(compact);
+}
+
+fn connect_actions(ui: &AppUi) {
+    let username = ui.username.clone();
+    username.connect_changed(move |entry| entry.remove_css_class("error"));
+
+    let nic_ui = ui.clone();
+    ui.nic.connect_selected_notify(move |_| {
+        let status = nic_ui.last_status.borrow().clone();
+        if let Some(status) = status {
+            apply_status(&nic_ui, status);
+            update_controls(&nic_ui);
         }
     });
 
+    let action_ui = ui.clone();
+    ui.action_btn.connect_clicked(move |_| {
+        let Some(settings) = collect_settings(&action_ui) else {
+            return;
+        };
+        if let Err(err) = config::save(&settings) {
+            toast(&action_ui, &format!("设置保存失败：{err}"));
+            return;
+        }
+        let password = action_ui.password.text().to_string();
+        action_ui.password.set_text("");
+        run_action(
+            &action_ui,
+            "正在请求授权并启动认证…",
+            "认证命令执行失败",
+            "认证命令已完成，正在确认进程状态",
+            move || system::authenticate(&settings, &password),
+            |_| {},
+        );
+    });
+
+    let disconnect_ui = ui.clone();
+    ui.disconnect_btn.connect_clicked(move |_| {
+        run_action(
+            &disconnect_ui,
+            "正在停止认证进程…",
+            "断开认证失败",
+            "认证进程已停止",
+            system::disconnect,
+            |_| {},
+        );
+    });
+
     let save_ui = ui.clone();
-    save_btn.connect_clicked(move |_| {
+    ui.save_btn.connect_clicked(move |_| {
         let Some(settings) = collect_settings(&save_ui) else {
             return;
         };
-
         match config::save(&settings) {
-            Ok(()) => {
-                append_log(&save_ui, "设置已保存。");
-                toast(&save_ui, "设置已保存");
-            }
+            Ok(()) => toast(&save_ui, "设置已保存（不包含密码）"),
             Err(err) => toast(&save_ui, &format!("设置保存失败：{err}")),
         }
     });
 
-    let disconnect_ui = ui.clone();
-    disconnect_btn.connect_clicked(move |_| match system::disconnect() {
-        Ok(()) => {
-            append_log(&disconnect_ui, "已请求断开认证。");
-            toast(&disconnect_ui, "已请求断开");
-            refresh_status(&disconnect_ui);
-        }
-        Err(err) => toast(&disconnect_ui, &format!("断开失败：{err}")),
-    });
-
-    let refresh_ui = ui.clone();
-    refresh_btn.connect_clicked(move |_| refresh_status(&refresh_ui));
-
-    let enable_ui = ui.clone();
-    enable_btn.connect_clicked(move |_| {
-        let Some(settings) = collect_settings(&enable_ui) else {
-            return;
-        };
-
-        if let Err(err) = config::save(&settings) {
-            toast(&enable_ui, &format!("设置保存失败：{err}"));
+    let autostart_ui = ui.clone();
+    ui.autostart.connect_active_notify(move |row| {
+        if autostart_ui.autostart_guard.get()
+            || autostart_ui.busy.get()
+            || autostart_ui.refreshing.get()
+        {
             return;
         }
 
-        match system::enable_service(&settings) {
-            Ok(()) => {
-                append_log(
-                    &enable_ui,
-                    &format!(
-                        "已按当前设置启用开机自启：账号={}，网卡={}，DHCP={}。",
-                        settings.username, settings.nic, settings.dhcp
-                    ),
-                );
-                toast(&enable_ui, "已启用自启");
-                refresh_status(&enable_ui);
+        if row.is_active() {
+            let Some(settings) = collect_settings(&autostart_ui) else {
+                set_autostart_switch(&autostart_ui, false);
+                return;
+            };
+            if let Err(err) = config::save(&settings) {
+                toast(&autostart_ui, &format!("设置保存失败：{err}"));
+                set_autostart_switch(&autostart_ui, false);
+                return;
             }
-            Err(err) => toast(&enable_ui, &format!("启用自启失败：{err}")),
+            run_action(
+                &autostart_ui,
+                "正在启用开机认证…",
+                "启用开机认证失败",
+                "开机认证已启用",
+                move || system::enable_service(&settings),
+                |_| {},
+            );
+        } else {
+            run_action(
+                &autostart_ui,
+                "正在停用开机认证…",
+                "停用开机认证失败",
+                "开机认证已停用",
+                system::disable_service,
+                |_| {},
+            );
         }
     });
 
-    let disable_ui = ui.clone();
-    disable_btn.connect_clicked(move |_| match system::disable_service() {
-        Ok(()) => {
-            append_log(&disable_ui, "已请求取消开机自启。");
-            toast(&disable_ui, "已请求取消自启");
-            refresh_status(&disable_ui);
-        }
-        Err(err) => toast(&disable_ui, &format!("取消自启失败：{err}")),
-    });
+    for button in [&ui.header_refresh_btn, &ui.log_refresh_btn] {
+        let refresh_ui = ui.clone();
+        button.connect_clicked(move |_| refresh_status(&refresh_ui));
+    }
 
     let logs_ui = ui.clone();
-    logs_btn.connect_clicked(move |_| match system::open_live_log() {
-        Ok(()) => append_log(&logs_ui, "已打开实时日志窗口。"),
-        Err(err) => toast(&logs_ui, &format!("日志窗口打开失败：{err}")),
+    ui.live_log_btn
+        .connect_clicked(move |_| match system::open_live_log() {
+            Ok(()) => toast(&logs_ui, "已打开实时日志窗口"),
+            Err(err) => toast(&logs_ui, &format!("无法打开实时日志：{err}")),
+        });
+
+    let stack = ui.stack.clone();
+    ui.diagnostics_btn
+        .connect_clicked(move |_| stack.set_visible_child_name("diagnostics"));
+
+    let connectivity_ui = ui.clone();
+    ui.connectivity_btn.connect_clicked(move |_| {
+        run_action(
+            &connectivity_ui,
+            "正在测试网络连通性…",
+            "网络连通测试失败",
+            "网络可以访问公网",
+            system::test_connectivity,
+            |_| {},
+        );
+    });
+
+    let restart_ui = ui.clone();
+    ui.restart_btn.connect_clicked(move |_| {
+        run_action(
+            &restart_ui,
+            "正在重启认证服务…",
+            "重启认证服务失败",
+            "认证服务已重启",
+            system::restart_service,
+            |_| {},
+        );
+    });
+
+    let client_folder_ui = ui.clone();
+    ui.client_folder_btn
+        .connect_clicked(move |_| match system::open_client_folder() {
+            Ok(()) => toast(&client_folder_ui, "已打开客户端目录"),
+            Err(err) => toast(&client_folder_ui, &format!("无法打开客户端目录：{err}")),
+        });
+
+    let help_ui = ui.clone();
+    ui.help_btn
+        .connect_clicked(move |_| match system::open_help() {
+            Ok(()) => toast(&help_ui, "已打开帮助文档"),
+            Err(err) => toast(&help_ui, &format!("无法打开帮助文档：{err}")),
+        });
+
+    let banner_window = ui.window.clone();
+    ui.client_banner.connect_button_clicked(move |_| {
+        let dialog = adw::AlertDialog::builder()
+            .heading("安装官方锐捷客户端")
+            .body("把 RG_Supplicant_For_Linux*.zip 放到 ~/Downloads，然后重新运行本仓库的 scripts/install.sh。")
+            .build();
+        dialog.add_response("close", "知道了");
+        dialog.present(Some(&banner_window));
+    });
+}
+
+fn run_action<F, S>(
+    ui: &AppUi,
+    pending: &str,
+    error_prefix: &'static str,
+    success_message: &'static str,
+    work: F,
+    on_success: S,
+) where
+    F: FnOnce() -> anyhow::Result<()> + Send + 'static,
+    S: FnOnce(&AppUi) + 'static,
+{
+    if ui.busy.replace(true) {
+        return;
+    }
+    ui.status_detail.set_text(pending);
+    ui.status_spinner.set_visible(true);
+    set_badge(ui, "处理中", "badge-working");
+    update_controls(ui);
+
+    let task_ui = ui.clone();
+    glib::spawn_future_local(async move {
+        let result = gio::spawn_blocking(work).await;
+        let succeeded = match result {
+            Ok(Ok(())) => {
+                on_success(&task_ui);
+                toast(&task_ui, success_message);
+                true
+            }
+            Ok(Err(err)) => {
+                toast(&task_ui, &format!("{error_prefix}：{err}"));
+                false
+            }
+            Err(_) => {
+                toast(&task_ui, &format!("{error_prefix}：后台任务异常终止"));
+                false
+            }
+        };
+        if succeeded {
+            glib::timeout_future(Duration::from_millis(700)).await;
+        }
+        task_ui.busy.set(false);
+        refresh_status(&task_ui);
     });
 }
 
 fn collect_settings(ui: &AppUi) -> Option<config::Settings> {
-    let username = ui.username.text().trim().to_string();
-    if username.is_empty() {
-        toast(ui, "请先输入校园网账号");
-        ui.username.grab_focus();
-        return None;
-    }
-
-    Some(config::Settings {
-        username,
+    let settings = config::Settings {
+        username: ui.username.text().trim().to_string(),
         nic: selected_nic(ui),
         dhcp: ui.dhcp.is_active(),
         save_password: ui.save_password.is_active(),
-    })
+    };
+    if let Err(err) = config::validate(&settings) {
+        ui.username.add_css_class("error");
+        ui.username.grab_focus();
+        toast(ui, &err.to_string());
+        return None;
+    }
+    Some(settings)
 }
 
 fn refresh_status(ui: &AppUi) {
-    let status = system::load_status();
-    let client = if status.client_installed {
-        "已安装"
-    } else {
-        "未找到"
-    };
-    let active = normalize_status(&status.service_active);
-    let enabled = normalize_status(&status.service_enabled);
+    refresh_interfaces(ui);
+    if ui.refreshing.replace(true) {
+        return;
+    }
+    ui.status_spinner.set_visible(true);
+    update_controls(ui);
+    let refresh_ui = ui.clone();
+    glib::spawn_future_local(async move {
+        match gio::spawn_blocking(system::load_status).await {
+            Ok(status) => apply_status(&refresh_ui, status),
+            Err(_) => toast(&refresh_ui, "状态读取任务异常终止"),
+        }
+        refresh_ui.refreshing.set(false);
+        if !refresh_ui.busy.get() {
+            refresh_ui.status_spinner.set_visible(false);
+        }
+        update_controls(&refresh_ui);
+    });
+}
 
-    ui.status.set_text(&format!(
-        "客户端：{}\n服务：{} / {}\n网卡：{}",
-        client,
-        enabled,
-        active,
-        selected_nic(ui)
+fn apply_status(ui: &AppUi, status: system::ClientStatus) {
+    let nic = selected_nic(ui);
+    let carrier = system::interface_has_carrier(&nic);
+    let enabled = service_is_enabled(&status.service_enabled);
+    let failed = status.service_active.trim() == "failed";
+
+    set_stage(
+        &ui.cable_stage,
+        if carrier { "已连接" } else { "未连接" },
+        if carrier {
+            "stage-success"
+        } else {
+            "stage-idle"
+        },
+    );
+    set_stage(
+        &ui.client_stage,
+        if status.client_installed {
+            "已就绪"
+        } else {
+            "未安装"
+        },
+        if status.client_installed {
+            "stage-success"
+        } else {
+            "stage-error"
+        },
+    );
+    set_stage(
+        &ui.process_stage,
+        if status.client_running {
+            "运行中"
+        } else {
+            "未运行"
+        },
+        if status.client_running {
+            "stage-success"
+        } else {
+            "stage-idle"
+        },
+    );
+    set_stage(
+        &ui.uptime_stage,
+        &status
+            .client_uptime_seconds
+            .map(format_duration)
+            .unwrap_or_else(|| "00:00:00".to_string()),
+        if status.client_running {
+            "stage-success"
+        } else {
+            "stage-idle"
+        },
+    );
+
+    ui.client_row.set_subtitle(if !status.client_installed {
+        "未安装"
+    } else if status.client_running {
+        "已安装 · 认证进程运行中"
+    } else {
+        "已安装 · 认证进程未运行"
+    });
+    ui.interface_row.set_subtitle(&format!(
+        "{} · {}",
+        nic,
+        if carrier {
+            "网线已连接"
+        } else {
+            "未检测到网线"
+        }
     ));
-    ui.status_hint
-        .set_text(match status.service_active.as_str() {
-            "active" => "服务正在运行，网络认证已发起。",
-            "inactive" => "服务未运行，点击连接网络即可发起认证。",
-            "failed" => "服务处于失败状态，请查看运行日志。",
-            _ => "状态已刷新。",
-        });
-    ui.log.buffer().set_text(&status.last_log);
+    ui.service_row.set_subtitle(if enabled {
+        "已启用，将在开机联网后自动认证"
+    } else {
+        "未启用"
+    });
+    set_autostart_switch(ui, enabled);
+    ui.sidebar_status.set_text(if status.client_running {
+        "认证运行中"
+    } else if carrier {
+        "等待认证"
+    } else {
+        "网络未连接"
+    });
+
+    if !status.client_installed {
+        set_connection_state(
+            ui,
+            "缺少官方客户端",
+            "安装学校提供的 Linux 客户端后才能发起认证",
+            "需安装",
+            "state-error",
+            "badge-error",
+            "dialog-warning-symbolic",
+        );
+    } else if failed {
+        set_connection_state(
+            ui,
+            "开机认证启动失败",
+            "打开诊断日志检查账号、密码或网卡设置",
+            "故障",
+            "state-error",
+            "badge-error",
+            "dialog-error-symbolic",
+        );
+    } else if status.client_running {
+        set_connection_state(
+            ui,
+            "认证进程正在运行",
+            if carrier {
+                "认证结果以官方客户端日志为准"
+            } else {
+                "进程仍在运行，但当前网卡没有检测到网线"
+            },
+            "运行中",
+            "state-active",
+            "badge-active",
+            "network-transmit-receive-symbolic",
+        );
+    } else if carrier {
+        set_connection_state(
+            ui,
+            "可以开始认证",
+            "网线和官方客户端均已就绪",
+            "待连接",
+            "state-ready",
+            "badge-ready",
+            "network-wired-symbolic",
+        );
+    } else {
+        set_connection_state(
+            ui,
+            "等待有线网络",
+            "连接网线，或在下方选择其他有线接口",
+            "未连接",
+            "state-idle",
+            "badge-idle",
+            "network-offline-symbolic",
+        );
+    }
+
+    ui.client_banner.set_revealed(!status.client_installed);
+    ui.log_buffer.set_text(&status.last_log);
+    scroll_log_to_end(&ui.log_preview);
+    scroll_log_to_end(&ui.log_full);
+    *ui.last_status.borrow_mut() = Some(status);
+}
+
+fn set_connection_state(
+    ui: &AppUi,
+    title: &str,
+    detail: &str,
+    badge: &str,
+    panel_class: &str,
+    badge_class: &str,
+    icon: &str,
+) {
+    for class in ["state-idle", "state-ready", "state-active", "state-error"] {
+        ui.link_panel.remove_css_class(class);
+    }
+    ui.link_panel.add_css_class(panel_class);
+    ui.status_icon.set_icon_name(Some(icon));
+    ui.status_title.set_text(title);
+    ui.status_detail.set_text(detail);
+    set_badge(ui, badge, badge_class);
+}
+
+fn set_badge(ui: &AppUi, text: &str, class: &str) {
+    for old in [
+        "badge-idle",
+        "badge-ready",
+        "badge-active",
+        "badge-error",
+        "badge-working",
+    ] {
+        ui.status_badge.remove_css_class(old);
+    }
+    ui.status_badge.add_css_class(class);
+    ui.status_badge.set_text(text);
+}
+
+fn set_stage(stage: &StageUi, text: &str, class: &str) {
+    for old in ["stage-idle", "stage-success", "stage-error"] {
+        stage.dot.remove_css_class(old);
+    }
+    stage.dot.add_css_class(class);
+    stage.value.set_text(text);
+}
+
+fn set_autostart_switch(ui: &AppUi, enabled: bool) {
+    ui.autostart_guard.set(true);
+    ui.autostart.set_active(enabled);
+    ui.autostart_guard.set(false);
+}
+
+fn update_controls(ui: &AppUi) {
+    let unavailable = ui.busy.get() || ui.refreshing.get();
+    for button in [
+        &ui.action_btn,
+        &ui.disconnect_btn,
+        &ui.save_btn,
+        &ui.header_refresh_btn,
+        &ui.log_refresh_btn,
+        &ui.connectivity_btn,
+        &ui.restart_btn,
+        &ui.client_folder_btn,
+        &ui.help_btn,
+    ] {
+        button.set_sensitive(!unavailable);
+    }
+    ui.autostart.set_sensitive(!unavailable);
+    ui.live_log_btn.set_sensitive(!unavailable);
+
+    if unavailable {
+        return;
+    }
+    let status = ui.last_status.borrow();
+    if let Some(status) = status.as_ref() {
+        ui.action_btn
+            .set_sensitive(status.client_installed && !status.client_running);
+        ui.disconnect_btn
+            .set_sensitive(status.client_installed && status.client_running);
+        ui.autostart.set_sensitive(status.client_installed);
+        ui.restart_btn.set_sensitive(status.client_installed);
+        ui.client_folder_btn.set_sensitive(status.client_installed);
+    } else {
+        ui.action_btn.set_sensitive(false);
+        ui.disconnect_btn.set_sensitive(false);
+        ui.autostart.set_sensitive(false);
+        ui.restart_btn.set_sensitive(false);
+        ui.client_folder_btn.set_sensitive(false);
+    }
+}
+
+fn refresh_interfaces(ui: &AppUi) {
+    let previous = selected_nic(ui);
+    let fresh = system::wired_interfaces();
+    if *ui.nics.borrow() == fresh {
+        return;
+    }
+    while ui.nic_model.n_items() > 0 {
+        ui.nic_model.remove(0);
+    }
+    for name in &fresh {
+        ui.nic_model.append(name);
+    }
+    ui.nic
+        .set_selected(preferred_nic_index(&fresh, &previous) as u32);
+    *ui.nics.borrow_mut() = fresh;
 }
 
 fn selected_nic(ui: &AppUi) -> String {
-    let selected = ui.nic.selected() as usize;
     ui.nics
         .borrow()
-        .get(selected)
+        .get(ui.nic.selected() as usize)
         .cloned()
         .unwrap_or_else(|| "eno1".to_string())
 }
 
-fn select_default_nic(dropdown: &gtk::DropDown, nics: &[String], preferred: &str) {
-    let index = nics
-        .iter()
+fn preferred_nic_index(nics: &[String], preferred: &str) -> usize {
+    nics.iter()
         .position(|name| !preferred.is_empty() && name == preferred)
         .or_else(|| nics.iter().position(|name| name == "eno1"))
-        .unwrap_or(0);
-    dropdown.set_selected(index as u32);
+        .unwrap_or(0)
 }
 
-fn normalize_status(status: &str) -> &str {
-    match status {
-        "enabled" => "已自启",
-        "disabled" => "未自启",
-        "active" => "运行中",
-        "inactive" => "已停止",
-        "failed" => "失败",
-        _ => "未知",
-    }
+fn service_is_enabled(value: &str) -> bool {
+    matches!(
+        value.trim(),
+        "enabled" | "enabled-runtime" | "linked" | "linked-runtime" | "alias"
+    )
+}
+
+fn format_duration(total_seconds: u64) -> String {
+    let hours = total_seconds / 3600;
+    let minutes = (total_seconds % 3600) / 60;
+    let seconds = total_seconds % 60;
+    format!("{hours:02}:{minutes:02}:{seconds:02}")
 }
 
 fn toast(ui: &AppUi, message: &str) {
     ui.toasts.add_toast(adw::Toast::new(message));
 }
 
-fn append_log(ui: &AppUi, line: &str) {
-    let buffer = ui.log.buffer();
-    let current = buffer
-        .text(&buffer.start_iter(), &buffer.end_iter(), false)
-        .to_string();
-    let next = if current.is_empty() {
-        line.to_string()
-    } else {
-        format!("{}\n{}", current, line)
-    };
-    buffer.set_text(&next);
+fn scroll_log_to_end(view: &gtk::TextView) {
+    let mut end = view.buffer().end_iter();
+    view.scroll_to_iter(&mut end, 0.0, false, 0.0, 1.0);
 }
 
-fn app_header() -> adw::HeaderBar {
-    let header = adw::HeaderBar::new();
-    header.add_css_class("chrome-bar");
+fn sidebar_navigation() -> SidebarUi {
+    let root = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .width_request(240)
+        .css_classes(["sidebar"])
+        .build();
 
-    let center = gtk::Box::builder().width_request(1).build();
-    header.set_title_widget(Some(&center));
-    header
+    let brand = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(10)
+        .margin_top(22)
+        .margin_bottom(24)
+        .margin_start(20)
+        .margin_end(16)
+        .build();
+    root.append(&brand);
+    let brand_mark = gtk::Box::builder()
+        .halign(gtk::Align::Center)
+        .valign(gtk::Align::Center)
+        .css_classes(["sidebar-brand-mark"])
+        .build();
+    let brand_icon = gtk::Image::from_icon_name("insert-link-symbolic");
+    brand_icon.set_pixel_size(22);
+    brand_mark.append(&brand_icon);
+    brand.append(&brand_mark);
+    let brand_copy = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(1)
+        .build();
+    brand_copy.append(
+        &gtk::Label::builder()
+            .label("锐捷有线认证")
+            .halign(gtk::Align::Start)
+            .css_classes(["sidebar-brand-title"])
+            .build(),
+    );
+    brand_copy.append(
+        &gtk::Label::builder()
+            .label("GDUFS 校园有线网")
+            .halign(gtk::Align::Start)
+            .css_classes(["sidebar-brand-subtitle"])
+            .build(),
+    );
+    brand.append(&brand_copy);
+
+    let nav = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(6)
+        .margin_start(14)
+        .margin_end(14)
+        .build();
+    root.append(&nav);
+    let (status_btn, _) = sidebar_nav_button("network-wired-symbolic", "连接状态", true);
+    let (auth_btn, _) = sidebar_nav_button("avatar-default-symbolic", "认证设置", false);
+    let (runtime_btn, _) = sidebar_nav_button("system-run-symbolic", "运行状态", false);
+    let (logs_btn, _) = sidebar_nav_button("utilities-terminal-symbolic", "日志查看", false);
+    let (settings_btn, _) = sidebar_nav_button("emblem-system-symbolic", "设置中心", false);
+    let (about_btn, _) = sidebar_nav_button("help-about-symbolic", "关于我们", false);
+    for button in [
+        &status_btn,
+        &auth_btn,
+        &runtime_btn,
+        &logs_btn,
+        &settings_btn,
+        &about_btn,
+    ] {
+        nav.append(button);
+    }
+
+    let spacer = gtk::Box::builder().vexpand(true).build();
+    root.append(&spacer);
+
+    let bytes = glib::Bytes::from_static(include_bytes!("../data/sidebar-landscape.png"));
+    let stream = gio::MemoryInputStream::from_bytes(&bytes);
+    let pixbuf = gtk::gdk_pixbuf::Pixbuf::from_stream(&stream, gio::Cancellable::NONE)
+        .expect("embedded sidebar artwork");
+    let texture = gtk::gdk::Texture::for_pixbuf(&pixbuf);
+    let picture = gtk::Picture::for_paintable(&texture);
+    picture.set_content_fit(gtk::ContentFit::Cover);
+    picture.set_width_request(240);
+    picture.set_height_request(300);
+
+    let artwork = gtk::Overlay::new();
+    artwork.set_child(Some(&picture));
+    root.append(&artwork);
+    let network_card = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(10)
+        .halign(gtk::Align::Fill)
+        .valign(gtk::Align::End)
+        .margin_start(14)
+        .margin_end(14)
+        .margin_bottom(16)
+        .css_classes(["sidebar-status-card"])
+        .build();
+    artwork.add_overlay(&network_card);
+    let network_icon = gtk::Image::from_icon_name("network-wireless-signal-excellent-symbolic");
+    network_icon.set_pixel_size(22);
+    network_card.append(&network_icon);
+    let status_copy = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(1)
+        .build();
+    status_copy.append(
+        &gtk::Label::builder()
+            .label("网络状态")
+            .halign(gtk::Align::Start)
+            .css_classes(["sidebar-status-caption"])
+            .build(),
+    );
+    let status_label = gtk::Label::builder()
+        .label("检查中")
+        .halign(gtk::Align::Start)
+        .css_classes(["sidebar-status-value"])
+        .build();
+    status_copy.append(&status_label);
+    network_card.append(&status_copy);
+
+    let compact_root = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .width_request(72)
+        .visible(false)
+        .css_classes(["compact-sidebar"])
+        .build();
+    let compact_brand = gtk::Box::builder()
+        .halign(gtk::Align::Center)
+        .valign(gtk::Align::Center)
+        .margin_top(18)
+        .margin_bottom(20)
+        .css_classes(["compact-brand"])
+        .build();
+    compact_brand.append(&gtk::Image::from_icon_name("insert-link-symbolic"));
+    compact_root.append(&compact_brand);
+    let compact_nav = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(8)
+        .build();
+    compact_root.append(&compact_nav);
+    let compact_status = compact_nav_button("network-wired-symbolic", "连接状态", true);
+    let compact_auth = compact_nav_button("avatar-default-symbolic", "认证设置", false);
+    let compact_runtime = compact_nav_button("system-run-symbolic", "运行状态", false);
+    let compact_logs = compact_nav_button("utilities-terminal-symbolic", "日志查看", false);
+    let compact_settings = compact_nav_button("emblem-system-symbolic", "设置中心", false);
+    let compact_about = compact_nav_button("help-about-symbolic", "关于我们", false);
+    for button in [
+        &compact_status,
+        &compact_auth,
+        &compact_runtime,
+        &compact_logs,
+        &compact_settings,
+        &compact_about,
+    ] {
+        compact_nav.append(button);
+    }
+
+    let all_buttons = vec![
+        status_btn.clone(),
+        auth_btn.clone(),
+        runtime_btn.clone(),
+        logs_btn.clone(),
+        settings_btn.clone(),
+        about_btn.clone(),
+        compact_status.clone(),
+        compact_auth.clone(),
+        compact_runtime.clone(),
+        compact_logs.clone(),
+        compact_settings.clone(),
+        compact_about.clone(),
+    ];
+
+    SidebarUi {
+        root,
+        compact_root,
+        status_label,
+        all_buttons,
+        status_buttons: vec![status_btn, compact_status],
+        auth_buttons: vec![auth_btn, compact_auth],
+        runtime_buttons: vec![runtime_btn, compact_runtime],
+        logs_buttons: vec![logs_btn, compact_logs],
+        settings_buttons: vec![settings_btn, compact_settings],
+        about_buttons: vec![about_btn, compact_about],
+    }
 }
 
-fn brand_header() -> gtk::Box {
-    let row = gtk::Box::builder()
+fn sidebar_nav_button(icon: &str, text: &str, active: bool) -> (gtk::Button, gtk::Label) {
+    let button = gtk::Button::builder()
+        .hexpand(true)
+        .css_classes(["sidebar-nav"])
+        .build();
+    if active {
+        button.add_css_class("active");
+    }
+    let content = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(12)
-        .valign(gtk::Align::Center)
         .halign(gtk::Align::Start)
-        .css_classes(["brand-row"])
         .build();
-    row.append(&icon_tile("network-wired-symbolic", "brand-icon"));
+    content.append(&gtk::Image::from_icon_name(icon));
+    let label = gtk::Label::builder().label(text).build();
+    content.append(&label);
+    button.set_child(Some(&content));
+    (button, label)
+}
 
+fn compact_nav_button(icon: &str, tooltip: &str, active: bool) -> gtk::Button {
+    let button = gtk::Button::builder()
+        .icon_name(icon)
+        .tooltip_text(tooltip)
+        .halign(gtk::Align::Center)
+        .css_classes(["compact-nav"])
+        .build();
+    if active {
+        button.add_css_class("active");
+    }
+    button
+}
+
+fn connect_sidebar(ui: &AppUi, sidebar: &SidebarUi, connection_page: &gtk::ScrolledWindow) {
+    for trigger in &sidebar.status_buttons {
+        let stack = ui.stack.clone();
+        let adjustment = connection_page.vadjustment();
+        let all = sidebar.all_buttons.clone();
+        let selected = sidebar.status_buttons.clone();
+        trigger.connect_clicked(move |_| {
+            select_sidebar_buttons(&all, &selected);
+            stack.set_visible_child_name("connection");
+            adjustment.set_value(0.0);
+        });
+    }
+
+    for trigger in &sidebar.auth_buttons {
+        let stack = ui.stack.clone();
+        let entry = ui.username.clone();
+        let all = sidebar.all_buttons.clone();
+        let selected = sidebar.auth_buttons.clone();
+        trigger.connect_clicked(move |_| {
+            select_sidebar_buttons(&all, &selected);
+            stack.set_visible_child_name("connection");
+            entry.grab_focus();
+        });
+    }
+
+    for trigger in &sidebar.runtime_buttons {
+        let stack = ui.stack.clone();
+        let switch = ui.autostart.clone();
+        let all = sidebar.all_buttons.clone();
+        let selected = sidebar.runtime_buttons.clone();
+        trigger.connect_clicked(move |_| {
+            select_sidebar_buttons(&all, &selected);
+            stack.set_visible_child_name("connection");
+            switch.grab_focus();
+        });
+    }
+
+    for trigger in &sidebar.logs_buttons {
+        let stack = ui.stack.clone();
+        let all = sidebar.all_buttons.clone();
+        let selected = sidebar.logs_buttons.clone();
+        trigger.connect_clicked(move |_| {
+            select_sidebar_buttons(&all, &selected);
+            stack.set_visible_child_name("diagnostics");
+        });
+    }
+
+    for trigger in &sidebar.settings_buttons {
+        let window = ui.window.clone();
+        trigger.connect_clicked(move |_| {
+            let dialog = adw::AlertDialog::builder()
+                .heading("设置中心")
+                .body(format!(
+                    "配置文件：{}\n官方客户端：{}\n\n账号和连接选项可在“认证设置”中修改。",
+                    config::settings_path().display(),
+                    config::client_path().display()
+                ))
+                .build();
+            dialog.add_response("close", "关闭");
+            dialog.present(Some(&window));
+        });
+    }
+
+    for trigger in &sidebar.about_buttons {
+        let window = ui.window.clone();
+        trigger.connect_clicked(move |_| {
+            let dialog = adw::AlertDialog::builder()
+                .heading("锐捷有线认证")
+                .body("面向 GDUFS 校园有线网的 GTK 客户端\n版本 0.2.0\n\n基于学校提供的官方 Linux 认证程序。")
+                .build();
+            dialog.add_response("close", "关闭");
+            dialog.present(Some(&window));
+        });
+    }
+}
+
+fn select_sidebar_buttons(buttons: &[gtk::Button], selected: &[gtk::Button]) {
+    for button in buttons {
+        button.remove_css_class("active");
+    }
+    for button in selected {
+        button.add_css_class("active");
+    }
+}
+
+fn icon_button(icon: &str, tooltip: &str) -> gtk::Button {
+    gtk::Button::builder()
+        .icon_name(icon)
+        .tooltip_text(tooltip)
+        .css_classes(["flat"])
+        .build()
+}
+
+fn text_action_button(icon: &str, label: &str, classes: &[&str]) -> gtk::Button {
+    let button = gtk::Button::builder()
+        .hexpand(true)
+        .css_classes(classes)
+        .build();
+    let content = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(8)
+        .halign(gtk::Align::Center)
+        .build();
+    content.append(&gtk::Image::from_icon_name(icon));
+    content.append(&gtk::Label::new(Some(label)));
+    button.set_child(Some(&content));
+    button
+}
+
+fn quick_action_button(icon: &str, title: &str, subtitle: &str) -> gtk::Button {
+    let button = gtk::Button::builder()
+        .hexpand(true)
+        .css_classes(["quick-action"])
+        .build();
+    let content = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(12)
+        .build();
+    let icon_wrap = gtk::Box::builder()
+        .halign(gtk::Align::Center)
+        .valign(gtk::Align::Center)
+        .css_classes(["quick-action-icon"])
+        .build();
+    icon_wrap.append(&gtk::Image::from_icon_name(icon));
+    content.append(&icon_wrap);
+    let copy = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(2)
+        .hexpand(true)
+        .build();
+    copy.append(
+        &gtk::Label::builder()
+            .label(title)
+            .halign(gtk::Align::Start)
+            .css_classes(["quick-action-title"])
+            .build(),
+    );
+    copy.append(
+        &gtk::Label::builder()
+            .label(subtitle)
+            .halign(gtk::Align::Start)
+            .wrap(true)
+            .xalign(0.0)
+            .css_classes(["quick-action-subtitle"])
+            .build(),
+    );
+    content.append(&copy);
+    content.append(&gtk::Image::from_icon_name("go-next-symbolic"));
+    button.set_child(Some(&content));
+    button
+}
+
+fn stage_widget(icon: &str, title: &str) -> (gtk::Box, StageUi) {
+    let item = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(10)
+        .css_classes(["stage-item"])
+        .build();
+    let dot = gtk::Box::builder()
+        .halign(gtk::Align::Center)
+        .valign(gtk::Align::Center)
+        .css_classes(["stage-dot", "stage-idle"])
+        .build();
+    dot.append(&gtk::Image::from_icon_name(icon));
+    item.append(&dot);
     let copy = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(1)
         .build();
     copy.append(
         &gtk::Label::builder()
-            .label("锐捷有线认证")
-            .halign(gtk::Align::Start)
-            .css_classes(["app-title"])
-            .build(),
-    );
-    copy.append(
-        &gtk::Label::builder()
-            .label("GDUFS Wired Network Client")
-            .halign(gtk::Align::Start)
-            .css_classes(["caption"])
-            .build(),
-    );
-    row.append(&copy);
-    row
-}
-
-fn hero_panel() -> gtk::Box {
-    let panel = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(16)
-        .halign(gtk::Align::Fill)
-        .css_classes(["hero"])
-        .build();
-    panel.append(&icon_tile("network-wired-symbolic", "hero-icon"));
-
-    let copy = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(6)
-        .valign(gtk::Align::Center)
-        .halign(gtk::Align::Start)
-        .hexpand(true)
-        .build();
-    copy.append(
-        &gtk::Label::builder()
-            .label("校园有线网络")
-            .halign(gtk::Align::Start)
-            .css_classes(["hero-title"])
-            .build(),
-    );
-    copy.append(
-        &gtk::Label::builder()
-            .label("一键连接、断开和管理开机自启。密码只在需要首次保存或修改时填写。")
-            .halign(gtk::Align::Start)
-            .wrap(true)
-            .css_classes(["body-copy"])
-            .build(),
-    );
-    panel.append(&copy);
-    panel
-}
-
-fn status_card() -> gtk::Box {
-    let card = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(14)
-        .margin_top(18)
-        .margin_bottom(2)
-        .margin_start(18)
-        .margin_end(18)
-        .tooltip_text("显示官方客户端、systemd 服务和当前网卡状态")
-        .build();
-    card.append(&icon_tile("network-wired-symbolic", "status-icon"));
-
-    let copy = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(4)
-        .valign(gtk::Align::Center)
-        .build();
-    copy.append(
-        &gtk::Label::builder()
-            .label("当前状态")
-            .halign(gtk::Align::Start)
-            .css_classes(["section-title"])
-            .build(),
-    );
-    copy.append(
-        &gtk::Label::builder()
-            .label("认证服务与客户端状态")
-            .halign(gtk::Align::Start)
-            .css_classes(["caption"])
-            .build(),
-    );
-    card.append(&copy);
-    card
-}
-
-fn section_header(title: &str, subtitle: &str) -> gtk::Box {
-    let header = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(5)
-        .margin_top(18)
-        .margin_bottom(14)
-        .margin_start(18)
-        .margin_end(18)
-        .build();
-    header.append(
-        &gtk::Label::builder()
             .label(title)
             .halign(gtk::Align::Start)
-            .css_classes(["section-title"])
+            .css_classes(["stage-title"])
             .build(),
     );
-    header.append(
-        &gtk::Label::builder()
-            .label(subtitle)
-            .halign(gtk::Align::Start)
-            .wrap(true)
-            .css_classes(["caption"])
-            .build(),
-    );
-    header
+    let value = gtk::Label::builder()
+        .label("检查中")
+        .halign(gtk::Align::Start)
+        .css_classes(["stage-value"])
+        .build();
+    copy.append(&value);
+    item.append(&copy);
+    (item, StageUi { dot, value })
 }
 
-fn setting_row<W: IsA<gtk::Widget>>(
-    icon: &str,
-    title: &str,
-    subtitle: &str,
-    control: &W,
-    last: bool,
-) -> gtk::Box {
-    let row = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(14)
-        .margin_start(18)
-        .margin_end(18)
-        .margin_top(0)
-        .margin_bottom(0)
-        .height_request(76)
-        .css_classes(["setting-row"])
-        .build();
-    if last {
-        row.add_css_class("last-row");
-    }
-
-    let icon_slot = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .width_request(18)
-        .valign(gtk::Align::Center)
-        .halign(gtk::Align::Center)
-        .build();
-    let image = gtk::Image::from_icon_name(icon);
-    image.set_pixel_size(16);
-    image.add_css_class("row-icon");
-    icon_slot.append(&image);
-    row.append(&icon_slot);
-
-    let text = gtk::Box::builder()
+fn section_heading(title: &str, description: &str) -> gtk::Box {
+    let copy = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(3)
-        .valign(gtk::Align::Center)
-        .hexpand(true)
         .build();
-    text.append(
+    copy.append(
         &gtk::Label::builder()
             .label(title)
             .halign(gtk::Align::Start)
-            .css_classes(["row-title"])
+            .css_classes(["section-title"])
             .build(),
     );
-    text.append(
+    copy.append(
         &gtk::Label::builder()
-            .label(subtitle)
+            .label(description)
             .halign(gtk::Align::Start)
             .wrap(true)
-            .css_classes(["row-subtitle"])
+            .xalign(0.0)
+            .css_classes(["section-description"])
             .build(),
     );
-    row.append(&text);
+    copy
+}
 
-    let control_box = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .valign(gtk::Align::Center)
-        .halign(gtk::Align::End)
+fn status_row(icon: &str, title: &str) -> adw::ActionRow {
+    let row = adw::ActionRow::builder()
+        .title(title)
+        .subtitle("检查中")
         .build();
-    control_box.append(control);
-    row.append(&control_box);
-
+    row.add_prefix(&gtk::Image::from_icon_name(icon));
     row
 }
 
-fn action_button(
-    icon: &str,
-    label: &str,
-    tooltip: &str,
-    primary: bool,
-    danger: bool,
-) -> gtk::Button {
-    let button = gtk::Button::builder()
-        .hexpand(true)
-        .tooltip_text(tooltip)
-        .css_classes(["action-button"])
-        .build();
-    button.set_cursor_from_name(Some("pointer"));
-    if primary {
-        button.add_css_class("primary-action");
-    }
-    if danger {
-        button.add_css_class("danger-action");
-    }
-    button.set_child(Some(&button_content(icon, label)));
-    button
-}
-
-fn button_content(icon: &str, label: &str) -> gtk::Box {
-    let content = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(8)
-        .halign(gtk::Align::Center)
-        .valign(gtk::Align::Center)
-        .build();
-    let image = gtk::Image::from_icon_name(icon);
-    image.set_pixel_size(16);
-    content.append(&image);
-    content.append(
-        &gtk::Label::builder()
-            .label(label)
-            .ellipsize(gtk::pango::EllipsizeMode::End)
-            .build(),
-    );
-    content
-}
-
-fn icon_tile(icon: &str, css_class: &str) -> gtk::Box {
-    let tile = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .halign(gtk::Align::Center)
-        .valign(gtk::Align::Center)
-        .css_classes([css_class])
-        .build();
-    let image = gtk::Image::from_icon_name(icon);
-    image.set_pixel_size(26);
-    image.set_halign(gtk::Align::Center);
-    image.set_valign(gtk::Align::Center);
-    tile.append(&image);
-    tile
+fn log_view(buffer: &gtk::TextBuffer) -> gtk::TextView {
+    gtk::TextView::builder()
+        .buffer(buffer)
+        .editable(false)
+        .cursor_visible(false)
+        .monospace(true)
+        .left_margin(14)
+        .right_margin(14)
+        .top_margin(12)
+        .bottom_margin(12)
+        .css_classes(["log-view"])
+        .build()
 }
 
 pub fn install_css() {
     let provider = gtk::CssProvider::new();
-    provider.load_from_data(
-        r#"
-        window,
-        .app-shell {
-          background: #f7f8f4;
-          color: #1d2721;
-        }
-
-        headerbar {
-          background: #f7f8f4;
-          box-shadow: none;
-          border-bottom: 1px solid rgba(47, 84, 62, 0.10);
-        }
-
-        .chrome-bar {
-          min-height: 34px;
-          padding-top: 0;
-          padding-bottom: 0;
-        }
-
-        .brand-row {
-          min-height: 46px;
-        }
-
-        .app-title {
-          font-size: 18px;
-          font-weight: 800;
-          color: #1d2721;
-        }
-
-        .caption {
-          font-size: 13px;
-          color: #6d7871;
-        }
-
-        .body-copy {
-          font-size: 14px;
-          color: #4e5d55;
-        }
-
-        .hero {
-          padding: 18px;
-          border-radius: 10px;
-          background: linear-gradient(90deg, #fbfdf9, #eef8f0);
-          border: 1px solid rgba(65, 128, 88, 0.18);
-        }
-
-        .hero-title {
-          font-size: 20px;
-          font-weight: 800;
-        }
-
-        .brand-icon,
-        .hero-icon,
-        .status-icon {
-          color: #29945d;
-          background: #dff4e7;
-          border: 1px solid rgba(41, 148, 93, 0.20);
-          border-radius: 10px;
-          min-width: 52px;
-          min-height: 52px;
-          padding: 0;
-        }
-
-        .brand-icon {
-          min-width: 42px;
-          min-height: 42px;
-        }
-
-        .status-icon {
-          min-width: 64px;
-          min-height: 64px;
-          border-radius: 999px;
-        }
-
-        .panel {
-          border-radius: 10px;
-          background: #ffffff;
-          border: 1px solid rgba(44, 67, 55, 0.12);
-          box-shadow: 0 8px 24px rgba(29, 39, 33, 0.045);
-        }
-
-        .section-title {
-          font-size: 16px;
-          font-weight: 800;
-        }
-
-        .setting-row {
-          border-bottom: 1px solid rgba(44, 67, 55, 0.10);
-        }
-
-        .last-row {
-          border-bottom: none;
-        }
-
-        .row-icon {
-          color: #80908a;
-        }
-
-        .row-title {
-          font-size: 15px;
-          font-weight: 700;
-          color: #1d2721;
-        }
-
-        .row-subtitle {
-          font-size: 13px;
-          color: #6d7871;
-        }
-
-        .compact-input,
-        .compact-select {
-          min-height: 44px;
-          border-radius: 8px;
-        }
-
-        .compact-input:focus,
-        .compact-select:focus {
-          outline: 2px solid alpha(#65c18b, 0.36);
-          outline-offset: 2px;
-          border-color: #65c18b;
-        }
-
-        switch:checked {
-          background: #65c18b;
-        }
-
-        .status-copy {
-          font-size: 14px;
-          font-weight: 700;
-          line-height: 1.45;
-        }
-
-        .hint {
-          font-size: 13px;
-          color: #6d7871;
-        }
-
-        .action-button {
-          min-height: 48px;
-          border-radius: 8px;
-          font-weight: 700;
-          background: #fbfcfa;
-          border: 1px solid rgba(44, 67, 55, 0.12);
-          color: #314139;
-          box-shadow: 0 1px 0 rgba(29, 39, 33, 0.04);
-        }
-
-        .action-button:hover {
-          background: #eef7f1;
-          border-color: rgba(41, 148, 93, 0.28);
-          box-shadow: 0 6px 16px rgba(44, 67, 55, 0.08);
-        }
-
-        .action-button:active {
-          background: #e1eee6;
-          border-color: rgba(41, 148, 93, 0.38);
-          box-shadow: inset 0 1px 3px rgba(29, 39, 33, 0.12);
-        }
-
-        .action-button:focus-visible {
-          outline: 2px solid alpha(#65c18b, 0.45);
-          outline-offset: 2px;
-        }
-
-        .primary-action {
-          color: #ffffff;
-          background: #65c18b;
-          border-color: #65c18b;
-          box-shadow: 0 8px 18px rgba(101, 193, 139, 0.26);
-        }
-
-        .primary-action:hover {
-          background: #57b67f;
-          border-color: #57b67f;
-          box-shadow: 0 10px 24px rgba(101, 193, 139, 0.34);
-        }
-
-        .primary-action:active {
-          background: #48a970;
-          border-color: #48a970;
-          box-shadow: inset 0 2px 5px rgba(24, 93, 57, 0.22);
-        }
-
-        .danger-action {
-          color: #c9362b;
-        }
-
-        .danger-action:hover {
-          background: #fff2f0;
-          border-color: rgba(201, 54, 43, 0.22);
-        }
-
-        .danger-action:active {
-          background: #ffe5e1;
-          border-color: rgba(201, 54, 43, 0.32);
-        }
-
-        .log-panel {
-          padding-bottom: 14px;
-        }
-
-        .log-view {
-          padding: 12px;
-          border-radius: 8px;
-          background: #fbfcfa;
-          color: #48554f;
-          font-size: 12px;
-        }
-        "#,
-    );
+    provider.load_from_data(include_str!("../data/style.css"));
 
     if let Some(display) = gtk::gdk::Display::default() {
         gtk::style_context_add_provider_for_display(

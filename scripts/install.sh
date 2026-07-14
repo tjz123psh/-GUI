@@ -11,6 +11,8 @@ APP_DIR="${DATA_HOME}/rjsupplicant"
 DESKTOP_DIR="${DATA_HOME}/applications"
 DESKTOP_FILE="${DESKTOP_DIR}/${APP_ID}.desktop"
 OLD_DESKTOP_FILE="${DESKTOP_DIR}/rjsupplicant.desktop"
+ICON_DIR="${DATA_HOME}/icons/hicolor/scalable/apps"
+ICON_FILE="${ICON_DIR}/${APP_ID}.svg"
 
 log() {
   printf '[rjsupplicant-gui] %s\n' "$*"
@@ -116,6 +118,8 @@ export LD_LIBRARY_PATH="\${arch_dir}/lib\${LD_LIBRARY_PATH:+:\${LD_LIBRARY_PATH}
 exec "\${arch_dir}/rjsupplicant" "\$@"
 EOF
   chmod 755 "${BIN_DIR}/rjsupplicant"
+  rm -rf "${tmp_dir}"
+  trap - RETURN
 }
 
 install_service() {
@@ -133,16 +137,20 @@ install_service() {
   cat >"${service_tmp}" <<EOF
 [Unit]
 Description=Ruijie RG-SU wired authentication client
-After=NetworkManager.service network-online.target
-Wants=NetworkManager.service network-online.target
+Documentation=https://etr.gdufs.edu.cn/info/1303/5137.htm
+After=network-online.target
+Wants=network-online.target
 
 [Service]
-Type=simple
-ExecStart=${BIN_DIR}/rjsupplicant -a 1 -d 1
-ExecStop=${BIN_DIR}/rjsupplicant -q
+Type=forking
+GuessMainPID=yes
+ExecStart="${BIN_DIR}/rjsupplicant" -a 1 -d 1
+ExecStop="${BIN_DIR}/rjsupplicant" -q
 Restart=on-failure
 RestartSec=10
-WorkingDirectory=${arch_dir}
+TimeoutStartSec=30
+TimeoutStopSec=15
+WorkingDirectory="${arch_dir}"
 
 [Install]
 WantedBy=multi-user.target
@@ -158,8 +166,9 @@ install_gui() {
   log "构建 GUI。"
   cargo build --release --manifest-path "${ROOT_DIR}/Cargo.toml"
 
-  mkdir -p "${BIN_DIR}" "${DESKTOP_DIR}"
+  mkdir -p "${BIN_DIR}" "${DESKTOP_DIR}" "${ICON_DIR}"
   install -m 755 "${ROOT_DIR}/target/release/rjsupplicant-gui" "${BIN_DIR}/rjsupplicant-gui"
+  install -m 644 "${ROOT_DIR}/data/${APP_ID}.svg" "${ICON_FILE}"
 
   sed "s#^Exec=.*#Exec=${BIN_DIR}/rjsupplicant-gui#" \
     "${ROOT_DIR}/data/${APP_ID}.desktop" >"${DESKTOP_FILE}"
@@ -168,6 +177,9 @@ install_gui() {
   rm -f "${OLD_DESKTOP_FILE}"
   if need_cmd update-desktop-database; then
     update-desktop-database "${DESKTOP_DIR}" || true
+  fi
+  if need_cmd gtk-update-icon-cache; then
+    gtk-update-icon-cache -f -t "${DATA_HOME}/icons/hicolor" || true
   fi
 }
 

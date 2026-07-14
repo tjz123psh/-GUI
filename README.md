@@ -2,81 +2,84 @@
 
 面向 Arch Linux 的 GDUFS 有线锐捷认证原生 GTK/libadwaita 客户端。
 
-这个仓库的目标是：在 Arch Linux 重装后，通过一条安装脚本完成 GUI、官方客户端 wrapper、桌面入口和 systemd 服务的安装，不需要手动考虑文件放在哪里。
+项目不重写锐捷协议，而是为学校提供的 Linux 官方客户端补上一套可安装、可诊断、可管理开机认证的桌面体验。
 
-它不重写锐捷协议，而是调用安装脚本生成的官方 Linux 客户端 wrapper：
+## 当前功能
 
-```text
-~/.local/bin/rjsupplicant
-```
+- 连接和断开有线认证，密码可仅使用一次或交给官方客户端保存
+- 自动识别物理有线网卡与网线链路状态，不把无线或虚拟接口混入默认列表
+- 分开显示官方客户端、认证进程、网线和开机认证状态
+- 按当前账号、网卡和 DHCP 设置生成并管理 `rjsupplicant.service`
+- 同时显示官方客户端日志和 systemd 日志，并可打开实时日志
+- 通过 `pkexec` 请求管理员授权；没有 `pkexec` 时回退到终端 + `sudo`
+- 参考暖色桌面控制台设计，提供橙色品牌主题、完整侧栏与独立应用图标
+- 针对 niri 的 640/960/1280/1920 列宽分别切换底部导航、图标栏和完整侧栏
+- 内置网络连通测试、认证服务重启、客户端目录和学校帮助文档入口
+- 授权与日志读取在后台执行，不会冻结 GTK 界面
 
-## 功能
+## v0.2 重要修复
 
-- 一键连接、断开有线认证
-- 保存账号、网卡、DHCP 和是否让官方客户端保存密码
-- 密码默认留空，复用官方客户端已经保存的密码
-- 需要首次保存或修改密码时，再在“本次修改密码”里填写
-- 启用/取消 `rjsupplicant.service` 开机自启
-- 在窗口内查看最近日志，也可以打开实时日志
-- 使用 `pkexec` 弹出系统授权对话框；没有 `pkexec` 时回退到终端 + `sudo`
+旧版 systemd 单元使用 `Type=simple`，但官方程序启动后会自行进入后台，导致 systemd 把启动器退出误判为服务结束并立刻执行断开。v0.2 改用 `Type=forking`，并对服务参数进行校验和 systemd 转义。
+
+旧版也只读取 `systemctl is-active` 并把它近似当作连接状态。新版直接检查认证进程，并将“开机认证已启用”“认证进程运行中”“网线已插入”作为三个独立状态展示。认证是否最终成功仍以官方客户端日志为准。
+
+完整审计结论见 [AUDIT.md](AUDIT.md)。
 
 ## 依赖
 
-不需要额外下载前端 UI 库。界面使用系统原生 GTK4 + libadwaita。
-
-Arch Linux:
+Arch Linux：
 
 ```bash
-sudo pacman -S --needed rust gtk4 libadwaita polkit
+sudo pacman -S --needed rust gtk4 libadwaita polkit desktop-file-utils unzip
 ```
 
-如果希望没有图形授权工具时还能回退到终端，至少安装一个终端：
-
-```bash
-sudo pacman -S --needed kitty
-```
+界面使用 GTK 4.10、libadwaita 1.6 或更高版本。若希望在没有图形授权工具时回退到终端，还需要 kitty、foot、alacritty 或 xterm 之一。
 
 ## 一键安装
-
-Arch Linux 重装后，执行：
 
 ```bash
 git clone https://github.com/tjz123psh/-GUI.git ~/.local/src/rjsupplicant-gui
 ~/.local/src/rjsupplicant-gui/scripts/install.sh
 ```
 
-安装脚本会：
+安装脚本会构建 GUI、安装桌面入口和图标、安装官方客户端 wrapper，并生成 systemd 服务。
 
-- 安装/确认 Rust、GTK4、libadwaita、polkit、desktop-file-utils、unzip
-- 构建并安装 `rjsupplicant-gui`
-- 安装桌面入口，并删除旧的终端启动器入口
-- 从 `RG_Supplicant_For_Linux*.zip` 安装官方客户端
-- 生成 `~/.local/bin/rjsupplicant` wrapper
-- 官方客户端就绪时，生成 `/etc/systemd/system/rjsupplicant.service`
-- 在 GUI 中点击“开机自启”会按当前账号、网卡、DHCP 设置重写 service 并启用
+官方客户端 zip 按以下顺序查找：
 
-官方客户端 zip 会自动从这些位置查找：
-
-- `RJSUPPLICANT_ZIP=/path/to/RG_Supplicant_For_Linux_V1.31.zip`
-- 仓库目录
-- `~/Downloads`
-
-如果首次运行时没有 zip，GUI 仍会安装；把 zip 放到 `~/Downloads` 后重新运行 `scripts/install.sh` 即可补装官方客户端。
-
-## 手动构建和安装
-
-```bash
-cargo build --release
-install -m 755 target/release/rjsupplicant-gui ~/.local/bin/rjsupplicant-gui
-install -m 644 data/io.github.pang.RjSupplicantGui.desktop ~/.local/share/applications/
-update-desktop-database ~/.local/share/applications
+```text
+RJSUPPLICANT_ZIP=/path/to/RG_Supplicant_For_Linux_V1.31.zip
+仓库目录
+~/Downloads
 ```
 
-## 密码说明
+首次没有 zip 也可先安装 GUI。之后把 `RG_Supplicant_For_Linux*.zip` 放到 `~/Downloads`，重新运行安装脚本即可。
 
-有两个不同的密码概念：
+更新旧版本后，建议重新运行一次安装脚本，或在 GUI 中重新点击“启用”开机认证，以迁移旧的 `Type=simple` 服务文件。
 
-- 校园网密码：只在首次保存或修改时填写；留空不会覆盖已保存密码。
-- 管理员授权：官方客户端需要 root 权限抓包/认证，所以连接、断开和管理 systemd 服务时系统会通过 `pkexec` 请求授权。
+## 密码与权限
 
-如果想做到“点击连接完全不输管理员密码”，需要额外配置 polkit 规则或专用 systemd 服务权限。默认不内置免密规则，避免把提权权限放得过宽。
+- 校园网密码默认不写入 GUI 配置；输入框留空时，复用官方客户端已经保存的密码。
+- “交给官方客户端保存密码”关闭时，本次输入的密码只用于当前认证。
+- 账号、网卡与开关保存在 `~/.config/rjsupplicant-gui/settings.conf`，权限设置为 `0600`。
+- 官方客户端要求 root 权限抓包，因此连接、断开和 systemd 管理会触发系统授权。
+- 官方程序只提供命令行密码参数，因此本次密码会短暂出现在特权进程参数中；这是上游客户端接口限制。
+
+## 手动构建与验证
+
+```bash
+cargo fmt --check
+cargo test
+cargo build --release
+bash -n scripts/install.sh
+shellcheck scripts/install.sh
+```
+
+手动安装 GUI：
+
+```bash
+install -m 755 target/release/rjsupplicant-gui ~/.local/bin/rjsupplicant-gui
+install -m 644 data/io.github.pang.RjSupplicantGui.desktop ~/.local/share/applications/
+install -m 644 data/io.github.pang.RjSupplicantGui.svg ~/.local/share/icons/hicolor/scalable/apps/
+update-desktop-database ~/.local/share/applications
+gtk-update-icon-cache -f -t ~/.local/share/icons/hicolor
+```

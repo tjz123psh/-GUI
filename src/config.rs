@@ -1,4 +1,6 @@
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 pub const APP_ID: &str = "io.github.pang.RjSupplicantGui";
@@ -48,6 +50,8 @@ pub fn load() -> Settings {
 }
 
 pub fn save(settings: &Settings) -> anyhow::Result<()> {
+    validate(settings)?;
+
     let path = settings_path();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -60,7 +64,41 @@ pub fn save(settings: &Settings) -> anyhow::Result<()> {
         settings.dhcp,
         settings.save_password
     );
-    fs::write(path, content)?;
+    let mut options = fs::OpenOptions::new();
+    options.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    use std::io::Write;
+    options.open(&path)?.write_all(content.as_bytes())?;
+    #[cfg(unix)]
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+pub fn validate(settings: &Settings) -> anyhow::Result<()> {
+    let username = settings.username.trim();
+    if username.is_empty() {
+        anyhow::bail!("校园网账号不能为空");
+    }
+    if username.len() > 128
+        || !username
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '@' | '.' | '_' | '+' | '-'))
+    {
+        anyhow::bail!("校园网账号只能包含字母、数字和 @ . _ + -");
+    }
+
+    let nic = settings.nic.trim();
+    if nic.is_empty() || nic.len() > 32 {
+        anyhow::bail!("网卡名称无效");
+    }
+    if !nic
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | ':' | '-'))
+    {
+        anyhow::bail!("网卡名称包含不支持的字符");
+    }
+
     Ok(())
 }
 
@@ -125,4 +163,29 @@ fn clean_value(value: &str) -> String {
         .collect::<String>()
         .trim()
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn settings(username: &str, nic: &str) -> Settings {
+        Settings {
+            username: username.to_string(),
+            nic: nic.to_string(),
+            dhcp: true,
+            save_password: true,
+        }
+    }
+
+    #[test]
+    fn accepts_common_account_and_interface_names() {
+        assert!(validate(&settings("20260001@gdufs", "enp4s0.20")).is_ok());
+    }
+
+    #[test]
+    fn rejects_values_that_could_change_service_arguments() {
+        assert!(validate(&settings("student --help", "eno1")).is_err());
+        assert!(validate(&settings("student", "eno1 --help")).is_err());
+    }
 }

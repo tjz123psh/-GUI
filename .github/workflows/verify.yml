@@ -46,8 +46,11 @@ jobs:
 
       - name: Validate shell scripts
         run: |
-          bash -n scripts/install.sh tests/install_uninstall.sh
-          shellcheck scripts/install.sh tests/install_uninstall.sh
+          bash -n scripts/bootstrap.sh scripts/install.sh
+          bash -n tests/bootstrap.sh tests/install_uninstall.sh
+          shellcheck scripts/bootstrap.sh scripts/install.sh
+          shellcheck tests/bootstrap.sh tests/install_uninstall.sh
+          tests/bootstrap.sh
           tests/install_uninstall.sh
 
       - name: Validate desktop metadata and XML

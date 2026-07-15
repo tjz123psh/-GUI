@@ -45,6 +45,27 @@ sudo pacman -S --needed rust gtk4 libadwaita polkit desktop-file-utils unzip
 
 ## 一键安装
 
+直接从 GitHub 获取引导脚本：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/tjz123psh/-GUI/main/scripts/bootstrap.sh | bash
+```
+
+该命令会把项目源码下载或安全更新到 `~/.local/src/rjsupplicant-gui`，从广东外语外贸大学官网下载 `RG_Supplicant_For_Linux_V1.31.zip` 到 `~/Downloads`，核对固定 SHA-256 后运行正式安装脚本。已有 Git 仓库只有在 `main` 没有修改、暂存或未跟踪文件，没有分叉且 origin 指向本项目时才会 fast-forward；归档模式不会覆盖已有源码目录。
+
+重复执行会更新源码和应用；root-owned 客户端已就绪时不会重复安装。确实需要重装客户端时，可在命令前设置 `RJSUPPLICANT_FORCE_CLIENT_INSTALL=1`。
+
+不希望直接把网络脚本交给 Bash 时，可先保存和检查：
+
+```bash
+curl -fsSLo /tmp/rjsupplicant-bootstrap.sh \
+  https://raw.githubusercontent.com/tjz123psh/-GUI/main/scripts/bootstrap.sh
+less /tmp/rjsupplicant-bootstrap.sh
+bash /tmp/rjsupplicant-bootstrap.sh
+```
+
+也可以手动克隆后安装：
+
 ```bash
 git clone https://github.com/tjz123psh/-GUI.git ~/.local/src/rjsupplicant-gui
 ~/.local/src/rjsupplicant-gui/scripts/install.sh
@@ -70,6 +91,13 @@ RJSUPPLICANT_ZIP=/path/to/RG_Supplicant_For_Linux_V1.31.zip
 ~/.local/src/rjsupplicant-gui/scripts/install.sh --uninstall
 ```
 
+默认源码目录存在时，也可使用对应的 curl 卸载入口：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/tjz123psh/-GUI/main/scripts/bootstrap.sh | \
+  bash -s -- --uninstall
+```
+
 卸载会中断当前有线认证，停止并移除 `rjsupplicant.service`，在需要时断开手动认证进程，然后删除 GUI、root-owned helper、polkit policy、新旧 wrapper、官方客户端目录、桌面入口和图标。脚本默认保留 `${XDG_CONFIG_HOME:-~/.config}/rjsupplicant-gui` 中的账号与网卡偏好；如需彻底清除，可在确认不再需要后手动删除该目录。
 
 ## 密码与权限
@@ -90,9 +118,12 @@ RJSUPPLICANT_ZIP=/path/to/RG_Supplicant_For_Linux_V1.31.zip
 cargo fmt --all --check
 cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
-cargo build --release
-bash -n scripts/install.sh tests/install_uninstall.sh
-shellcheck scripts/install.sh tests/install_uninstall.sh
+cargo build --locked --release
+bash -n scripts/bootstrap.sh scripts/install.sh
+bash -n tests/bootstrap.sh tests/install_uninstall.sh
+shellcheck scripts/bootstrap.sh scripts/install.sh
+shellcheck tests/bootstrap.sh tests/install_uninstall.sh
+tests/bootstrap.sh
 tests/install_uninstall.sh
 desktop-file-validate data/io.github.pang.RjSupplicantGui.desktop
 xmllint --noout data/io.github.pang.RjSupplicantGui.svg

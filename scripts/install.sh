@@ -127,7 +127,10 @@ find_official_zip() {
 
 build_binaries() {
   log "构建 GUI 和特权 helper。"
-  cargo build --release --manifest-path "${ROOT_DIR}/Cargo.toml"
+  rm -f \
+    "${ROOT_DIR}/target/release/rjsupplicant-gui" \
+    "${ROOT_DIR}/target/release/rjsupplicant-helper"
+  cargo build --locked --release --manifest-path "${ROOT_DIR}/Cargo.toml"
 }
 
 install_privileged_helper() {
@@ -137,6 +140,11 @@ install_privileged_helper() {
 }
 
 install_official_client() {
+  if privileged_client_ready && [[ "${RJSUPPLICANT_FORCE_CLIENT_INSTALL:-0}" != "1" ]]; then
+    log "root-owned 官方客户端已存在，跳过重复安装。"
+    return
+  fi
+
   local zip_path
   zip_path="$(find_official_zip || true)"
   if [[ -z "${zip_path}" ]]; then

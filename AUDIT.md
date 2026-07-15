@@ -99,6 +99,12 @@ root helper 若通过 `PATH` 查找解压器、wrapper 继承调用方 `LD_LIBRA
 
 处理：GUI 改为通过标准输入向 helper 传送最多 4096 字节的 UTF-8 密码，helper 参数只保留经过校验的 DHCP、网卡、账号和保存开关。终端 sudo 回退会关闭回显后重新提示。官方闭源客户端只接受 `-p`，因此其进程参数中的短暂暴露仍无法消除。
 
+### 一般：首次安装步骤较多
+
+手动安装需要先克隆仓库、寻找学校官方 ZIP，再运行安装脚本，不适合个人机器快速恢复。
+
+处理：增加 GitHub curl bootstrap。它保护已有 Git 修改和分叉，只从项目 GitHub 获取源码；Linux V1.31 客户端只从学校 HTTPS 直链下载，并使用固定 SHA-256 校验后原子放入 `~/Downloads`。已有同名 ZIP 校验不符时直接拒绝，闭源 ZIP 不提交到仓库，客户端已就绪时也不会因重复更新而重装。安装器还会删除最终 release 输出并使用锁定依赖重新链接 GUI/helper，避免信任被替换的缓存二进制。新增完全位于 `/tmp` 的离线回归，不触碰真实安装、网络或服务。
+
 ## 保留限制
 
 - 官方客户端是闭源旧程序；`sysctl: 写入错误: 错误的文件描述符` 等上游问题无法由 GUI 内部修复。
@@ -117,7 +123,7 @@ root helper 若通过 `PATH` 查找解压器、wrapper 继承调用方 `LD_LIBRA
 - `cargo clippy --all-targets -- -D warnings`
 - `cargo build --release`
 - `bash -n` 与 ShellCheck
-- 隔离环境中的安装/卸载回归测试
+- 隔离环境中的 bootstrap 与安装/卸载回归测试
 - desktop 与 SVG、polkit policy XML 校验
 - Wayland/niri 下 640px、960px、1280px 和 1920px 四档列宽实图检查
 

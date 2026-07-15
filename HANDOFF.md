@@ -1,7 +1,7 @@
 # rjsupplicant-gui 项目交接文档
 
-- 最后更新：2026-07-14
-- 当前版本：0.2.0
+- 最后更新：2026-07-15
+- 当前版本：0.3.0
 - 主分支：`main`
 - 远端：`git@github.com:tjz123psh/-GUI.git`
 
@@ -11,7 +11,7 @@
 
 当前实现具备安装官方客户端、保存非密码配置、连接/断开认证、管理开机认证、读取真实进程与网线状态、查看日志和执行常用诊断操作的完整闭环。项目不实现锐捷认证协议，而是包装学校提供的闭源 Linux 客户端。
 
-本轮代码已经通过格式、单元测试、Clippy、Release 构建、ShellCheck、desktop 文件、SVG XML 和 diff 空白检查。为避免影响当前网络，验证期间没有主动发起真实校园网认证，也没有改动本机现有 systemd 服务。
+本轮代码已经通过格式、24 项 Rust 测试、Clippy、Release 构建、ShellCheck、隔离安装/卸载回归、desktop、SVG/polkit XML 和 diff 空白检查。为避免影响当前网络，验证期间没有安装 helper 到真实系统、主动发起校园网认证或改动本机现有 systemd 服务。
 
 详细审计记录见 [AUDIT.md](AUDIT.md)，面向使用者的安装说明见 [README.md](README.md)。
 
@@ -80,20 +80,32 @@
 ```text
 Cargo.toml                                      Rust 包和 GTK/libadwaita 依赖
 src/main.rs                                     应用入口、单实例窗口、浅色方案和 CSS 初始化
+src/lib.rs                                      GUI 与 helper 共用库入口
 src/config.rs                                   XDG/HOME 路径、设置读写、0600 权限和参数校验
-src/system.rs                                   官方客户端命令、提权、systemd、状态、日志和诊断
-src/ui.rs                                       所有 GTK 页面、交互、后台任务和响应式断点
+src/client_install.rs                           ZIP 快照、校验、权限加固、事务安装和 wrapper 生成
+src/privileged.rs                               helper 白名单协议、固定路径、认证参数和 root service
+src/bin/rjsupplicant-helper.rs                  root helper 入口、客户端调用和 systemd 管理
+src/system.rs                                   helper/旧版分流、提权、状态、日志和诊断
+src/ui.rs                                       窗口、连接页和诊断页装配，共享 UI 状态
+src/ui/components.rs                            状态阶段、按钮、标题、日志等通用组件
+src/ui/layout.rs                                640/960/1280/1920 响应式断点
+src/ui/navigation.rs                            完整/紧凑侧栏及页面定位逻辑
+src/ui/runtime.rs                               异步动作、状态刷新、表单收集和控件状态
 data/style.css                                  暖色主题和组件样式
 data/sidebar-landscape.png                      完整侧栏底部插画
 data/io.github.pang.RjSupplicantGui.svg         应用图标
 data/io.github.pang.RjSupplicantGui.desktop     桌面入口模板
-scripts/install.sh                              依赖、官方客户端、服务、GUI 和桌面资源安装
+data/io.github.pang.RjSupplicantGui.policy      按 helper 子命令匹配的 polkit policy
+scripts/install.sh                              依赖、官方客户端、服务、GUI 和桌面资源安装/卸载
+tests/install_uninstall.sh                      隔离 HOME/XDG/systemd/usr 路径的安装卸载回归
+.github/workflows/verify.yml                    Arch Linux 自动构建与完整校验
 README.md                                       用户文档
 AUDIT.md                                        本轮代码审计结论与限制
 HANDOFF.md                                      本交接文档
+CHANGELOG.md                                    版本变更记录
 ```
 
-没有 GtkBuilder XML；界面目前全部在 `src/ui.rs` 中构建。该文件较大，后续功能继续增长时可按 dashboard、diagnostics、navigation 和 async actions 拆分，但拆分不应改变现有断点行为。
+没有 GtkBuilder XML；界面使用 Rust 构建。`src/ui.rs` 保留窗口和两页装配，通用组件、断点、导航、异步动作与状态同步已拆入 `src/ui/` 子模块。继续修改时应保持 GTK 控件只在主上下文更新，并避免把导航或运行状态重新堆回根文件。
 
 ## 5. 当前 UI 结构
 
@@ -104,7 +116,9 @@ HANDOFF.md                                      本交接文档
 
 完整侧栏中的“连接状态、认证设置、运行状态”会定位到连接页的相应区域；“日志查看”进入诊断页；“设置中心”和“关于我们”打开对话框。快捷键 `Ctrl+1` 打开连接页，`Ctrl+2` 打开诊断页。
 
-响应式规则位于 `src/ui.rs::install_breakpoints`：
+官方客户端缺失时，顶部 banner 的“选择安装包”会打开原生 `GtkFileDialog`。安装期间 banner 原位显示忙碌状态，连接、自启、重启和客户端目录操作保持禁用；成功后立即刷新真实状态并开放连接操作。
+
+响应式规则位于 `src/ui/layout.rs::install_breakpoints`：
 
 | 窗口宽度 | 导航 | 内容布局 | niri 使用场景 |
 | --- | --- | --- | --- |
@@ -117,22 +131,43 @@ HANDOFF.md                                      本交接文档
 
 ## 6. 运行数据与路径
 
-用户数据遵循 XDG 路径：
+当前完整安装把所有可被保留 polkit 授权执行的程序放在 root-owned 固定路径：
 
 ```text
 设置文件：${XDG_CONFIG_HOME:-~/.config}/rjsupplicant-gui/settings.conf
 GUI 程序：~/.local/bin/rjsupplicant-gui
-官方 wrapper：~/.local/bin/rjsupplicant
-官方客户端：${XDG_DATA_HOME:-~/.local/share}/rjsupplicant/{x64|x86}/rjsupplicant
-官方日志：${XDG_DATA_HOME:-~/.local/share}/rjsupplicant/{x64|x86}/log/run.log
+特权 helper：/usr/lib/rjsupplicant-gui/rjsupplicant-helper
+官方 wrapper：/usr/lib/rjsupplicant-gui/rjsupplicant
+官方客户端：/usr/lib/rjsupplicant/{x64|x86}/rjsupplicant
+官方日志：/usr/lib/rjsupplicant/{x64|x86}/log/run.log
+polkit policy：/usr/share/polkit-1/actions/io.github.pang.RjSupplicantGui.policy
 桌面入口：${XDG_DATA_HOME:-~/.local/share}/applications/io.github.pang.RjSupplicantGui.desktop
 应用图标：${XDG_DATA_HOME:-~/.local/share}/icons/hicolor/scalable/apps/io.github.pang.RjSupplicantGui.svg
 系统服务：/etc/systemd/system/rjsupplicant.service
 ```
 
-设置文件仅保存账号、网卡、DHCP 和是否让官方客户端保存密码，权限强制为 `0600`。GUI 不保存密码。
+从 v0.2 及更早版本升级时，如果 root-owned 客户端还未安装，GUI 会暂时回退到以下旧路径：
+
+```text
+旧 wrapper：~/.local/bin/rjsupplicant
+旧客户端：${XDG_DATA_HOME:-~/.local/share}/rjsupplicant/{x64|x86}/rjsupplicant
+```
+
+该回退只用于迁移，不匹配项目的保留授权 policy。不要把 `/usr/lib/rjsupplicant-gui/rjsupplicant-helper`、wrapper 或 `/usr/lib/rjsupplicant` 改到用户可写位置。设置文件仅保存账号、网卡、DHCP 和是否让官方客户端保存密码，权限强制为 `0600`；GUI 不保存密码。
 
 ## 7. 核心流程
+
+### 在 GUI 中安装官方客户端
+
+1. 缺失 banner 通过 `GtkFileDialog` 选择本机 ZIP。
+2. 后台任务调用 `system::install_official_client`，GTK 主线程不执行解压或文件写入。
+3. GUI 规范化路径后执行 `pkexec /usr/lib/rjsupplicant-gui/rjsupplicant-helper install-client <绝对路径>`；policy 对安装动作使用 `auth_admin`，不保留本次授权。
+4. helper 检查有效 UID 为 0，使用 `O_NOFOLLOW|O_NONBLOCK` 打开普通 ZIP，并从同一文件句柄复制到 `/usr/lib` 下的 `0700` 私有临时目录，避免授权后替换源文件。
+5. 固定使用 `/usr/bin/unzip`；解压前拒绝绝对路径、反斜杠逃逸、`..` 以及 ZIP Unix 类型中的链接/特殊文件，解压后再递归拒绝符号链接与特殊文件，将目录收紧为 `0755`、普通文件收紧为 `0644/0755`。
+6. 验证当前架构二进制并明确设置可执行权限，生成固定 `/usr/bin/bash`、`/usr/bin/getconf` 且不继承调用方 `LD_LIBRARY_PATH` 的 wrapper。
+7. 先暂存旧客户端，再切换新目录和 wrapper；wrapper 安装失败时恢复旧客户端。成功后删除临时目录并刷新真实状态。
+
+完整流程只写 root-owned `/usr/lib/rjsupplicant` 和 `/usr/lib/rjsupplicant-gui/rjsupplicant`，不会创建 systemd 服务。用户之后启用“开机自动认证”时，helper 才按当前设置生成完整 service。
 
 ### 连接认证
 
@@ -140,28 +175,30 @@ GUI 程序：~/.local/bin/rjsupplicant-gui
 2. `config::validate` 校验账号与网卡字符范围。
 3. `config::save` 保存非密码设置。
 4. 后台任务调用 `system::authenticate`。
-5. 经 `pkexec` 运行官方 wrapper：
+5. root-owned 客户端就绪时，经 `pkexec` 运行固定 helper：
 
 ```text
-~/.local/bin/rjsupplicant -a 1 -d <0|1> -n <网卡> -u <账号> -S <0|1> [-p <密码>]
+/usr/lib/rjsupplicant-gui/rjsupplicant-helper authenticate <DHCP 0|1> <网卡> <账号> <保存 0|1>
 ```
 
-密码框为空时不传 `-p`，由官方客户端尝试复用其已保存密码。密码不为空时会短暂出现在特权进程参数中，这是官方程序只提供命令行密码接口造成的上游限制。
+helper 重新解析并校验参数，再从标准输入读取最多 4096 字节的 UTF-8 密码，然后调用固定 root-owned wrapper。密码不会进入 `pkexec` 或 helper 参数；没有 `pkexec` 时，终端 `sudo` 回退以关闭回显的方式重新提示密码。密码框为空时不传 `-p`，由官方客户端尝试复用已保存密码。闭源客户端只提供命令行接口，因此非空密码仍会短暂出现在官方客户端进程参数中。root-owned 客户端未就绪时才回退到旧用户级 wrapper。
 
 ### 断开认证
 
-- 若 `rjsupplicant.service` 正在运行，执行 `systemctl stop rjsupplicant.service`，避免服务重启策略把认证重新拉起。
-- 否则直接调用 `rjsupplicant -q`。
+- 新架构统一调用 helper 的 `disconnect` 白名单动作。
+- helper 若检测到 `rjsupplicant.service` 正在运行，使用固定 `/usr/bin/systemctl stop`，避免服务重启策略把认证重新拉起；否则调用固定 root-owned wrapper 的 `-q`。
+- 只有 root-owned 客户端未就绪时才使用旧版 systemctl/wrapper 回退。
 
 ### 开机认证
 
-启用开机认证时，GUI 按当前账号、网卡、DHCP 和保存密码选项生成 service，写入 `/etc/systemd/system/rjsupplicant.service`，执行 `daemon-reload`，再执行：
+启用开机认证时，GUI 把当前账号、网卡、DHCP 和保存密码选项传给 helper。helper 重新校验参数，生成只引用固定 root-owned wrapper 的 service，原子写入 `/etc/systemd/system/rjsupplicant.service`，执行 `daemon-reload`，再执行：
 
 ```text
-systemctl enable --now rjsupplicant.service
+systemctl enable rjsupplicant.service
+systemctl restart rjsupplicant.service
 ```
 
-关闭时执行：
+关闭时通过 helper 执行：
 
 ```text
 systemctl disable --now rjsupplicant.service
@@ -178,16 +215,20 @@ GuessMainPID=yes
 
 service 不保存明文密码。开机认证依赖官方客户端先前保存的密码；若用户关闭“交给官方客户端保存密码”，必须明确提示其开机无人值守认证可能无法完成。
 
+polkit policy 使用 `org.freedesktop.policykit.exec.path` 固定 helper，并用 `org.freedesktop.policykit.exec.argv1` 分别匹配六个白名单动作。安装客户端使用 `auth_admin`；连接、断开、启用/关闭/重启服务使用 `auth_admin_keep`。停止、禁用或重启前，helper 会验证 service 是 root-owned、不可写且只引用固定 wrapper；旧 service 必须先通过“启用”动作原子迁移。保留授权永远不能指向 `~/.local/bin` 或其他用户可写程序。
+
 ### 状态与日志
 
 `system::load_status` 在后台读取：
 
-- wrapper 和架构对应官方二进制是否都存在；
+- root-owned helper、wrapper 和架构二进制是否就绪，否则检查旧用户级客户端；
 - `/proc/*/comm` 中是否存在 `rjsupplicant`；
 - 认证进程运行时长；
 - `systemctl is-enabled` 和 `systemctl is-active`；
 - 官方 `run.log` 最近 80 行；
 - systemd journal 最近 60 行。
+
+客户端目录与日志也按相同优先级选择 root-owned 新路径或旧版回退路径。
 
 选中网卡的物理链路通过 `/sys/class/net/<nic>/carrier` 判断。默认网卡列表排除 loopback、无线和常见虚拟接口，优先保留具有 sysfs `device` 节点的物理以太网卡。
 
@@ -210,11 +251,19 @@ git clone https://github.com/tjz123psh/-GUI.git ~/.local/src/rjsupplicant-gui
 3. ~/Downloads 内同名模式
 ```
 
-如果没有 zip，安装脚本仍会安装 GUI，但会跳过官方客户端和 systemd 服务。zip 到位后重新运行脚本即可。
+安装脚本先构建并安装 root-owned helper 与 polkit policy，再通过 helper 安装 ZIP，最后安装用户级 GUI。如果没有 zip，仍会安装 GUI、helper 和 policy，但会跳过官方客户端；安装阶段始终不创建 systemd 服务。zip 到位后可在 GUI 中点击“选择安装包”，或重新运行脚本。
 
-从 v0.1 或更早版本升级后必须重新运行 `scripts/install.sh`，或在 GUI 中重新启用一次开机认证，以把旧的 `Type=simple` service 迁移为 `Type=forking`，并写入当前账号和网卡。
+从旧版本升级时应重新运行 `scripts/install.sh`，并通过脚本或 GUI 重新选择一次官方 ZIP，把客户端从用户可写路径迁移到 root-owned `/usr/lib`。在迁移完成前，GUI 保留旧路径回退，但该路径不享受项目 policy 的保留授权。客户端迁移后应在 GUI 中重新启用一次开机认证，把旧 service 更新为 `Type=forking`、当前账号/网卡和固定 root-owned wrapper。
 
 安装脚本会删除旧桌面入口 `~/.local/share/applications/rjsupplicant.desktop`，防止应用菜单出现两个图标。
+
+卸载：
+
+```bash
+scripts/install.sh --uninstall
+```
+
+卸载会中断当前有线认证，停止并删除 `rjsupplicant.service`，必要时通过 helper 或旧 wrapper 断开手动认证进程，再移除 GUI、root-owned helper、polkit policy、新旧 wrapper、官方客户端目录、桌面入口和图标，但保留 `${XDG_CONFIG_HOME:-~/.config}/rjsupplicant-gui` 中的用户偏好。服务停止或手动断开失败时会在删除相关文件前中止。`tests/install_uninstall.sh` 将 HOME、XDG、systemd、libexec、客户端和 policy 路径全部指向临时目录，不接触本机服务或网络。
 
 ## 9. 开发与验证
 
@@ -227,18 +276,22 @@ sudo pacman -S --needed rust gtk4 libadwaita polkit desktop-file-utils unzip she
 完整验证：
 
 ```bash
-cargo fmt --check
-cargo test
-cargo clippy --all-targets -- -D warnings
-cargo build --release
-bash -n scripts/install.sh
-shellcheck scripts/install.sh
+cargo fmt --all --check
+cargo test --locked
+cargo clippy --locked --all-targets -- -D warnings
+cargo build --locked --release
+bash -n scripts/install.sh tests/install_uninstall.sh
+shellcheck scripts/install.sh tests/install_uninstall.sh
+tests/install_uninstall.sh
 desktop-file-validate data/io.github.pang.RjSupplicantGui.desktop
 xmllint --noout data/io.github.pang.RjSupplicantGui.svg
+xmllint --noout data/io.github.pang.RjSupplicantGui.policy
 git diff --check
 ```
 
-当前测试共 9 项，覆盖设置参数校验、认证/断开命令构造、systemd service 内容和 systemd 参数转义。
+当前 Rust 测试共 24 项，覆盖设置参数校验、新旧认证命令构造、密码标准输入校验、helper 参数拒绝、固定 root service、旧 service 路径拒绝、systemd 参数转义、ZIP 路径/源文件/符号链接校验、权限收紧、客户端安装、wrapper 生成和失败回滚；另有 1 个隔离 shell 回归脚本覆盖安装/卸载、root-owned 产物、不安全 ZIP、回滚、服务清理和配置保留。
+
+GitHub Actions 的 `Verify` 工作流使用 `archlinux:latest` 容器执行同一组检查，避免 Ubuntu 较旧的 libadwaita 版本与正式目标不一致。工作流在 push、pull request 和手动触发时运行，并使用 `Cargo.lock` 的锁定依赖。
 
 短启动检查：
 
@@ -260,6 +313,9 @@ timeout 3s target/release/rjsupplicant-gui
 - 不要在源码、脚本或 service 中写死 `/home/pang`，统一使用 `HOME`、XDG 路径或 `src/config.rs`。
 - 不要提交官方客户端 zip、解压后的闭源二进制、用户账号、密码、日志或本机 service。
 - 不要把配置权限从 `0600` 放宽。
+- 不要给用户可写的 `~/.local/bin/rjsupplicant` 配置 `auth_admin_keep`；保留授权只能执行 root-owned 固定 helper。
+- 不要放宽 `HelperRequest` 的子命令或参数数量；新增特权动作必须同时更新解析校验、helper 分支、policy 的 `argv1` 匹配、测试和文档。
+- 不要把 helper 中的 `/usr/bin/systemctl`、客户端、wrapper、`/usr/bin/unzip`、wrapper 解释器和 `getconf` 改回基于用户 `PATH` 查找。
 - 不要未经校验直接把账号或网卡拼入 systemd `ExecStart`；保留 `config::validate` 与 `systemd_quote`。
 - 不要把 `systemctl is-active` 当作认证成功信号。
 - 不要在 GTK 主线程直接调用 `.status()`、`.output()` 或长时间文件/日志读取。
@@ -271,9 +327,11 @@ timeout 3s target/release/rjsupplicant-gui
 
 - 官方客户端是闭源旧程序，类似 `sysctl: 写入错误: 错误的文件描述符` 的兼容性错误无法在 GUI 内部根治。
 - 官方客户端没有协议级成功回调，GUI 只能可靠判断进程、链路和服务状态，账号是否通过仍需看日志。
-- 首次或修改密码时，密码会短暂出现在官方客户端命令行参数中。
-- GUI 写 systemd service 需要 `pkexec`；连接等其他提权操作在没有 `pkexec` 时才回退到 kitty、foot、alacritty 或 xterm 中执行 `sudo`。
-- 安装脚本尚无卸载参数，也没有发行包或预编译 GitHub Release。
+- GUI 到 helper 的密码使用标准输入且不回显；首次或修改密码时，密码仍会短暂出现在官方闭源客户端命令行参数中。
+- root-owned helper 和 policy 必须先通过安装脚本部署；没有 `pkexec` 时，GUI 才回退到 kitty、foot、alacritty 或 xterm 中用 `sudo` 调用同一 helper。
+- 旧版用户级客户端回退仍保留用于迁移，但它不具备 root-owned helper 的完整权限边界，应尽快通过重新选择官方 ZIP 完成迁移。
+- policy 已做 XML/DTD 结构检查，但没有安装到本机或在真实 polkit agent 上触发，以免改动系统授权状态。
+- 项目定位为个人自用，通过 GitHub 保存和同步源码，不维护 Arch/AUR 包或预编译 Release。
 - 当前只有浅色主题。
 - 部分侧栏入口是同一连接页的快捷定位，不是六个独立页面。
 
@@ -282,8 +340,9 @@ timeout 3s target/release/rjsupplicant-gui
 官方客户端未安装：
 
 ```bash
-ls -l ~/.local/bin/rjsupplicant
-ls -l ~/.local/share/rjsupplicant/x64/rjsupplicant
+ls -l /usr/lib/rjsupplicant-gui/rjsupplicant-helper
+ls -l /usr/lib/rjsupplicant-gui/rjsupplicant
+ls -l /usr/lib/rjsupplicant/x64/rjsupplicant
 RJSUPPLICANT_ZIP=~/Downloads/RG_Supplicant_For_Linux_V1.31.zip scripts/install.sh
 ```
 
@@ -292,6 +351,7 @@ RJSUPPLICANT_ZIP=~/Downloads/RG_Supplicant_For_Linux_V1.31.zip scripts/install.s
 ```bash
 command -v pkexec
 systemctl status polkit
+ls -l /usr/share/polkit-1/actions/io.github.pang.RjSupplicantGui.policy
 systemctl cat rjsupplicant.service
 systemctl status rjsupplicant.service
 journalctl -u rjsupplicant.service -n 120 --no-pager
@@ -300,7 +360,7 @@ journalctl -u rjsupplicant.service -n 120 --no-pager
 认证结果不明确：
 
 ```bash
-cat ~/.local/share/rjsupplicant/x64/log/run.log
+cat /usr/lib/rjsupplicant/x64/log/run.log
 journalctl -u rjsupplicant.service -n 120 --no-pager
 pgrep -a rjsupplicant
 cat /sys/class/net/<网卡>/carrier
@@ -318,13 +378,9 @@ update-desktop-database ~/.local/share/applications
 按优先级排序：
 
 1. 在真实校园有线网环境完成一次连接、断开、错误密码和重启后的端到端验证，并记录脱敏日志。
-2. 增加 `scripts/install.sh --uninstall` 和对应文档。
-3. 将 `src/ui.rs` 按页面与组件拆分，保持现有视觉和断点不变。
-4. 为官方 zip 缺失提供 GUI 内选择文件并安装的流程。
-5. 增加 polkit policy，减少重复授权，同时严格限制可执行动作。
-6. 建立 GitHub Actions，自动执行 Rust、Shell、desktop 和 SVG 校验。
-7. 提供 Arch PKGBUILD 或 GitHub Release 预编译包。
-8. 若继续打磨图标，采用统一的自有 symbolic SVG 集，不要混用多种线宽和视觉语言。
+2. 在一次明确授权的测试窗口中安装 policy，实测六个 `argv1` 动作的匹配、取消授权、保留授权与错误参数拒绝。
+3. 保持 GitHub 源码仓库与验证工作流可用，不扩展 Arch/AUR 或预编译包发布范围。
+4. 若继续打磨图标，采用统一的自有 symbolic SVG 集，不要混用多种线宽和视觉语言。
 
 ## 14. 接手顺序
 
@@ -333,7 +389,7 @@ update-desktop-database ~/.local/share/applications
 1. 阅读本文件、`README.md` 和 `AUDIT.md`。
 2. 执行 `git status --short --branch`，确认没有覆盖用户未提交改动。
 3. 阅读 `src/config.rs` 和 `src/system.rs`，先理解路径、提权和 service 边界。
-4. 阅读 `src/ui.rs::install_breakpoints`、`connect_actions`、`refresh_status` 和 `sidebar_navigation`。
+4. 阅读 `src/ui/layout.rs::install_breakpoints`、`src/ui/runtime.rs::{connect_actions,refresh_status}` 和 `src/ui/navigation.rs::sidebar_navigation`。
 5. 运行完整验证命令。
 6. 修改 UI 时对照用户参考图，并完成四档宽度截图检查。
 7. 涉及真实认证或本机 systemd 服务前，先说明会影响当前网络和系统状态。

@@ -1,0 +1,60 @@
+name: Verify
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  arch-linux:
+    name: Arch Linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    container:
+      image: archlinux:latest
+    env:
+      CARGO_TERM_COLOR: always
+
+    steps:
+      - name: Install build and validation dependencies
+        run: >-
+          pacman -Syu --noconfirm --needed
+          base-devel rust gtk4 libadwaita unzip
+          desktop-file-utils libxml2 shellcheck
+
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Check Rust formatting
+        run: cargo fmt --check
+
+      - name: Run Rust tests
+        run: cargo test --locked
+
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Build release binary
+        run: cargo build --locked --release
+
+      - name: Validate shell scripts
+        run: |
+          bash -n scripts/install.sh tests/install_uninstall.sh
+          shellcheck scripts/install.sh tests/install_uninstall.sh
+          tests/install_uninstall.sh
+
+      - name: Validate desktop metadata and XML
+        run: |
+          desktop-file-validate data/io.github.pang.RjSupplicantGui.desktop
+          xmllint --noout data/io.github.pang.RjSupplicantGui.svg
+          xmllint --noout data/io.github.pang.RjSupplicantGui.policy
+
+      - name: Check whitespace errors
+        run: git diff --check

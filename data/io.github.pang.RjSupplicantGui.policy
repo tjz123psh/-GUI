@@ -1,0 +1,92 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+  "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+  "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <vendor>rjsupplicant-gui</vendor>
+  <vendor_url>https://github.com/tjz123psh/-GUI</vendor_url>
+
+  <action id="io.github.pang.RjSupplicantGui.install-client">
+    <description>Install the official Ruijie client</description>
+    <description xml:lang="zh_CN">安装官方锐捷客户端</description>
+    <message>Authentication is required to install the official Ruijie client</message>
+    <message xml:lang="zh_CN">安装官方锐捷客户端需要管理员授权</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/lib/rjsupplicant-gui/rjsupplicant-helper</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">install-client</annotate>
+  </action>
+
+  <action id="io.github.pang.RjSupplicantGui.authenticate">
+    <description>Authenticate to the wired campus network</description>
+    <description xml:lang="zh_CN">认证校园有线网络</description>
+    <message>Authentication is required to start wired network authentication</message>
+    <message xml:lang="zh_CN">启动校园有线认证需要管理员授权</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/lib/rjsupplicant-gui/rjsupplicant-helper</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">authenticate</annotate>
+  </action>
+
+  <action id="io.github.pang.RjSupplicantGui.disconnect">
+    <description>Disconnect wired campus authentication</description>
+    <description xml:lang="zh_CN">断开校园有线认证</description>
+    <message>Authentication is required to disconnect wired network authentication</message>
+    <message xml:lang="zh_CN">断开校园有线认证需要管理员授权</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/lib/rjsupplicant-gui/rjsupplicant-helper</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">disconnect</annotate>
+  </action>
+
+  <action id="io.github.pang.RjSupplicantGui.enable-service">
+    <description>Enable wired authentication at boot</description>
+    <description xml:lang="zh_CN">启用开机有线认证</description>
+    <message>Authentication is required to enable wired authentication at boot</message>
+    <message xml:lang="zh_CN">启用开机有线认证需要管理员授权</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/lib/rjsupplicant-gui/rjsupplicant-helper</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">enable-service</annotate>
+  </action>
+
+  <action id="io.github.pang.RjSupplicantGui.disable-service">
+    <description>Disable wired authentication at boot</description>
+    <description xml:lang="zh_CN">关闭开机有线认证</description>
+    <message>Authentication is required to disable wired authentication at boot</message>
+    <message xml:lang="zh_CN">关闭开机有线认证需要管理员授权</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/lib/rjsupplicant-gui/rjsupplicant-helper</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">disable-service</annotate>
+  </action>
+
+  <action id="io.github.pang.RjSupplicantGui.restart-service">
+    <description>Restart wired authentication service</description>
+    <description xml:lang="zh_CN">重启有线认证服务</description>
+    <message>Authentication is required to restart wired authentication</message>
+    <message xml:lang="zh_CN">重启有线认证服务需要管理员授权</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/lib/rjsupplicant-gui/rjsupplicant-helper</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">restart-service</annotate>
+  </action>
+</policyconfig>

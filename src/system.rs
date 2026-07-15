@@ -1,11 +1,15 @@
 use crate::config::{self, SERVICE, Settings};
 use anyhow::{Context, Result};
+use rjsupplicant_gui::privileged::{self, AuthOptions, CLIENT_DIR, HELPER_PATH, HelperRequest};
 use std::fs;
 use std::io::Write;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-const SERVICE_PATH: &str = "/etc/systemd/system/rjsupplicant.service";
+const PKEXEC_PATH: &str = "/usr/bin/pkexec";
+const SUDO_PATH: &str = "/usr/bin/sudo";
+const SYSTEMCTL_PATH: &str = "/usr/bin/systemctl";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommandSpec {
@@ -16,6 +20,8 @@ pub struct CommandSpec {
 #[derive(Clone, Debug)]
 pub struct ClientStatus {
     pub client_installed: bool,
+    pub client_requires_migration: bool,
+    pub service_requires_migration: bool,
     pub client_running: bool,
     pub client_uptime_seconds: Option<u64>,
     pub service_enabled: String,
@@ -25,6 +31,7 @@ pub struct ClientStatus {
 
 #[derive(Clone, Debug)]
 pub enum Action {
+    InstallClient,
     Authenticate,
     Disconnect,
     EnableService,
@@ -34,14 +41,20 @@ pub enum Action {
 
 pub fn load_status() -> ClientStatus {
     let (client_running, client_uptime_seconds) = client_process_info();
+    let privileged_ready = privileged_client_ready();
+    let legacy_ready = legacy_client_ready();
+    let service_enabled = command_text(SYSTEMCTL_PATH, &["is-enabled", SERVICE])
+        .unwrap_or_else(|| "unknown".to_string());
+    let service_active = command_text(SYSTEMCTL_PATH, &["is-active", SERVICE])
+        .unwrap_or_else(|| "unknown".to_string());
     ClientStatus {
-        client_installed: config::client_path().exists() && config::client_binary_path().exists(),
+        client_installed: privileged_ready || legacy_ready,
+        client_requires_migration: helper_installed() && !privileged_ready && legacy_ready,
+        service_requires_migration: privileged_ready && installed_service_is_unsafe(),
         client_running,
         client_uptime_seconds,
-        service_enabled: command_text("systemctl", &["is-enabled", SERVICE])
-            .unwrap_or_else(|| "unknown".to_string()),
-        service_active: command_text("systemctl", &["is-active", SERVICE])
-            .unwrap_or_else(|| "unknown".to_string()),
+        service_enabled,
+        service_active,
         last_log: recent_log(),
     }
 }
@@ -81,16 +94,42 @@ pub fn interface_has_carrier(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+pub fn install_official_client(zip_path: &Path) -> Result<()> {
+    if helper_installed() {
+        let zip_path = fs::canonicalize(zip_path).context("无法读取选择的安装包路径")?;
+        let spec = helper_command(HelperRequest::InstallClient(zip_path));
+        return run_elevated_wait(Action::InstallClient, &spec.program, &spec.args);
+    }
+    rjsupplicant_gui::client_install::install_official_client(
+        zip_path,
+        &config::data_dir(),
+        &config::client_path(),
+    )
+}
+
 pub fn authenticate(settings: &Settings, password: &str) -> Result<()> {
     config::validate(settings)?;
     ensure_client_installed()?;
-    let spec = authenticate_command(settings, password);
+    let use_helper = privileged_client_ready();
+    let spec = authenticate_command_for(settings, password, use_helper);
+    if use_helper {
+        return run_elevated_wait_with_input(
+            Action::Authenticate,
+            &spec.program,
+            &spec.args,
+            Some(password.as_bytes()),
+        );
+    }
     run_elevated_wait(Action::Authenticate, &spec.program, &spec.args)
 }
 
 pub fn disconnect() -> Result<()> {
     ensure_client_installed()?;
-    if command_text("systemctl", &["is-active", SERVICE]).as_deref() == Some("active") {
+    if privileged_client_ready() {
+        let spec = helper_command(HelperRequest::Disconnect);
+        return run_elevated_wait(Action::Disconnect, &spec.program, &spec.args);
+    }
+    if command_text(SYSTEMCTL_PATH, &["is-active", SERVICE]).as_deref() == Some("active") {
         let spec = stop_service_command();
         return run_elevated_wait(Action::Disconnect, &spec.program, &spec.args);
     }
@@ -99,23 +138,33 @@ pub fn disconnect() -> Result<()> {
 }
 
 pub fn enable_service(settings: &Settings) -> Result<()> {
-    install_service(settings)?;
-    let spec = enable_service_command();
-    run_elevated_wait(Action::EnableService, &spec.program, &spec.args)
+    config::validate(settings)?;
+    ensure_client_installed()?;
+    if privileged_client_ready() {
+        let spec = helper_command(HelperRequest::EnableService(privileged_options(
+            settings, None,
+        )));
+        return run_elevated_wait(Action::EnableService, &spec.program, &spec.args);
+    }
+    anyhow::bail!("旧版客户端不能启用开机认证，请通过顶部提示重新选择官方 ZIP 完成安全迁移")
 }
 
 pub fn disable_service() -> Result<()> {
+    if helper_installed() {
+        let spec = helper_command(HelperRequest::DisableService);
+        return run_elevated_wait(Action::DisableService, &spec.program, &spec.args);
+    }
     let spec = disable_service_command();
     run_elevated_wait(Action::DisableService, &spec.program, &spec.args)
 }
 
 pub fn restart_service() -> Result<()> {
     ensure_client_installed()?;
-    run_elevated_wait(
-        Action::RestartService,
-        "systemctl",
-        &["restart".to_string(), SERVICE.to_string()],
-    )
+    if privileged_client_ready() {
+        let spec = helper_command(HelperRequest::RestartService);
+        return run_elevated_wait(Action::RestartService, &spec.program, &spec.args);
+    }
+    anyhow::bail!("旧版客户端不能重启开机认证，请先完成 root-owned 客户端迁移")
 }
 
 pub fn test_connectivity() -> Result<()> {
@@ -135,7 +184,11 @@ pub fn test_connectivity() -> Result<()> {
 }
 
 pub fn open_client_folder() -> Result<()> {
-    open_with_default_app(config::data_dir())
+    open_with_default_app(client_data_dir())
+}
+
+pub fn client_display_path() -> PathBuf {
+    client_data_dir()
 }
 
 pub fn open_help() -> Result<()> {
@@ -157,8 +210,8 @@ pub fn open_live_log() -> Result<()> {
 }
 
 fn run_elevated(action: Action, program: &str, args: &[String]) -> Result<()> {
-    if command_exists("pkexec") {
-        Command::new("pkexec")
+    if command_exists(PKEXEC_PATH) {
+        Command::new(PKEXEC_PATH)
             .arg(program)
             .args(args)
             .spawn()
@@ -166,18 +219,43 @@ fn run_elevated(action: Action, program: &str, args: &[String]) -> Result<()> {
         return Ok(());
     }
 
-    let mut terminal_args = vec!["sudo".to_string(), program.to_string()];
+    let mut terminal_args = vec![SUDO_PATH.to_string(), program.to_string()];
     terminal_args.extend(args.iter().cloned());
     run_terminal(action_label(&action), &terminal_args)
 }
 
 fn run_elevated_wait(action: Action, program: &str, args: &[String]) -> Result<()> {
-    if command_exists("pkexec") {
-        let status = Command::new("pkexec")
-            .arg(program)
-            .args(args)
-            .status()
+    run_elevated_wait_with_input(action, program, args, None)
+}
+
+fn run_elevated_wait_with_input(
+    action: Action,
+    program: &str,
+    args: &[String],
+    input: Option<&[u8]>,
+) -> Result<()> {
+    if command_exists(PKEXEC_PATH) {
+        let mut command = Command::new(PKEXEC_PATH);
+        command.arg(program).args(args);
+        if input.is_some() {
+            command.stdin(Stdio::piped());
+        }
+        let mut child = command
+            .spawn()
             .with_context(|| format!("无法启动系统授权：{}", action_label(&action)))?;
+        if let Some(input) = input {
+            let write_result = child
+                .stdin
+                .take()
+                .context("无法打开 helper 密码输入通道")?
+                .write_all(input);
+            if let Err(err) = write_result {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(err).context("无法写入 helper 密码输入通道");
+            }
+        }
+        let status = child.wait()?;
 
         if status.success() {
             return Ok(());
@@ -189,45 +267,7 @@ fn run_elevated_wait(action: Action, program: &str, args: &[String]) -> Result<(
     run_elevated(action, program, args)
 }
 
-fn install_service(settings: &Settings) -> Result<()> {
-    config::validate(settings)?;
-    ensure_client_installed()?;
-
-    write_root_file(SERVICE_PATH, &service_file(settings))?;
-    run_elevated_wait(
-        Action::EnableService,
-        "systemctl",
-        &["daemon-reload".to_string()],
-    )
-}
-
-fn write_root_file(path: &str, content: &str) -> Result<()> {
-    if !command_exists("pkexec") {
-        anyhow::bail!("找不到 pkexec，无法写入 {}", path);
-    }
-
-    let mut child = Command::new("pkexec")
-        .arg("tee")
-        .arg(path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .spawn()
-        .with_context(|| format!("无法请求管理员授权写入 {}", path))?;
-
-    child
-        .stdin
-        .as_mut()
-        .context("无法写入 systemd 服务内容")?
-        .write_all(content.as_bytes())?;
-
-    let status = child.wait()?;
-    if status.success() {
-        return Ok(());
-    }
-
-    anyhow::bail!("写入 {} 失败：{}", path, status);
-}
-
+#[cfg(test)]
 pub fn service_file(settings: &Settings) -> String {
     let dhcp = if settings.dhcp { "1" } else { "0" };
     let save = if settings.save_password { "1" } else { "0" };
@@ -264,6 +304,7 @@ pub fn service_file(settings: &Settings) -> String {
     )
 }
 
+#[cfg(test)]
 fn systemd_quote(value: &str) -> String {
     let escaped = value
         .replace('\\', "\\\\")
@@ -273,14 +314,19 @@ fn systemd_quote(value: &str) -> String {
 }
 
 fn ensure_client_installed() -> Result<()> {
-    if config::client_path().exists() && config::client_binary_path().exists() {
+    if client_installed() {
         return Ok(());
     }
 
     anyhow::bail!("官方客户端未安装，请先运行 scripts/install.sh 并放入官方客户端 zip")
 }
 
-pub fn authenticate_command(settings: &Settings, password: &str) -> CommandSpec {
+fn authenticate_command_for(settings: &Settings, password: &str, use_helper: bool) -> CommandSpec {
+    if use_helper {
+        return helper_command(HelperRequest::Authenticate(privileged_options(
+            settings, None,
+        )));
+    }
     let dhcp = if settings.dhcp { "1" } else { "0" };
     let save = if settings.save_password { "1" } else { "0" };
 
@@ -308,6 +354,23 @@ pub fn authenticate_command(settings: &Settings, password: &str) -> CommandSpec 
     }
 }
 
+fn privileged_options(settings: &Settings, password: Option<String>) -> AuthOptions {
+    AuthOptions {
+        username: settings.username.trim().to_string(),
+        nic: settings.nic.trim().to_string(),
+        dhcp: settings.dhcp,
+        save_password: settings.save_password,
+        password,
+    }
+}
+
+fn helper_command(request: HelperRequest) -> CommandSpec {
+    CommandSpec {
+        program: HELPER_PATH.to_string(),
+        args: request.arguments(),
+    }
+}
+
 pub fn disconnect_command() -> CommandSpec {
     CommandSpec {
         program: config::path_string(&config::client_path()),
@@ -315,9 +378,10 @@ pub fn disconnect_command() -> CommandSpec {
     }
 }
 
+#[cfg(test)]
 pub fn enable_service_command() -> CommandSpec {
     CommandSpec {
-        program: "systemctl".to_string(),
+        program: SYSTEMCTL_PATH.to_string(),
         args: vec![
             "enable".to_string(),
             "--now".to_string(),
@@ -328,7 +392,7 @@ pub fn enable_service_command() -> CommandSpec {
 
 pub fn disable_service_command() -> CommandSpec {
     CommandSpec {
-        program: "systemctl".to_string(),
+        program: SYSTEMCTL_PATH.to_string(),
         args: vec![
             "disable".to_string(),
             "--now".to_string(),
@@ -339,7 +403,7 @@ pub fn disable_service_command() -> CommandSpec {
 
 pub fn stop_service_command() -> CommandSpec {
     CommandSpec {
-        program: "systemctl".to_string(),
+        program: SYSTEMCTL_PATH.to_string(),
         args: vec!["stop".to_string(), SERVICE.to_string()],
     }
 }
@@ -387,7 +451,7 @@ fn run_terminal(title: &str, args: &[String]) -> Result<()> {
 fn recent_log() -> String {
     let journal = command_text("journalctl", &["-u", SERVICE, "-n", "60", "--no-pager"])
         .filter(|text| !text.is_empty() && !text.contains("-- No entries --"));
-    let client = fs::read_to_string(config::log_path())
+    let client = fs::read_to_string(client_log_path())
         .ok()
         .filter(|text| !text.trim().is_empty())
         .map(|text| tail_lines(&text, 80));
@@ -490,12 +554,62 @@ fn is_executable_file(path: PathBuf) -> bool {
 
 fn action_label(action: &Action) -> &'static str {
     match action {
+        Action::InstallClient => "安装官方锐捷客户端",
         Action::Authenticate => "锐捷有线认证",
         Action::Disconnect => "断开锐捷认证",
         Action::EnableService => "启用锐捷开机自启",
         Action::DisableService => "禁用锐捷开机自启",
         Action::RestartService => "重启锐捷认证服务",
     }
+}
+
+fn helper_installed() -> bool {
+    is_executable_file(PathBuf::from(HELPER_PATH))
+}
+
+fn privileged_client_ready() -> bool {
+    helper_installed()
+        && is_executable_file(PathBuf::from(privileged::CLIENT_WRAPPER_PATH))
+        && is_executable_file(privileged::client_binary_path())
+}
+
+fn legacy_client_ready() -> bool {
+    is_executable_file(config::client_path()) && is_executable_file(config::client_binary_path())
+}
+
+fn client_installed() -> bool {
+    privileged_client_ready() || legacy_client_ready()
+}
+
+fn client_data_dir() -> PathBuf {
+    if privileged_client_ready() {
+        PathBuf::from(CLIENT_DIR)
+    } else {
+        config::data_dir()
+    }
+}
+
+fn client_log_path() -> PathBuf {
+    if privileged_client_ready() {
+        privileged::client_log_path()
+    } else {
+        config::log_path()
+    }
+}
+
+fn installed_service_is_unsafe() -> bool {
+    let path = Path::new(privileged::SERVICE_PATH);
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(_) => return true,
+    };
+    if !metadata.file_type().is_file() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+        return true;
+    }
+    fs::read_to_string(path)
+        .map(|content| !privileged::service_content_uses_owned_paths(&content))
+        .unwrap_or(true)
 }
 
 #[cfg(test)]
@@ -513,7 +627,7 @@ mod tests {
 
     #[test]
     fn builds_authenticate_command_without_password() {
-        let spec = authenticate_command(&settings(), "");
+        let spec = authenticate_command_for(&settings(), "", false);
 
         assert_eq!(spec.program, config::path_string(&config::client_path()));
         assert_eq!(
@@ -526,7 +640,7 @@ mod tests {
 
     #[test]
     fn builds_authenticate_command_with_password_only_when_present() {
-        let spec = authenticate_command(&settings(), "secret");
+        let spec = authenticate_command_for(&settings(), "secret", false);
 
         assert_eq!(
             spec.args,
@@ -542,13 +656,31 @@ mod tests {
         settings.dhcp = false;
         settings.save_password = false;
 
-        let spec = authenticate_command(&settings, "  ");
+        let spec = authenticate_command_for(&settings, "  ", false);
 
         assert_eq!(
             spec.args,
             [
                 "-a", "1", "-d", "0", "-n", "enp4s0", "-u", "20260001", "-S", "0"
             ]
+        );
+    }
+
+    #[test]
+    fn privileged_authenticate_uses_fixed_helper_without_password_argument() {
+        let spec = authenticate_command_for(&settings(), "secret", true);
+
+        assert_eq!(spec.program, HELPER_PATH);
+        assert!(!spec.args.iter().any(|argument| argument == "secret"));
+        assert_eq!(
+            HelperRequest::parse(&spec.args).expect("parse helper arguments"),
+            HelperRequest::Authenticate(AuthOptions {
+                username: "20260001".to_string(),
+                nic: "enp4s0".to_string(),
+                dhcp: true,
+                save_password: true,
+                password: None,
+            })
         );
     }
 
@@ -568,7 +700,7 @@ mod tests {
         assert_eq!(
             enable_service_command(),
             CommandSpec {
-                program: "systemctl".to_string(),
+                program: SYSTEMCTL_PATH.to_string(),
                 args: vec![
                     "enable".to_string(),
                     "--now".to_string(),
@@ -579,7 +711,7 @@ mod tests {
         assert_eq!(
             disable_service_command(),
             CommandSpec {
-                program: "systemctl".to_string(),
+                program: SYSTEMCTL_PATH.to_string(),
                 args: vec![
                     "disable".to_string(),
                     "--now".to_string(),
@@ -590,7 +722,7 @@ mod tests {
         assert_eq!(
             stop_service_command(),
             CommandSpec {
-                program: "systemctl".to_string(),
+                program: SYSTEMCTL_PATH.to_string(),
                 args: vec!["stop".to_string(), SERVICE.to_string()]
             }
         );

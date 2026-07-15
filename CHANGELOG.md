@@ -18,6 +18,7 @@
 - 官方客户端与 wrapper 迁移到 root-owned `/usr/lib`；旧用户级路径仅作为升级回退。
 - 开机认证 service 由 helper 按当前设置生成，安装脚本不再创建参数不完整的默认服务。
 - 重复运行安装器时跳过已经就绪的 root-owned 客户端，可通过环境变量显式要求重装。
+- Arch 安装时复用已有 rustup 工具链，避免与 pacman 的 `rust` 包发生 cargo 冲突。
 - “关于”对话框直接读取 Cargo 包版本。
 
 ### Security

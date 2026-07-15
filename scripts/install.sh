@@ -99,7 +99,13 @@ install_system_deps() {
 
   if need_cmd pacman; then
     log "安装/确认 Arch Linux 依赖。"
-    sudo pacman -S --needed rust gtk4 libadwaita polkit desktop-file-utils unzip
+    local dependencies=(gtk4 libadwaita polkit desktop-file-utils unzip)
+    if cargo --version >/dev/null 2>&1 && rustc --version >/dev/null 2>&1; then
+      log "检测到可用 Rust 工具链，保留当前 rustup/cargo 配置。"
+    else
+      dependencies=(rust "${dependencies[@]}")
+    fi
+    sudo pacman -S --needed "${dependencies[@]}"
     return
   fi
 

@@ -265,6 +265,8 @@ git clone https://github.com/tjz123psh/-GUI.git ~/.local/src/rjsupplicant-gui
 
 安装脚本先构建并安装 root-owned helper 与 polkit policy，再通过 helper 安装 ZIP，最后安装用户级 GUI。如果没有 zip，仍会安装 GUI、helper 和 policy，但会跳过官方客户端；安装阶段始终不创建 systemd 服务。zip 到位后可在 GUI 中点击“选择安装包”，或重新运行脚本。
 
+依赖安装会先执行 `cargo --version` 和 `rustc --version`；现有 rustup 工具链可用时不会安装 pacman 的 `rust` 包，避免两套 cargo 冲突。
+
 从旧版本升级时应重新运行 `scripts/install.sh`，并通过脚本或 GUI 重新选择一次官方 ZIP，把客户端从用户可写路径迁移到 root-owned `/usr/lib`。在迁移完成前，GUI 保留旧路径回退，但该路径不享受项目 policy 的保留授权。客户端迁移后应在 GUI 中重新启用一次开机认证，把旧 service 更新为 `Type=forking`、当前账号/网卡和固定 root-owned wrapper。
 
 安装脚本会删除旧桌面入口 `~/.local/share/applications/rjsupplicant.desktop`，防止应用菜单出现两个图标。

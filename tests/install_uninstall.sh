@@ -14,6 +14,7 @@ CONFIG_HOME="${TMP_DIR}/config"
 SYSTEMD_DIR="${TMP_DIR}/systemd"
 FAKE_BIN="${TMP_DIR}/bin"
 SUDO_LOG="${TMP_DIR}/sudo.log"
+PACMAN_LOG="${TMP_DIR}/pacman.log"
 PRIVILEGED_DIR="${TMP_DIR}/lib/rjsupplicant-gui"
 ROOT_CLIENT_DIR="${TMP_DIR}/lib/rjsupplicant"
 POLICY_DIR="${TMP_DIR}/polkit-actions"
@@ -85,6 +86,19 @@ fi
 exec "$@"
 EOF
 chmod 755 "${FAKE_BIN}/sudo"
+
+cat >"${FAKE_BIN}/pacman" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+for argument in "$@"; do
+  if [[ "${argument}" == "rust" ]]; then
+    printf '已有 rustup 时安装器仍请求 pacman rust\n' >&2
+    exit 1
+  fi
+done
+printf '%s\n' "$*" >"${PACMAN_LOG}"
+EOF
+chmod 755 "${FAKE_BIN}/pacman"
 
 cat >"${FAKE_BIN}/unzip" <<'EOF'
 #!/usr/bin/env bash
@@ -201,8 +215,8 @@ RJSUPPLICANT_LIBEXEC_DIR="${INSTALL_LIBEXEC}" \
 RJSUPPLICANT_PRIVILEGED_CLIENT_DIR="${INSTALL_ROOT_CLIENT}" \
 RJSUPPLICANT_POLICY_DIR="${INSTALL_POLICY}" \
 RJSUPPLICANT_ZIP="${INSTALL_ZIP}" \
-SKIP_SYSTEM_DEPS=1 \
 SUDO_LOG="${SUDO_LOG}" \
+PACMAN_LOG="${PACMAN_LOG}" \
 CARGO_HOME="${HOST_CARGO_HOME}" \
 RUSTUP_HOME="${HOST_RUSTUP_HOME}" \
 PATH="${FAKE_BIN}:${PATH}" \
@@ -214,6 +228,7 @@ PATH="${FAKE_BIN}:${PATH}" \
 [[ -x "${INSTALL_ROOT_CLIENT}/x64/rjsupplicant" ]]
 [[ -f "${INSTALL_POLICY}/io.github.pang.RjSupplicantGui.policy" ]]
 [[ ! -e "${INSTALL_SYSTEMD}/rjsupplicant.service" ]]
+grep -Fq 'gtk4 libadwaita polkit desktop-file-utils unzip' "${PACMAN_LOG}"
 
 HOME="${INSTALL_HOME}" \
 XDG_DATA_HOME="${INSTALL_DATA}" \

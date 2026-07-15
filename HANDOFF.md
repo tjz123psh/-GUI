@@ -2,6 +2,8 @@
 
 - 最后更新：2026-07-15
 - 当前版本：0.3.0
+- 项目状态：功能冻结，等待校园有线网实机验证
+- 最终验收代码基线：`9ff5645`
 - 主分支：`main`
 - 远端：`git@github.com:tjz123psh/-GUI.git`
 
@@ -11,7 +13,9 @@
 
 当前实现具备安装官方客户端、保存非密码配置、连接/断开认证、管理开机认证、读取真实进程与网线状态、查看日志和执行常用诊断操作的完整闭环。项目不实现锐捷认证协议，而是包装学校提供的闭源 Linux 客户端。
 
-本轮代码已经通过格式、24 项 Rust 测试、Clippy、Release 构建、ShellCheck、隔离安装/卸载回归、desktop、SVG/polkit XML 和 diff 空白检查。为避免影响当前网络，验证期间没有安装 helper 到真实系统、主动发起校园网认证或改动本机现有 systemd 服务。
+2026-07-15 已完成最终非联网验收：格式、24 项 Rust 测试、Clippy、Release 构建、ShellCheck、隔离安装/卸载回归、desktop、SVG/polkit XML 和 diff 空白检查全部通过；连接页、设置页和诊断页也在真实 niri 会话中通过 640、960、1280、1920 四档宽度实图检查。当前没有继续修改代码的发布阻塞项，项目进入功能冻结状态，等待校园有线网实机验证。
+
+本机已经通过一键脚本安装当前版本。验收时确认 GUI 与 helper 的哈希和当前 Release 完全一致，helper、wrapper、官方客户端及 policy 均为正确的 root-owned 权限，学校官方 ZIP 的 SHA-256 也匹配固定值。验收没有主动发起认证或创建/改动 systemd 服务；测试 GUI 已关闭。
 
 详细审计记录见 [AUDIT.md](AUDIT.md)，面向使用者的安装说明见 [README.md](README.md)。
 
@@ -312,6 +316,16 @@ git diff --check
 
 GitHub Actions 的 `Verify` 工作流使用 `archlinux:latest` 容器执行同一组检查，避免 Ubuntu 较旧的 libadwaita 版本与正式目标不一致。工作流在 push、pull request 和手动触发时运行，并使用 `Cargo.lock` 的锁定依赖。
 
+### 2026-07-15 最终验收记录
+
+- 仓库工作区干净，`main` 与 GitHub 远端一致，验收代码基线为 `9ff5645`。
+- 当前安装的 GUI、helper、图标和 policy 与仓库/Release 一致；root-owned 目录和程序均不可由普通用户修改。
+- `~/Downloads/RG_Supplicant_For_Linux_V1.31.zip` 的 SHA-256 为 `d211d9a6efbe5f9dcc27eb78af9515a279b3e44dfc8580e6801b79e9a4f1eea9`，与 bootstrap 固定值一致。
+- 连接页、设置对话框和诊断页在 niri 的 640、960、1280、1920 宽度下均无控件裁切或主操作缺失。
+- 当前没有 `rjsupplicant.service` 属于正常状态；只有用户在 GUI 中启用“开机自动认证”后才会生成服务。
+- 当前没有设置文件也属于正常状态；首次保存设置时才会以 `0600` 权限创建。
+- 未执行正确密码、错误密码、断开、polkit 授权或重启后的实际认证测试。
+
 短启动检查：
 
 ```bash
@@ -349,7 +363,7 @@ timeout 3s target/release/rjsupplicant-gui
 - GUI 到 helper 的密码使用标准输入且不回显；首次或修改密码时，密码仍会短暂出现在官方闭源客户端命令行参数中。
 - root-owned helper 和 policy 必须先通过安装脚本部署；没有 `pkexec` 时，GUI 才回退到 kitty、foot、alacritty 或 xterm 中用 `sudo` 调用同一 helper。
 - 旧版用户级客户端回退仍保留用于迁移，但它不具备 root-owned helper 的完整权限边界，应尽快通过重新选择官方 ZIP 完成迁移。
-- policy 已做 XML/DTD 结构检查，但没有安装到本机或在真实 polkit agent 上触发，以免改动系统授权状态。
+- policy 与 helper 已安装到本机并核对属主、权限和文件内容，但尚未在真实 polkit agent 上触发授权、取消或保留授权流程。
 - 项目定位为个人自用，通过 GitHub 保存和同步源码，不维护 Arch/AUR 包或预编译 Release。
 - 当前只有浅色主题。
 - 部分侧栏入口是同一连接页的快捷定位，不是六个独立页面。
@@ -392,26 +406,30 @@ rm -f ~/.local/share/applications/rjsupplicant.desktop
 update-desktop-database ~/.local/share/applications
 ```
 
-## 13. 后续建议
+## 13. 后续工作触发条件
 
-按优先级排序：
+当前不安排新的功能开发或界面调整。只有在校园有线网实机验证出现问题时再恢复工作，验证范围为：
 
-1. 在真实校园有线网环境完成一次连接、断开、错误密码和重启后的端到端验证，并记录脱敏日志。
-2. 在一次明确授权的测试窗口中安装 policy，实测六个 `argv1` 动作的匹配、取消授权、保留授权与错误参数拒绝。
-3. 保持 GitHub 源码仓库与验证工作流可用，不扩展 Arch/AUR 或预编译包发布范围。
-4. 若继续打磨图标，采用统一的自有 symbolic SVG 集，不要混用多种线宽和视觉语言。
+1. 正确账号和密码能否完成认证，日志是否能明确判断结果。
+2. 错误密码时 GUI 状态、提示和日志是否符合实际结果。
+3. 手动断开、重新连接以及 service 正在运行时的断开行为是否正确。
+4. polkit 授权、取消授权和授权保留期间的六个 helper 动作是否正常。
+5. 启用开机自动认证后重启，systemd 是否自动认证；关闭自启后是否彻底停止并禁用服务。
+
+若以上项目全部通过，`v0.3.0` 即可视为个人使用的最终版本。若出现问题，应先记录操作步骤、界面状态和脱敏后的 `run.log`/journal，再针对具体故障修改；不要在没有复现证据时继续重构。
 
 ## 14. 接手顺序
 
 下一位开发者或 AI 建议按以下顺序恢复上下文：
 
-1. 阅读本文件、`README.md` 和 `AUDIT.md`。
-2. 执行 `git status --short --branch`，确认没有覆盖用户未提交改动。
-3. 阅读 `src/config.rs` 和 `src/system.rs`，先理解路径、提权和 service 边界。
-4. 阅读 `src/ui/layout.rs::install_breakpoints`、`src/ui/runtime.rs::{connect_actions,refresh_status}` 和 `src/ui/navigation.rs::sidebar_navigation`。
-5. 运行完整验证命令。
-6. 修改 UI 时对照用户参考图，并完成四档宽度截图检查。
-7. 涉及真实认证或本机 systemd 服务前，先说明会影响当前网络和系统状态。
-8. 提交前检查是否意外加入官方二进制、账号、密码、日志、截图或临时文件。
+1. 先确认用户在上述哪一项实机验证中遇到问题，并收集可复现步骤与脱敏日志。
+2. 阅读本文件、`README.md` 和 `AUDIT.md`。
+3. 执行 `git status --short --branch`，确认没有覆盖用户未提交改动。
+4. 阅读 `src/config.rs` 和 `src/system.rs`，先理解路径、提权和 service 边界。
+5. 阅读 `src/ui/layout.rs::install_breakpoints`、`src/ui/runtime.rs::{connect_actions,refresh_status}` 和 `src/ui/navigation.rs::sidebar_navigation`。
+6. 运行完整验证命令。
+7. 修改 UI 时对照用户参考图，并完成四档宽度截图检查。
+8. 涉及真实认证或本机 systemd 服务前，先说明会影响当前网络和系统状态。
+9. 提交前检查是否意外加入官方二进制、账号、密码、日志、截图或临时文件。
 
 交接完成的判断标准不是“程序能编译”，而是安装可恢复、GUI 不阻塞、提权结果可靠、service 生命周期正确、状态文案不误导，并且四档 niri 列宽的布局都通过实图检查。

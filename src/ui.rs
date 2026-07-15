@@ -2,6 +2,7 @@ mod components;
 mod layout;
 mod navigation;
 mod runtime;
+mod settings;
 
 use self::components::*;
 use self::layout::install_breakpoints;
@@ -555,6 +556,7 @@ pub fn build(app: &adw::Application) {
         &diagnostics_page,
     );
     connect_actions(&ui);
+    settings::install_settings_action(app, &ui);
     connect_sidebar(&ui, &sidebar, &connection_page);
     update_controls(&ui);
     refresh_status(&ui);

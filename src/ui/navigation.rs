@@ -1,5 +1,4 @@
 use super::AppUi;
-use crate::config;
 use adw::prelude::*;
 use gtk::{gio, glib};
 use gtk4 as gtk;
@@ -287,19 +286,8 @@ pub(super) fn connect_sidebar(
     }
 
     for trigger in &sidebar.settings_buttons {
-        let window = ui.window.clone();
-        trigger.connect_clicked(move |_| {
-            let dialog = adw::AlertDialog::builder()
-                .heading("设置中心")
-                .body(format!(
-                    "配置文件：{}\n官方客户端：{}\n\n账号和连接选项可在“认证设置”中修改。",
-                    config::settings_path().display(),
-                    crate::system::client_display_path().display()
-                ))
-                .build();
-            dialog.add_response("close", "关闭");
-            dialog.present(Some(&window));
-        });
+        let settings_ui = ui.clone();
+        trigger.connect_clicked(move |_| super::settings::show_settings_dialog(&settings_ui));
     }
 
     for trigger in &sidebar.about_buttons {

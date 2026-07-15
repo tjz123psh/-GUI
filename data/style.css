@@ -9,10 +9,41 @@
 @define-color warm_accent_2 #ffad43;
 @define-color warm_success #36bd6b;
 
+/* Keep libadwaita dialogs consistent even when the user GTK theme is dark. */
+@define-color accent_bg_color @warm_accent;
+@define-color accent_fg_color #ffffff;
+@define-color window_bg_color @warm_canvas;
+@define-color window_fg_color @warm_text;
+@define-color view_bg_color @warm_canvas;
+@define-color view_fg_color @warm_text;
+@define-color headerbar_bg_color #fffaf4;
+@define-color headerbar_fg_color @warm_text;
+@define-color sidebar_bg_color @warm_sidebar;
+@define-color sidebar_fg_color @warm_text;
+@define-color card_bg_color @warm_surface;
+@define-color card_fg_color @warm_text;
+@define-color popover_bg_color @warm_surface;
+@define-color popover_fg_color @warm_text;
+@define-color dialog_bg_color @warm_canvas;
+@define-color dialog_fg_color @warm_text;
+@define-color headerbar_backdrop_color @window_bg_color;
+@define-color sidebar_backdrop_color @sidebar_bg_color;
+
 window,
 .app-shell {
   background: @warm_canvas;
   color: @warm_text;
+}
+
+.settings-dialog.preferences,
+.settings-page {
+  background: @warm_canvas;
+  color: @warm_text;
+}
+
+.settings-page scrolledwindow,
+.settings-page viewport {
+  background: transparent;
 }
 
 headerbar,

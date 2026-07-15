@@ -187,10 +187,6 @@ pub fn open_client_folder() -> Result<()> {
     open_with_default_app(client_data_dir())
 }
 
-pub fn client_display_path() -> PathBuf {
-    client_data_dir()
-}
-
 pub fn open_help() -> Result<()> {
     open_with_default_app("https://etr.gdufs.edu.cn/info/1303/5137.htm")
 }

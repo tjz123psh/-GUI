@@ -615,7 +615,7 @@ fn format_duration(total_seconds: u64) -> String {
     format!("{hours:02}:{minutes:02}:{seconds:02}")
 }
 
-fn toast(ui: &AppUi, message: &str) {
+pub(super) fn toast(ui: &AppUi, message: &str) {
     ui.toasts.add_toast(adw::Toast::new(message));
 }
 

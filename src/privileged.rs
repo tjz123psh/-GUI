@@ -86,11 +86,11 @@ pub fn service_file(options: &AuthOptions) -> String {
     let client = systemd_quote(CLIENT_WRAPPER_PATH);
     let nic = systemd_quote(&options.nic);
     let username = systemd_quote(&options.username);
-    let workdir = systemd_quote(
-        &Path::new(CLIENT_DIR)
-            .join(current_arch_dir())
-            .to_string_lossy(),
-    );
+    // systemd 的 WorkingDirectory= 不接受引号包裹（与 ExecStart 不同），必须裸绝对路径
+    let workdir = Path::new(CLIENT_DIR)
+        .join(current_arch_dir())
+        .to_string_lossy()
+        .into_owned();
 
     format!(
         "[Unit]\n\
@@ -119,7 +119,7 @@ pub fn service_content_uses_owned_paths(content: &str) -> bool {
     let expected_program = format!("ExecStart=\"{CLIENT_WRAPPER_PATH}\"");
     let expected_stop = format!("ExecStop=\"{CLIENT_WRAPPER_PATH}\" -q");
     let expected_workdir = format!(
-        "WorkingDirectory=\"{}\"",
+        "WorkingDirectory={}",
         Path::new(CLIENT_DIR).join(current_arch_dir()).display()
     );
     let mut start_count = 0;

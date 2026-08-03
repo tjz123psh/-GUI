@@ -11,13 +11,29 @@
 - 查看认证进程、systemd 状态及客户端日志
 - 管理开机自动认证
 - 在应用内安装学校官方客户端 ZIP
+- 渐进披露浮层：DHCP/保存密码连接设置与测试连通、重启认证服务等诊断工具
+- 完整日志查看（点击"最近日志"弹出可滚动日志面板）
 - 适配 Niri 的窄列、半宽和全宽窗口
 - 通过 root-owned helper 和 polkit 安全执行特权操作
 
-## 一键安装
+界面采用樱花学园主题：整幅樱花插画随窗口宽度在窄列裁切、半景与完整构图间切换，场景层铺满全窗口、标题栏透明沉浸（背景贯穿到顶部，标题与窗口按钮浮于其上）；内容为**舞台 + 控制台**——左侧透明舞台直接透出樱花场景（大状态字 + 设备↔校园网关自绘链路图，认证时链路点亮光点流动 + 4 枚状态胶囊），右侧 420px 单张玻璃控制台（连接设置表单、连接/断开/安装、最近日志、诊断工具），窄列自动折叠为单栏实底控制台 + 顶部状态条。配 Tabler 线性玫瑰粉图标，认证成功时画面向暖粉霞光漫开、链路节点泛起光晕。低频工具遵循渐进披露：DHCP、保存密码等连接设置与测试连通、重启开机认证、打开日志等诊断动作收在标题栏"更多工具"深紫浮层，完整日志可从"最近日志"行弹出查看，控制台只保留核心认证流程。
+
+## 安装
+
+推荐先把源码放到可审查的本地目录，再运行仓库内脚本：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/tjz123psh/-GUI/main/scripts/bootstrap.sh | bash
+git clone https://github.com/tjz123psh/-GUI.git ~/.local/src/rjsupplicant-gui
+~/.local/src/rjsupplicant-gui/scripts/bootstrap.sh
+```
+
+不使用 Git 时，也应先把引导脚本下载为文件、检查后再执行；不要直接使用 `curl | sh`：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/tjz123psh/-GUI/main/scripts/bootstrap.sh \
+  -o /tmp/rjsupplicant-bootstrap.sh
+sed -n '1,240p' /tmp/rjsupplicant-bootstrap.sh
+bash /tmp/rjsupplicant-bootstrap.sh
 ```
 
 安装过程会：
@@ -32,12 +48,12 @@ curl -fsSL https://raw.githubusercontent.com/tjz123psh/-GUI/main/scripts/bootstr
 
 ## 更新
 
-重新运行同一条安装命令即可。已有官方客户端不会重复安装。
+重新运行本地 `~/.local/src/rjsupplicant-gui/scripts/bootstrap.sh` 即可。已有官方客户端不会重复安装。
 
 ## 卸载
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/tjz123psh/-GUI/main/scripts/bootstrap.sh | bash -s -- --uninstall
+~/.local/src/rjsupplicant-gui/scripts/bootstrap.sh --uninstall
 ```
 
 卸载会停止认证服务并删除应用和客户端，但保留账号、网卡等用户偏好。卸载过程会中断当前有线认证。
@@ -50,6 +66,16 @@ curl -fsSL https://raw.githubusercontent.com/tjz123psh/-GUI/main/scripts/bootstr
 4. 需要无人值守认证时，再启用“开机自动认证”。
 
 GUI 不保存校园网密码。认证是否最终成功以官方客户端日志为准。
+
+### 安装或重装官方客户端
+
+官方认证客户端不是发行版软件，需要从学校官网下载 Linux 版 ZIP（`RG_Supplicant_For_Linux_V1.31.zip`）后安装：
+
+- 在应用内：点控制台「安装官方客户端」按钮，选择下载好的 ZIP，按提示完成授权安装；
+- 若应用检测到已安装的客户端是旧版结构，顶部会弹出横幅提示，「现在处理」按钮进入同一安装流程；
+- 命令行方式：`~/.local/src/rjsupplicant-gui/scripts/install.sh`（安装脚本会识别 `~/Downloads` 下的 ZIP，`--help` 可查看其他参数）。
+
+安装会把客户端解压到 `/usr/lib/rjsupplicant/` 并配置提权与开机认证所需文件；重装系统后重新运行上述任一入口即可恢复，已有官方客户端不会重复安装。
 
 ## 当前状态
 

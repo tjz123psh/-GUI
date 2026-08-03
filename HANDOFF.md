@@ -1,19 +1,32 @@
 # rjsupplicant-gui 项目交接文档
 
-- 最后更新：2026-07-15
+- 最后更新：2026-08-03
 - 当前版本：0.3.0
-- 项目状态：功能冻结，等待校园有线网实机验证
+- 项目状态：后端与提权链功能冻结；樱花学园前端已完成皮肤、渐进披露浮层与**舞台+控制台布局重设计**（左侧透明舞台透出樱花场景：大状态字 + 设备↔网关链路图 + 状态胶囊；右侧单张玻璃控制台），多轮修复与逐屏视觉验收（沉浸式标题栏、Tabler 图标、深紫玻璃胶囊文字对比度、深紫 popover、链路图标替换、按钮左移），系统集成已验证（polkit agent 补齐、unit 模板 WorkingDirectory 引号 bug 修复、实时日志链路确认），等待校园有线网实机验证
 - 最终验收代码基线：`9ff5645`
+- 当前代码基线：`7842361` + 未提交前端皮肤改动（不要 reset/stash 覆盖）
 - 主分支：`main`
 - 远端：`git@github.com:tjz123psh/-GUI.git`
 
 ## 1. 交接结论
 
-这是面向 Arch Linux 和 niri 桌面环境的 GDUFS 有线锐捷认证原生客户端。当前版本已完成暖色桌面控制台 UI 重设计、niri 多档窗口宽度适配和一轮客户端实现审计。
+这是面向 Arch Linux 和 niri 桌面环境的 GDUFS 有线锐捷认证原生客户端。后端、安装器和提权链沿用已审计的冻结实现；当前工作区已完成 GTK4/libadwaita 前端皮肤重构，视觉方向为日系二次元樱花学园沉浸式单窗口（背景贯穿全窗、透明标题栏、玻璃拟态卡片）。
 
 当前实现具备安装官方客户端、保存非密码配置、连接/断开认证、管理开机认证、读取真实进程与网线状态、查看日志和执行常用诊断操作的完整闭环。项目不实现锐捷认证协议，而是包装学校提供的闭源 Linux 客户端。
 
 2026-07-15 已完成最终非联网验收：格式、24 项 Rust 测试、Clippy、Release 构建、ShellCheck、隔离安装/卸载回归、desktop、SVG/polkit XML 和 diff 空白检查全部通过；连接页、设置页和诊断页也在真实 niri 会话中通过 640、960、1280、1920 四档宽度实图检查。当前没有继续修改代码的发布阻塞项，项目进入功能冻结状态，等待校园有线网实机验证。
+
+2026-08-03 前端皮肤轮完成：删除旧四工作区界面（连接/日志/诊断/设置与暖白侧栏），重建为暮色学园单窗口皮肤（自绘场景层 `src/scene.rs` + 玻璃拟态卡片 `src/ui.rs`），并在真实 niri 会话完成 640/960/1280 三档截图、Gemini 逐屏评审与像素级定量验证；修复了刷新误触发服务变更、开关被行高拉伸、窄列月亮/剪影重叠等缺陷。格式、Rust 测试、Clippy、Release 构建均通过。当前未执行真实认证、polkit 授权或 systemd 服务修改。
+
+2026-08-03 樱花皮肤轮（当日跟进）：场景换为 `data/scene/scene-sakura.png`；标题栏改为沉浸式（根 Overlay：场景铺满全窗口、卡片与透明 headerbar 浮层），修复 headerbar 渐变不生效根因（`background-color` 未置透明导致 libadwaita 底色叠加成纯白条）；引入 Tabler 线性玫瑰粉图标（内嵌 PNG + `gdk::Texture::from_bytes`）、状态四格圆形徽章、日志圆底徽章，并整体提升文字对比度。三档截图经 Gemini 评审 9.0/10，640 窄列逐项验收无缺陷。
+
+2026-08-03 阶段 3 渐进披露浮层轮（当日跟进）：主卡片保持核心认证流程，低频入口收进浮层——header 新增"更多工具"齿轮按钮（`gtk::Popover`，340px 宽白磨砂面板），内含"连接设置"（DHCP 自动获取 IP、保存密码两个开关，读 `config::load()` 初值、变更即 `config::save`）与"诊断与工具"五项（测试连通 ping 223.5.5.5 / 重启开机认证 `RestartService` / 打开客户端目录 / 打开实时日志 terminal / 在线帮助），全部接线 `system.rs` 既有后端入口（原 dead_code 现在点亮）；"最近日志"行改为 activatable，点击弹出完整日志浮层（`gtk::TextView` 等宽深紫、可滚动 220-320px）。新增 Tabler 图标 settings/terminal-2/folder-open/help-circle/bulb，统一玫瑰粉。三档截图经 Gemini 复审通过，无大白条/卡片完整/浮层正常。
+
+2026-08-03 布局重设计轮（当日跟进，用户反馈"布局完全没设计感、全部成列在一个面板、很空洞"后执行）：按"行动与感知分离"重构——左侧玻璃卡片改为**纯操作区**（连接设置表单 + 连接/断开/安装 + 最近日志行），右侧新增**监控面板 side-panel**（运行状态大字 big_conn/big_server + 2×2 状态指标网格 stat_grid + 诊断与工具 5 行 side_diag）；**双栏断点 STANDARD_MAX 从 1080 降到 940**（Niri 半屏 954px 即双栏，此前 954<1080 双栏永不出现、内容竖排窄条+右侧空白）；表单改 `.form-line`/`.form-label` 两列对齐（icon+固定 64px label+输入框）；日志不再常驻右侧（防纵向溢出、左轻右重），由主卡"最近日志"行弹出承载；窄屏显示 `narrow_status` 摘要；纵向压缩（big-state 17pt、padding 收紧、side-panel 行 min-height 34px）；默认窗口 1280×820。**白圈根因两处**：①`popover > contents` 未覆盖 libadwaita 默认 1px border + box-shadow（浮层边缘白圈）；②`window.csd` 默认 1px 白色 outline 与 `window.csd.tiled` 1px color-mix 边框（Niri 平铺触发，窗口四周亮橙带）——统一 `box-shadow:none; border:none; outline:none`（含 backdrop/tiled/maximized/fullscreen）。验证：954×820 双栏/640 单栏/1280 双栏三档截图 Gemini 评审 9.5/10 无缺陷；build/clippy/fmt/test 全绿；本机已重装（哈希 7bc8398d）。
+
+2026-08-03 舞台+控制台重设计轮（当日跟进，用户反馈"放几个卡片就完事了/布局没设计感/很空洞"后执行）：删除全部嵌套玻璃小卡与 2×2 指标网格，改为**舞台 + 控制台**——左侧透明舞台直接透出樱花场景（大状态字胶囊 + 自绘链路图 + 4 状态胶囊 pill：客户端/进程/服务/网卡），右侧 420px 单张玻璃控制台（标题/表单三行/开机认证/连接断开安装/最近日志行/诊断 5 行）；断点：<760 控制台 fill+solid 实底 + 顶部紧凑状态条（圆点+状态字+副行）、760-939 紧凑舞台 shift 0.5、≥940 完整舞台 shift 0.58。`scene::Link` 自绘链路层节点图标（左设备右网关）经用户反馈后替换为 Tabler `device-laptop`/`server`（jsdelivr @tabler/icons 2.47.0 下载，rsvg-convert 64px，描边 #b8507c 与既有 14 枚同语言，随节点半径缩放）。**文字对比度统一招式**：GTK4 CSS 无 text-shadow，舞台大字/区块标题/表单 label/headerbar 标题统一「深紫玻璃胶囊 `alpha(#4A3048, 0.45-0.72)` 托底 + 白字」，玻璃卡底 alpha 提至 0.48/0.56/0.64；popover 由白玻璃改为深紫玻璃（alpha 0.92 + 浅粉描边 + 收敛投影，行标题白字/副标题浅粉）——用户反馈白色浮层"字体和阴影很奇怪"后重做，Esc 正常关闭。验证：三档水平/垂直像素剖面确认舞台场景可见有明暗节奏、控制台为独立 420px 窄带不横贯全窗；Tab 顺序（refresh→more→账号→密码→网卡→自启→连接→断开→安装→日志→诊断 5 行）、键盘输入落位、连接失败反馈（stage-big 变 stat-warn 红 #C63F38）、popover 打开/关闭均实机验证；build/clippy -D warnings/fmt/24 项测试全绿；已部署 ~/.local/bin（哈希 3a0df83c，未提交 diff 延续）。
+
+2026-08-03 系统集成验证轮（用户反馈"右上角设置/刷新按钮放左边"+"实时日志终端没输出"后触发，用户确认安装 polkit agent）：headerbar 的刷新/设置按钮从 `pack_end` 改为 `pack_start`（左上角，标题胶囊跟随在按钮右侧）；「打开实时日志」终端之前为空是正常现象（journalctl 按 unit 过滤，服务从未运行过、无条目）；为触发真实特权链路，用 `gsudo` 跑 helper `enable-service`，**发现并修复 unit 模板 bug**：systemd `WorkingDirectory=` 不接受引号（`ExecStart` 接受），`src/privileged.rs` 的 `service_file()`/`service_content_uses_owned_paths()` 中 workdir 去掉 `systemd_quote`（system.rs 的 GUI 侧模板本就无引号，未动），helper 重部署（745808 字节）后写 unit + enable 成功；**服务启动失败=官方 2014 闭源客户端在 root 下 SEGV**（栈 `CContextControlThread::DispathMessage→CLnxThread::Run→__libc_msgrcv`、`GetDHCPIPInfo`，与现代 glibc 不兼容），普通用户运行则提示权限不够；已 `disable` 服务防开机崩溃循环（unit 文件保留为修复后正确模板），journalctl 留有崩溃栈历史可验证实时日志链路。**polkit agent 补齐**：本机此前无 agent（GUI 特权操作静默失败），`gsudo pacman -S polkit-gnome` 安装，`~/.config/niri/config.kdl` 新增 `spawn-at-startup "/usr/lib/polkit-gnome/polkit-gnome-authentication-agent-1"`；`pkexec /bin/true` 实测授权弹窗→通过。GUI 部署哈希 2f1b0d19。前端自本轮起不再有新功能改动，等待校园有线网实机验证（第 13 节清单）。前端接线审计补全：`client_requires_migration`/`service_requires_migration`/`service_active` 三个此前未消费的 `ClientStatus` 字段现已接入——控制台顶部新增 `adw::Banner` 迁移横幅（旧版客户端时带"现在处理"按钮直达安装选择器；服务模板不安全时提示操作自启开关），服务状态胶囊区分"已启用/异常/未启用"（enabled 但 `service_active != active` 显示"服务 异常"红点，修复客户端崩溃后误报健康的问题）；安装选择器逻辑提取为 `open_install_dialog()` 供安装按钮与横幅共用。控制台垂直间距压缩（spacing 10→6、行高 34→30、表单 4→2、heading margin 6→2、玻璃卡 padding 24→16）与内容区上边距 48（卡片顶明显低于标题栏关闭按钮）。部署哈希 1bc3d5cd（前端）+ helper 745808 字节。
 
 本机已经通过一键脚本安装当前版本。验收时确认 GUI 与 helper 的哈希和当前 Release 完全一致，helper、wrapper、官方客户端及 policy 均为正确的 root-owned 权限，学校官方 ZIP 的 SHA-256 也匹配固定值。验收没有主动发起认证或创建/改动 systemd 服务；测试 GUI 已关闭。
 
@@ -39,42 +52,84 @@
 
 ## 3. 用户明确要求与视觉约束
 
-用户要的是电脑版、niri 版适配，不是拉宽后的手机界面。视觉方向来自以下参考图：
+用户要的是电脑版、niri 版适配，不是拉宽后的手机界面。2026-08-03 经 grilling 逐问确认的视觉契约（当前唯一权威）：
 
-```text
-/home/pang/Pictures/Screenshots/ChatGPT Image 2026年7月14日 13_15_36.png
-```
+> **后续轮次更新**：樱花皮肤轮把视觉方向从"暮色"切换为"樱花学园"（背景改用 `data/scene/scene-sakura.png` 插画铺底，配色改樱粉白磨砂，标题栏透明沉浸）；布局重设计轮把"Niri 三档"中的 1280 档扩展为**双栏**（左操作卡 + 右监控面板，断点 940）；舞台+控制台轮确立当前布局（左透明舞台 + 右 420px 玻璃控制台）；系统集成轮补齐 polkit agent 并修复 unit 模板（详见第 3.1 节轮次记录）。以下"暮色/Niri 三档"条目保留作为契约演进记录，当前实际以第 3.1 节轮次记录与第 5 节 UI 结构为准。
 
-当前界面采用暖白画布、橙色强调色、浅色卡片、桌面侧栏和明确的状态层级。侧栏山景已从参考图的无控件区域裁切为仓库资源 `data/sidebar-landscape.png`。
+- **皮肤层**：只改视觉层，后端骨架与交互链路不动。
+- **基调**：学园昼夜·轻小说——优雅、二次元、灵动流畅，不用 emoji 等廉价元素。
+- **暮色**：深靛蓝 → 落日暖橙的垂直渐变（非纯黑），认证成功时整幅画面向暖橙霞光漫开（签名时刻），失败用冷青闪击 + 短促回落（惊险感），日常星点呼吸、雾层漂移。
+- **混合背景**：代码渐变基底 + 可商用的原创具象元素（学园建筑剪影、月亮、薄雾）+ 暮光滤镜统一色相。
+- **动效架构**：声明式 CSS 过渡 + 自绘光效层（`src/scene.rs` 逐帧特效），不做全程动画。
+- **非对称主从**：宽窗玻璃卡片偏左黄金位、右侧留场景；窄列卡片自动切居中/fill。
+- **含蓄角色**：窗边抱膝侧坐的学园制服少女剪影（原创轮廓，侧坐剪影不涉及五官版权），藏在雾中。
+- **Niri 三档**：640 纯做事工具（卡片 fill、装饰零负担）；960 场景登场（卡片偏左、剪影从卡片右缘外开始）；1280 展开形态（卡片 440px、场景在右侧黄金分割位）。
 
-继续修改 UI 时必须遵守：
+实现约定：
 
-- 宽屏优先展示完整桌面信息密度，不要改回窄卡片居中式布局。
-- 紧凑侧栏使用真正独立的 icon-only 按钮和 GTK 自然居中，不要靠隐藏文字、负边距或 padding 假对齐。
-- 图标优先使用语义一致的 symbolic 图标；更换图标时要同时检查 72px 紧凑侧栏和 tooltip。
-- 保持强制浅色方案，因为当前配色和插画没有完成深色版本。
-- 视觉修改必须至少实测 640、960、1280、1920 四种窗口宽度。
-- niri 适配通过 GTK/libadwaita 响应式断点实现，运行时不依赖 niri IPC，因此在其他 Wayland/X11 桌面也可运行。
+- 强制深色（`adw::StyleManager::set_color_scheme(ForceDark)`），当前配色与自绘场景只有深色版本。
+- 背景由自绘 `DrawingArea` 承载，不引入外部图片资源；卡片用半透明玻璃拟态（CSS 渐变 + 圆角 + 阴影），不覆盖 libadwaita 具名调色板。
+- 断点通过 GTK widget 属性 setter 切换（`connect_resize` 监听场景宽度），不依赖 Niri IPC 或 CSS media query；阈值 760/940。
+- 视觉修改必须至少实测 640、960、1280 三种 Niri preset 宽度并截图评审；浮动缩窗时内容可滚动（Overlay 外包裹 ScrolledWindow）。
+- 后端、`src/system.rs`、`src/privileged.rs`、helper、安装脚本和 polkit 协议不属于本轮重写范围。
 
 本机已安装可复用的设计/开发技能：
 
 ```text
-~/.codex/skills/frontend-design
-~/.codex/skills/designing-gnome-ui
-~/.codex/skills/developing-gtk-apps
-~/.codex/skills/niri-gtk-design
-~/.codex/skills/niri-ipc
+~/.config/opencode/skills/frontend-design/desktop/design/niri-gtk-design
+~/.config/opencode/skills/frontend-design/desktop/design/gnome-ui-design
+~/.config/opencode/skills/frontend-design/desktop/build/gtk4-libadwaita-app
+~/.config/opencode/skills/frontend-design/desktop/validation/desktop-validation
 ```
 
 这些技能只辅助设计和截图验证，不是应用运行依赖。
+
+## 3.1 前端皮肤重构（2026-08-03）
+
+用户已明确要求**推翻此前所有前端方案**并重新设计。本文件第 3 节描述暖白侧栏界面的旧内容已被 2026-08-03 的暮色学园契约取代，不要当成目标。
+
+### 当前代码状态
+
+2026-08-03 前端皮肤轮是当前工作区唯一前端实现，基于 `7842361` 重建。工作区**不干净且有意保留未提交改动**。改动范围：
+
+- 删除：`src/ui.rs` 旧版与 `src/ui/`（components/layout/navigation/runtime/settings/connection/diagnostics/logs）、`data/style.css`、`data/sidebar-landscape.png`、`data/campus-link-hero.{svg,jpg}`、`data/resources.gresource.xml`、`data/ARTWORK.md`、`data/icons/`、`build.rs`、`DESIGN.md`。
+- 新增 `src/scene.rs`：自绘场景层（樱花皮肤加载 `data/scene/scene-sakura.png` 铺底 + 动效层；此前暮色自绘渐变/星点/月亮/剪影/薄雾已替换，Connecting/Success/Failed 三种模式动效保留）。**布局重设计轮新增 `Link` 层**：设备（笔记本图标）↔ 校园网关（服务器图标）圆形节点 + 链路动画，随认证模式点亮（Idle 淡粉 / Connecting 脉冲 / Success 金粉光点流动 + 节点光晕 / Failed 冷红闪烁）。
+- 重写 `src/ui.rs`：**舞台 + 控制台**结构（宽屏左侧透明舞台透出场景：大状态字胶囊 + 链路图 + 4 状态胶囊；右侧 420px 单张玻璃控制台：表单 + 动作 + 日志行 + 诊断），断点阈值 760/940，事件接线；`Cargo.toml` 的 gtk4 features 从 `v4_10` 升到 `v4_20`。已删除旧版嵌套玻璃区块（glass-section/stat_grid/side-panel/narrow_status/big_conn/big_server）。
+- `src/system.rs` 顶部新增 `#![allow(dead_code)]`：部分后端入口在单窗口皮肤下暂无界面调用者，属后端能力清单，待后续界面接入。
+
+不要执行 `git reset --hard`、自动清理未跟踪文件或恢复旧 stash。后端、`src/system.rs`、`src/privileged.rs`、helper、安装脚本和 polkit 协议没有被本轮功能性重写。
+
+### 上一轮失败的根因（必须避免重犯）
+
+1. **契约倒置**：先自己写"避免清单"（不要渐变按钮、不要装饰、不要卡片），恰好禁掉了参考图本身的风格，然后忠实执行。参考图的风格就是目标，不要用通用"高级感=克制"的教条覆盖用户明确的视觉要求。
+2. **平铺背景**：交付物 87.61% 是单一 `#101418`，卡片 `#1d2024` 与背景只差约 13 个灰阶，组件完全浮不起来。暮色皮肤改用完整垂直渐变 + 星点 + 场景剪影，杜绝平铺色。
+3. **目录式装配**：界面把 libadwaita 组件目录（boxed-list、PreferencesGroup、ViewSwitcher）按顺序堆起来，读起来就是"硬编码"。当前皮肤把表单收进单张玻璃卡片、让背景场景承担氛围，不再逐目录堆组件。
+4. **断点误伤**：963px 宽度触发双栏断点导致内容高度折半、底部大面积空白。断点阈值 760/1080 按 Niri preset 640/960/1280 实测校准；2026-08-03 布局轮把双栏阈值降到 940（Niri 半屏 954 即双栏），并验证每档纵向填充。
+
+### 皮肤轮验收门槛
+
+界面改完后必须给出量化证据，不能只说"构建通过"：
+
+1. `cargo build --locked` 通过，`cargo clippy --locked --all-targets -- -D warnings` 无告警。
+2. 在真实 niri 会话中截图（`scripts/capture-widths.sh io.github.pang.RjSupplicantGui <dir> 640 960 1280`）。
+3. 640/960/1280 三档逐屏评审：无裁切、无控件畸变（开关保持横向胶囊）、卡片与背景场景无重叠穿帮、窄列装饰零负担。
+4. 浮动缩窗验证：内容可滚动，主操作（连接/断开/安装）在任何缩小高度下仍可达。
+5. 不得回归 polkit / systemd / root helper 路径；`tests/` 两个隔离回归脚本仍需通过。
+
+### 前端皮肤轮的硬约束
+
+- **必须继续使用 GTK4 + libadwaita**。已评估并否决 Tauri/Electron：本项目全部价值在原生集成（polkit/pkexec 授权、systemd service、`/proc` 进程判定、root helper、约 4000 行经过审计的 Rust），引入 webview 会破坏 pkexec 授权链。GTK4 CSS 支持 `linear-gradient`、`radial-gradient`、`box-shadow`、`border-radius`、`transition`，libadwaita 1.9 还支持 CSS 变量；唯一缺失的是模糊/`backdrop-filter`。
+- GTK CSS **没有** `prefers-color-scheme`。当前皮肤强制深色，不实现浅色变体；若未来要支持浅色，需要读 `adw::StyleManager` 并在窗口挂主题类。
+- 不要覆盖 libadwaita 的具名调色板颜色，也不要在 `window` 上直接设 `color`——曾因此弄坏主题并把原生对话框染色。
+- 响应式用 widget 属性断点（`connect_resize`），不要改用 CSS media query（GTK 不支持）。
 
 ## 4. 技术栈与仓库结构
 
 技术栈：
 
 - Rust 2024 edition
-- GTK 4.10+
-- libadwaita 1.6+
+- GTK 4.20+（crate feature `v4_20`，本机 GTK 4.22.4）
+- libadwaita 1.6+（本机 1.9.2）
 - systemd system service
 - polkit / `pkexec`
 - Bash 安装脚本
@@ -82,21 +137,16 @@
 关键文件：
 
 ```text
-Cargo.toml                                      Rust 包和 GTK/libadwaita 依赖
-src/main.rs                                     应用入口、单实例窗口、浅色方案和 CSS 初始化
+Cargo.toml                                      Rust 包和 GTK/libadwaita 依赖（gtk4 v4_20）
+src/main.rs                                     应用入口、单实例窗口、深色方案和模块装配
 src/lib.rs                                      GUI 与 helper 共用库入口
 src/config.rs                                   XDG/HOME 路径、设置读写、0600 权限和参数校验
 src/client_install.rs                           ZIP 快照、校验、权限加固、事务安装和 wrapper 生成
 src/privileged.rs                               helper 白名单协议、固定路径、认证参数和 root service
 src/bin/rjsupplicant-helper.rs                  root helper 入口、客户端调用和 systemd 管理
 src/system.rs                                   helper/旧版分流、提权、状态、日志和诊断
-src/ui.rs                                       窗口、连接页和诊断页装配，共享 UI 状态
-src/ui/components.rs                            状态阶段、按钮、标题、日志等通用组件
-src/ui/layout.rs                                640/960/1280/1920 响应式断点
-src/ui/navigation.rs                            完整/紧凑侧栏及页面定位逻辑
-src/ui/runtime.rs                               异步动作、状态刷新、表单收集和控件状态
-data/style.css                                  暖色主题和组件样式
-data/sidebar-landscape.png                      完整侧栏底部插画
+src/scene.rs                                    自绘场景层：樱花插画铺底 + 模式动效 + Link 链路层（设备↔网关节点动画）
+src/ui.rs:单窗口樱花皮肤：透明舞台（大状态字 + 链路图 + 状态胶囊）+ 420px 玻璃控制台、断点 760/940、事件接线与状态刷新
 data/io.github.pang.RjSupplicantGui.svg         应用图标
 data/io.github.pang.RjSupplicantGui.desktop     桌面入口模板
 data/io.github.pang.RjSupplicantGui.policy      按 helper 子命令匹配的 polkit policy
@@ -111,31 +161,28 @@ HANDOFF.md                                      本交接文档
 CHANGELOG.md                                    版本变更记录
 ```
 
-没有 GtkBuilder XML；界面使用 Rust 构建。`src/ui.rs` 保留窗口和两页装配，通用组件、断点、导航、异步动作与状态同步已拆入 `src/ui/` 子模块。继续修改时应保持 GTK 控件只在主上下文更新，并避免把导航或运行状态重新堆回根文件。
+没有 GtkBuilder XML；界面使用 Rust 构建。`src/ui.rs` 装配窗口，`src/scene.rs` 承担背景绘制；继续修改时应保持 GTK 控件只在主上下文更新，并避免把运行状态重新堆回根文件。
 
 ## 5. 当前 UI 结构
 
-应用包含两个真实页面：
+当前前端是单窗口樱花学园皮肤，**舞台 + 控制台**两层结构（2026-08-03 布局重设计最终形态，取代早前的"左操作卡 + 右监控面板"双栏）：
 
-- “连接”：状态总览、连接/断开、四阶段状态、认证信息、连接方式、开机认证、快捷操作和最近日志。
-- “诊断”：合并日志、手动刷新和实时 journal 入口。
+- **背景层**（`src/scene.rs` 的 `DrawingArea`）：樱花插画 `data/scene/scene-sakura.png` 铺满全窗（按窗口宽度水平裁切：窄列 focus 素材左端 shift=0、中屏 shift=0.5、宽屏 shift=0.58），标题栏透明沉浸（根 Overlay：场景为底，内容 ScrolledWindow 与透明 headerbar 浮层），认证成功时画面向暖粉霞光漫开。
+- **舞台层**（`gtk::Box.stage`，透明无卡背景，场景直接透出）：顶部**大状态字**（`stage-big`，26pt 深紫玻璃胶囊托底 + 白字，stat-ok 粉 / stat-warn 暖红）→ 副标题 → **自绘链路图**（`scene::Link`：左侧设备节点（笔记本 Tabler 图标）+ 右侧校园网关节点（服务器图标）圆形玻璃底、中间链路按认证模式点亮——Idle 淡粉 / Connecting 粉脉冲+光点 / Success 亮金粉+光点流动+节点光晕（签名视觉时刻）/ Failed 冷红闪烁；节点图标为 `data/icons/device-laptop.png`、`server.png`，随节点半径缩放）→ 底部 4 枚**状态胶囊** `pill`（客户端/进程/服务/网卡，圆点 dot-ok 粉 / dot-warn 红）。
+- **控制台层**（`gtk::Box.glass-card.console`，420px，唯一玻璃容器）：标题/副标题 → 连接设置表单（`.form-line` 两列对齐：icon + 固定 64px label + 输入框；账号/密码/网卡三行，开机认证 ActionRow+Switch）→ 连接/断开按钮 → 安装按钮 → 最近日志行（activatable 弹完整日志浮层）→ 诊断与工具 5 行（与"更多工具"浮层共用 `make_diag_rows`）。区块文字标题（`console-heading`）与表单 label 均为深紫玻璃胶囊托底白字。
+- **窄屏状态条**（`compact_status`，<760 显示）：圆点 + 状态字 + 副行，替代被隐藏的舞台。
 
-完整侧栏中的“连接状态、认证设置、运行状态”会定位到连接页的相应区域；“日志查看”进入诊断页；“关于我们”打开应用信息对话框。“设置中心”是可编辑的原生偏好设置对话框，可修改账号、网卡、DHCP 和是否由官方客户端保存密码；保存后同步更新连接页，关闭对话框则放弃修改。快捷键 `Ctrl+1` 打开连接页，`Ctrl+2` 打开诊断页，`Ctrl+,` 打开设置。
+导航形态按窗口宽度切换（`connect_resize` 断点，阈值 760/940）：
 
-设置对话框已在 niri 下实测 640、960、1280、1920 四档宽度：窄列无裁切，宽列中的表单保持舒适阅读宽度。设置中不提供开机认证开关，避免普通配置修改意外触发管理员授权；该操作仍只在连接页执行。
-
-官方客户端缺失时，顶部 banner 的“选择安装包”会打开原生 `GtkFileDialog`。安装期间 banner 原位显示忙碌状态，连接、自启、重启和客户端目录操作保持禁用；成功后立即刷新真实状态并开放连接操作。
-
-响应式规则位于 `src/ui/layout.rs::install_breakpoints`：
-
-| 窗口宽度 | 导航 | 内容布局 | niri 使用场景 |
+| 窗口宽度 | 布局 | 场景 shift | niri 使用场景 |
 | --- | --- | --- | --- |
-| `< 720sp` | 隐藏侧栏，显示底部导航 | 状态区和卡片单栏 | 约 640px 窄列 |
-| `720–1099sp` | 72px 独立图标栏 | 单栏 | 约 960px 半宽列 |
-| `1100–1399sp` | 72px 独立图标栏 | 三栏 | 约 1280px 宽列 |
-| `>= 1400sp` | 240px 完整图文侧栏 | 三栏 | 约 1920px 全宽列 |
+| `< 760` | 控制台单列 fill 铺满（`.glass-card.solid` 实底变体保证可读）+ 顶部状态条；舞台隐藏 | 0（素材左端） | 约 640px 窄列 |
+| `760–939` | 紧凑舞台 + 420px 控制台靠右（stage 约 284px） | 0.5（居中） | 约 960px 半宽列 |
+| `>= 940` | 完整舞台吃满剩余 + 控制台靠右（1280 时 stage 约 760px） | 0.58（宽屏偏右） | 约 1280px 全宽 |
 
-默认窗口为 `960 × 760`，最小请求尺寸为 `420 × 520`。主内容通过 `adw::Clamp` 限制最大阅读宽度；不要仅通过 CSS media query 重做断点，因为 GTK CSS 不支持网页式媒体查询，现有布局切换依赖 `adw::Breakpoint` setter。
+断点通过 widget 属性 setter 切换，不依赖 Niri IPC 或 GTK CSS media query；Overlay 外包 ScrolledWindow，浮动缩窗高度不足时内容可滚动。所有可能阻塞的状态、认证、日志和服务操作继续在后台任务中执行，GTK 控件只在主上下文更新。
+
+**文字对比度统一招式**：GTK4 CSS 无 `text-shadow`，所有浮在亮樱花背景上的文字（舞台大字、区块标题、表单 label、副标题、headerbar 标题、popover 行）统一用「深紫半透明玻璃胶囊底 + 白/浅粉字 + 收敛下投影」，不依赖发光/描边让文字可读。
 
 ## 6. 运行数据与路径
 
@@ -244,10 +291,20 @@ polkit policy 使用 `org.freedesktop.policykit.exec.path` 固定 helper，并�
 
 ## 8. 安装、升级与恢复
 
-标准安装：
+标准安装（先审查脚本，不使用 `curl | sh`）：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/tjz123psh/-GUI/main/scripts/bootstrap.sh | bash
+git clone https://github.com/tjz123psh/-GUI.git ~/.local/src/rjsupplicant-gui
+~/.local/src/rjsupplicant-gui/scripts/bootstrap.sh
+```
+
+无 Git 时先下载为文件并检查，再运行：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/tjz123psh/-GUI/main/scripts/bootstrap.sh \
+  -o /tmp/rjsupplicant-bootstrap.sh
+sed -n '1,240p' /tmp/rjsupplicant-bootstrap.sh
+bash /tmp/rjsupplicant-bootstrap.sh
 ```
 
 bootstrap 默认把源码放到 `~/.local/src/rjsupplicant-gui`。存在 Git 时只允许从项目 origin 对没有修改、暂存或未跟踪文件且未分叉的 `main` 做 fast-forward；没有 Git 时下载 GitHub main 归档，且拒绝覆盖现有目录。随后它从学校官方 `etr.gdufs.edu.cn` 下载 Linux V1.31 ZIP 到 `~/Downloads`，校验固定 SHA-256 `d211d9a6efbe5f9dcc27eb78af9515a279b3e44dfc8580e6801b79e9a4f1eea9` 后通过 `RJSUPPLICANT_ZIP` 交给正式安装脚本。闭源 ZIP 不进入 GitHub 仓库。
@@ -316,7 +373,7 @@ git diff --check
 
 GitHub Actions 的 `Verify` 工作流使用 `archlinux:latest` 容器执行同一组检查，避免 Ubuntu 较旧的 libadwaita 版本与正式目标不一致。工作流在 push、pull request 和手动触发时运行，并使用 `Cargo.lock` 的锁定依赖。
 
-### 2026-07-15 最终验收记录
+### 2026-07-15 后端基线验收记录
 
 - 仓库工作区干净，`main` 与 GitHub 远端一致，验收代码基线为 `9ff5645`。
 - 当前安装的 GUI、helper、图标和 policy 与仓库/Release 一致；root-owned 目录和程序均不可由普通用户修改。
@@ -332,14 +389,56 @@ GitHub Actions 的 `Verify` 工作流使用 `archlinux:latest` 容器执行同�
 timeout 3s target/release/rjsupplicant-gui
 ```
 
-该命令只能发现启动和 CSS 解析问题，不能替代视觉截图检查。niri 下修改界面后应保存 640、960、1280、1920 四档截图，并重点检查：
+该命令只能发现启动和 CSS 解析问题，不能替代视觉截图检查。niri 下修改界面后应保存 640、960、1280 三档截图（`scripts/capture-widths.sh io.github.pang.RjSupplicantGui <输出目录> 640 960 1280`），并重点检查：
 
-- 导航图标是否自然居中；
-- 文本、按钮和状态徽标是否溢出；
-- 960px 是否确实转为单栏；
-- 1280px 是否保留可读的三栏；
-- 1920px 完整侧栏和主内容比例是否协调；
-- 所有 tooltip、键盘焦点和禁用/忙碌状态是否正常。
+- 开关、按钮等控件是否保持原生比例（避免 valign 拉伸）；
+- 卡片是否与背景场景重叠穿帮（960 档剪影应从卡片右缘外开始）；
+- 窄列是否零装饰（640 档不应出现月亮/剪影）；
+- 卡片内容、状态文字和 toast 是否有裁切或溢出；
+- 浮动缩窗高度不足时内容是否可滚动、主操作是否仍可达。
+
+### 2026-08-02 当前前端轮验收记录
+
+- `cargo fmt --all -- --check`、`cargo test --locked`（24 项）、`cargo clippy --locked --all-targets -- -D warnings`、`cargo build --locked --release`：通过。
+- `bash -n`、ShellCheck、desktop-file-validate、SVG/polkit XML、`git diff --check`：通过。
+- `tests/bootstrap.sh`、`tests/install_uninstall.sh`：在 `/tmp` 隔离目录通过；未改动真实 `/etc/systemd`、polkit、客户端或用户配置。
+- Niri 1920×1080、预设列宽约 640/960/1280/1920：连接、日志、诊断、设置页面均做了只读实图检查；连接主操作无裁切，960px 为 68px rail，完整侧栏为 240px。
+- 连接截图量测（先按 alpha bbox 去除 20px CSD 边）：最高频精确色占比为 9.47%–26.35%，远低于旧失败版本 87.61%；以 HSV 饱和度 `S>=0.35` 计，彩色像素约 2.01%–5.81%；主内容有效行覆盖约 85.9%–95.9%。
+- 未验证：真实校园账号/密码、错误密码、polkit agent 授权/取消/保留、systemd 重启后的实际认证结果。
+
+### 2026-08-03 暮色皮肤轮验收记录
+
+- `cargo build --locked`、`cargo test --locked`（11+10+3 项）、`cargo clippy --locked --all-targets -- -D warnings`、`cargo fmt`、`cargo build --locked --release`：全部通过。
+- 旧四工作区前端已删除（`src/ui.rs` 旧版、`src/ui/`、`data/style.css`、hero/sidebar 美术、`build.rs`、`DESIGN.md`、`ARTWORK.md`、gresource）；后端模块与安装链无功能性改动。
+- 真实 niri 会话三档截图（`scripts/capture-widths.sh io.github.pang.RjSupplicantGui /tmp/opencode/dusk-shots3 640 960 1280`）经 Gemini 逐屏评审：三档均无缺陷，960 档卡片内部纯净（剪影从卡片右缘外开始）、1280 完整场景构图、640 全宽单卡零装饰负担。
+- 像素级定量验证：640 下月亮位置恢复深空色（detail 门控生效）、底部 toast 白色文字密度从 0.592% 降为 0.000%（刷新不再误触发服务变更）、640×700 内容完整显示、640×600 核心操作可达且状态区进入滚动区。
+- 修复清单：refresh `set_active` 误触发 autostart notify 导致意外启停服务（新增 `refreshing` 标志）；开关被 ActionRow 行高纵向拉伸（`set_valign(Align::Center)`）；960 档卡片内透出剪影分界（detail 0.55→0.45）；窄列月亮被卡片切过（月亮加 detail 门控）；浮动缩窗内容溢出（Overlay 外包 ScrolledWindow）；状态 label 限宽（`max_width_chars(26)`）。
+- 未验证：真实校园账号/密码、错误密码、polkit agent 授权/取消/保留、systemd 重启后的实际认证结果。
+
+### 2026-08-03 樱花皮肤轮验收记录
+
+- 结构：`AdwToolbarView` 替换为根 `GtkOverlay`（child=scene 铺满全窗，overlay=ScrolledWindow(card) + 透明 headerbar 浮层），`HeaderBar` 经 `set_halign(Fill)/set_valign(Start)` 浮于顶部，窗口控制按钮在浮层下仍正常。
+- 图标：`data/icons/` 11 枚 Tabler 线性图标（SVG 源 + 64px PNG），描边统一 `#b8507c`，通过 `gdk::Texture::from_bytes` + `Image::set_paintable` 加载；应用到表单三行前缀、连接/断开/安装按钮、刷新按钮、状态四格徽章、日志徽章。
+- 组件精修：状态四格圆形粉渐变徽章（`.stat-badge`）、日志圆底徽章（`.row-badge`）、输入框内阴影、switch 轨道细化、行 hover/active、副标题与占位符对比度整体提升。
+- 三档截图（`capture-widths.sh io.github.pang.RjSupplicantGui /tmp/opencode/whitebar-check 1280 960 640`）经 Gemini 评审 9.0/10，640 窄列逐项验收通过（沉浸标题栏、四格无挤压、"eno1 无网线"完整）。
+- 已知遗留：GTK CSD 窗口 buffer 固有约 15px 透明外扩（截图可测、桌面不可见性取决于壁纸，`window { box-shadow:none }` 无效，应用层无法去除）。**2026-08-03 布局轮已进一步压制**：`window.csd`/`.tiled` 变体统一 `box-shadow:none; border:none; outline:none` 后，窗口四周亮橙带与白色描边在截图中消除；buffer 本身若有剩余透明外扩仅取决于壁纸亮度，Niri 平铺 + 深色壁纸下不可见。
+- 未验证：真实校园账号/密码、错误密码、polkit agent 授权/取消/保留、systemd 重启后的实际认证结果。
+
+### 2026-08-03 阶段 3 渐进披露浮层验收记录
+
+- `cargo build --release`、`cargo clippy --release -- -D warnings`、`cargo fmt --check`、`cargo test --release`（3 项 lib 测试）：全部通过；无任何验证钩子残留（`GAP_TEST_POPOVER` 门已删除）。
+- header 顺序：close → refresh → more（齿轮）。更多工具浮层（`gtk::Popover`，width 340）："连接设置"组（DHCP/保存密码开关，`config::load()` 初值，开关变更即 `config::save(&ui.settings())` 持久化，失败 toast）+ "诊断与工具"组五项（测试连通/重启开机认证/打开客户端目录/打开实时日志/在线帮助，`run_diag` 独立消息）。
+- 完整日志浮层：`gtk::TextView`（不可编辑、等宽 `.log-text`、`WrapMode::WordChar`）于 ScrolledWindow（min/max height 220/320、width 360），White label "最近日志 点击查看完整日志" activatable，点击后台加载 `load_status().last_log` 后弹出。
+- 截图验证：`stage3-shots.sh`（`niri msg action set-window-width/height --id` + `grim`）在空 workspace 隔离后获取 1280/960/640 三档（`/tmp/opencode/stage3-final/`），Gemini 复审：三档均无大白条、齿轮/刷新按钮正常、卡片完整无裁剪、640 属已知极限（四格紧凑但无变形）、配色协调。
+- 未验证：真实校园账号/密码、错误密码、polkit agent 授权/取消/保留、systemd 重启后的实际认证结果；渐进披露的开关/诊断在无客户端/无 polkit 环境下的失败路径未实机触发。
+
+### 2026-08-03 布局重设计轮验收记录
+
+- 触发：用户反馈"布局完全没设计感、全部成列在一个面板上、很空洞"，要求学习开源项目（GNOME Connections / ssh-client-manager / adw-network）的布局方式；根因是断点 1080 高于 Niri 半屏 954，双栏永不出现。
+- `cargo build --release`、`cargo clippy --release -- -D warnings`、`cargo fmt --check`、`cargo test`：全部通过。
+- 真实 niri 会话三档截图（`/tmp/opencode/final-installed-954.png`、`final-installed-small.png`，窗口 id=83）经 Gemini 逐屏评审 9.5/10：954×820 双栏完整无截断、左右协调、5 行诊断全可见；640 窄屏单栏完整，底部状态区显示；1280 双栏完整、右侧场景留白属视觉呼吸非空洞；无白圈/亮橙边框（两处 CSS 根因见 CHANGELOG）。
+- 已重装本机：`setsid scripts/install.sh </dev/null > /tmp/install.log 2>&1 &`（install.sh 内部裸 sudo，必须无 TTY 才走 SUDO_ASKPASS fuzzel 密码框）；/home/pang/.local/bin/rjsupplicant-gui 与 target/release 哈希一致 `7bc8398d`。
+- 未验证：真实校园认证、polkit 授权、systemd 重启后行为（同前几轮，等待实机验证）。
 
 ## 10. 高风险修改约束
 
@@ -365,8 +464,8 @@ timeout 3s target/release/rjsupplicant-gui
 - 旧版用户级客户端回退仍保留用于迁移，但它不具备 root-owned helper 的完整权限边界，应尽快通过重新选择官方 ZIP 完成迁移。
 - policy 与 helper 已安装到本机并核对属主、权限和文件内容，但尚未在真实 polkit agent 上触发授权、取消或保留授权流程。
 - 项目定位为个人自用，通过 GitHub 保存和同步源码，不维护 Arch/AUR 包或预编译 Release。
-- 当前只有浅色主题。
-- 部分侧栏入口是同一连接页的快捷定位，不是六个独立页面。
+- 当前只有深色主题（`ColorScheme::ForceDark`）；自绘樱花场景与玻璃卡片没有浅色变体。
+- 背景场景与按钮动效由 `src/scene.rs` 逐帧自绘，悬浮缩小窗口且高度不足时状态区需要滚动查看（GTK overlay-scrolling，滚动条仅在滚动时短暂显示）。
 
 ## 12. 常见排障
 
@@ -408,7 +507,9 @@ update-desktop-database ~/.local/share/applications
 
 ## 13. 后续工作触发条件
 
-当前不安排新的功能开发或界面调整。只有在校园有线网实机验证出现问题时再恢复工作，验证范围为：
+后端、提权链和安装脚本不安排新的功能开发。**前端当前轮已完成代码与视觉验收，后续只根据用户反馈或实机验证证据继续迭代**，起点和门槛见第 3.1 节。
+
+后端只有在校园有线网实机验证出现问题时再恢复工作，验证范围为：
 
 1. 正确账号和密码能否完成认证，日志是否能明确判断结果。
 2. 错误密码时 GUI 状态、提示和日志是否符合实际结果。
@@ -422,14 +523,15 @@ update-desktop-database ~/.local/share/applications
 
 下一位开发者或 AI 建议按以下顺序恢复上下文：
 
-1. 先确认用户在上述哪一项实机验证中遇到问题，并收集可复现步骤与脱敏日志。
-2. 阅读本文件、`README.md` 和 `AUDIT.md`。
-3. 执行 `git status --short --branch`，确认没有覆盖用户未提交改动。
-4. 阅读 `src/config.rs` 和 `src/system.rs`，先理解路径、提权和 service 边界。
-5. 阅读 `src/ui/layout.rs::install_breakpoints`、`src/ui/runtime.rs::{connect_actions,refresh_status}` 和 `src/ui/navigation.rs::sidebar_navigation`。
-6. 运行完整验证命令。
-7. 修改 UI 时对照用户参考图，并完成四档宽度截图检查。
-8. 涉及真实认证或本机 systemd 服务前，先说明会影响当前网络和系统状态。
-9. 提交前检查是否意外加入官方二进制、账号、密码、日志、截图或临时文件。
+1. **如果任务是前端修改**：先读第 3 节和第 3.1 节，它们是唯一的前端权威约定（暮色学园契约 + 皮肤轮记录）。然后确认 `git status --short --branch`，保留当前未提交前端改动；旧 UI 文件已删除，`stash@{0}` 仅供查阅失败原因，不要直接恢复。
+2. 如果任务是后端问题：先确认用户在第 13 节哪一项实机验证中遇到问题，并收集可复现步骤与脱敏日志。
+3. 阅读本文件、`README.md` 和 `AUDIT.md`。
+4. 执行 `git status --short --branch`，确认没有覆盖用户未提交改动。
+5. 阅读 `src/config.rs` 和 `src/system.rs`，先理解路径、提权和 service 边界。
+6. 阅读 `src/ui.rs`（窗口装配、断点、事件）和 `src/scene.rs`（自绘场景层），理解后再改视觉。
+7. 运行完整验证命令（`cargo fmt --check`、`cargo test --locked`、`cargo clippy --locked --all-targets -- -D warnings`、`cargo build --locked --release`）。
+8. 修改 UI 时对照第 3.1 节的暮色契约与验收门槛，完成 640/960/1280 三档截图和逐屏评审，不要只报告构建通过。
+9. 涉及真实认证或本机 systemd 服务前，先说明会影响当前网络和系统状态。
+10. 提交前检查是否意外加入官方二进制、账号、密码、日志、截图或临时文件。
 
-交接完成的判断标准不是“程序能编译”，而是安装可恢复、GUI 不阻塞、提权结果可靠、service 生命周期正确、状态文案不误导，并且四档 niri 列宽的布局都通过实图检查。
+交接完成的判断标准不是“程序能编译”，而是安装可恢复、GUI 不阻塞、提权结果可靠、service 生命周期正确、状态文案不误导，并且三档 niri 列宽的布局都通过实图检查。

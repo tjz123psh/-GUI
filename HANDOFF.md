@@ -30,6 +30,8 @@
 
 本机已经通过一键脚本安装当前版本。验收时确认 GUI 与 helper 的哈希和当前 Release 完全一致，helper、wrapper、官方客户端及 policy 均为正确的 root-owned 权限，学校官方 ZIP 的 SHA-256 也匹配固定值。验收没有主动发起认证或创建/改动 systemd 服务；测试 GUI 已关闭。
 
+2026-08-04 收尾轮（用户「更新交接文档、清理残余文件、收尾」）：**curl 一键安装本机完整检验通过**——用户跑 `bootstrap.sh` 后逐项核验：官方 ZIP SHA-256=`d211d9a6…` 与脚本内 `CLIENT_SHA256` 一致；helper `ff7d1b6e`、GUI `6e45cbf1` 与本地 `target/release` 构建哈希一致（GitHub 最新源码 `cargo build --release`）；helper/wrapper/客户端均 root:root 755、policy root:root 644；`strings helper` 确认 `WorkingDirectory=` 无引号（unit 修复已进入安装产物）；wrapper 的 getconf LONG_BIT 选 x64/x86 正确；policy 6 动作（install-client/authenticate/disconnect/enable-service/disable-service/restart-service）齐全；desktop 入口与图标就位；`pkexec /bin/true` exit=0；`systemctl is-enabled` 为 not-found 属正常（unit 由 GUI 开自启时生成，安装不创建）。**仓库整理**：删除误入的 `.ruff_cache/`、4 个无引用的 Tabler 图标（activity/server-cog）并按需补 `.gitignore`（提交 ffe7479）。**日志终端行为说明（用户曾困惑）**：`journalctl -u rjsupplicant.service -n 120 -f` 无条件回放最近 120 行历史后进入跟随模式；journal 是系统级日志库，卸载/重装/重开终端均不清空历史，服务无新日志时终端停留在历史尾部——这是预期行为，不是刷新问题。**最终状态**：前端、后端、提权链、安装链全部就绪并入库（main 与 origin/main 同步），唯一待办为校园有线网实机验证（第 13 节清单 5 项，验证通过即 v0.3.0 收版）。本机为 curl bootstrap 完整安装的最新构建环境，验证时可直接使用。
+
 详细审计记录见 [AUDIT.md](AUDIT.md)，面向使用者的安装说明见 [README.md](README.md)。
 
 ## 2. 产品目标与边界

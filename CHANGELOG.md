@@ -2,6 +2,10 @@
 
 ## Unreleased - 2026-08-03
 
+### 日志区块整合（同日跟进）
+
+- 控制台「最近日志」标题改为「日志」，并在「查看完整日志」行之前新增「打开实时日志」行（点击在终端打开 `journalctl -f`，复用 `system::open_live_log`，与诊断区同一条已验证动作），消除标题与行内容在「日志」概念上的视觉重复。
+
 ### 前后端接线补全轮（同日跟进）
 
 - 审计 system.rs 14 个公开接口与 helper 6 个提权动作的 UI 接线（load_status/wired_interfaces/interface_has_carrier/install_official_client/authenticate/disconnect/enable_service/disable_service/restart_service/test_connectivity/open_client_folder/open_help/open_live_log 全部有入口，无死接口）。

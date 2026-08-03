@@ -72,6 +72,8 @@ struct Ui {
     diag: Vec<adw::ActionRow>,
     /// 最近日志预览（走 ActionRow subtitle，左对齐不飘）
     log_row: adw::ActionRow,
+    /// 实时日志行：点击打开 journalctl 终端（复用 system::open_live_log）。
+    live_log_row: adw::ActionRow,
     /// 迁移提示横幅：旧版客户端 / 不安全的开机认证服务配置时显示。
     banner: adw::Banner,
     busy: Arc<AtomicBool>,
@@ -521,14 +523,24 @@ fn build_window(app: &adw::Application) -> Ui {
     install_wrap.append(&install);
     console.append(&install_wrap);
 
-    // ---- 最近日志行：点击弹出完整日志浮层 ----
+    // ---- 日志区块：标题 + 实时日志行 + 完整日志行 ----
     let log_title = gtk::Label::builder()
-        .label("最近日志")
+        .label("日志")
         .css_classes(["console-heading"])
         .xalign(0.0)
         .margin_top(2)
         .build();
     console.append(&log_title);
+    let live_log_row = adw::ActionRow::builder()
+        .title("打开实时日志")
+        .subtitle("终端 journalctl -f")
+        .activatable(true)
+        .build();
+    set_pointer_cursor(&live_log_row);
+    let live_log_badge = gtk::Box::builder().css_classes(["row-badge"]).build();
+    live_log_badge.append(&icon_image(ICON_TERMINAL, 16));
+    live_log_row.add_prefix(&live_log_badge);
+    console.append(&live_log_row);
     let log_row = adw::ActionRow::builder()
         .title("查看完整日志")
         .subtitle("暂无日志")
@@ -652,6 +664,7 @@ fn build_window(app: &adw::Application) -> Ui {
         log_view,
         diag: diag_rows,
         log_row,
+        live_log_row,
         banner,
         busy: Arc::new(AtomicBool::new(false)),
         refreshing: Arc::new(AtomicBool::new(false)),
@@ -1348,6 +1361,17 @@ fn wire_events(ui: &Ui) {
             Ok(()) => {}
             Err(err) => toast(&ui, &format!("设置未保存：{err}")),
         }
+    });
+
+    // 实时日志行：点击在终端打开 journalctl -f（与诊断区「打开实时日志」同一动作）
+    let live_log_ui = ui.clone();
+    ui.live_log_row.connect_activated(move |_| {
+        run_diag(
+            &live_log_ui,
+            "正在打开实时日志…",
+            "已打开日志终端",
+            system::open_live_log,
+        );
     });
 
     // 日志行：点击弹出完整日志浮层

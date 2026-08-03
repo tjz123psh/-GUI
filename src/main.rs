@@ -1,21 +1,16 @@
 mod config;
+mod scene;
 mod system;
 mod ui;
 
-use adw::prelude::*;
-use gtk::glib;
-use gtk4 as gtk;
+use gtk4::gio::prelude::*;
+use gtk4::glib;
 use libadwaita as adw;
 
 fn main() -> glib::ExitCode {
     let app = adw::Application::builder()
         .application_id(config::APP_ID)
         .build();
-
-    app.connect_startup(|_| {
-        adw::StyleManager::default().set_color_scheme(adw::ColorScheme::ForceLight);
-        ui::install_css();
-    });
-    app.connect_activate(ui::build);
+    app.connect_activate(ui::activate);
     app.run()
 }

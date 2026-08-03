@@ -1,3 +1,8 @@
+// 后端能力模块：为特权 helper、systemd 服务与官方客户端操作提供纯逻辑。
+// 旧版前端删除后，部分入口（连接性测试/日志/重启等）暂时没有界面调用方，
+// 它们属于后端能力清单，待新前端按设计接入后再逐个点亮。
+#![allow(dead_code)]
+
 use crate::config::{self, SERVICE, Settings};
 use anyhow::{Context, Result};
 use rjsupplicant_gui::privileged::{self, AuthOptions, CLIENT_DIR, HELPER_PATH, HelperRequest};

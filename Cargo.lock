@@ -516,6 +516,7 @@ name = "rjsupplicant-gui"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "cairo-rs",
  "gtk4",
  "libadwaita",
  "libc",

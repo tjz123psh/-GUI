@@ -37,9 +37,11 @@ usage() {
   cat <<EOF
 用法：scripts/install.sh [选项]
 
-无选项        安装或升级 rjsupplicant-gui
+无选项        安装或升级 rjsupplicant-gui（构建完成后自动清理编译中间产物）
 --uninstall   停止认证服务并移除已安装组件（保留用户设置）
 -h, --help    显示此帮助
+
+可选环境变量：RJSUPPLICANT_KEEP_BUILD=1 保留构建产物（跳过清理）
 EOF
 }
 
@@ -137,6 +139,17 @@ build_binaries() {
     "${ROOT_DIR}/target/release/rjsupplicant-gui" \
     "${ROOT_DIR}/target/release/rjsupplicant-helper"
   cargo build --locked --release --manifest-path "${ROOT_DIR}/Cargo.toml"
+}
+
+cleanup_build_artifacts() {
+  if [[ "${RJSUPPLICANT_KEEP_BUILD:-0}" == "1" ]]; then
+    log "已设置 RJSUPPLICANT_KEEP_BUILD=1，保留编译中间产物。"
+    return
+  fi
+  if [[ -d "${ROOT_DIR}/target" ]]; then
+    log "清理编译中间产物（重装时会自动重新构建）。"
+    cargo clean --locked --manifest-path "${ROOT_DIR}/Cargo.toml"
+  fi
 }
 
 install_privileged_helper() {
@@ -289,6 +302,7 @@ main() {
   install_privileged_helper
   install_official_client
   install_gui
+  cleanup_build_artifacts
 
   log "安装完成。"
   log "应用入口：锐捷有线认证"

@@ -271,7 +271,7 @@ fn build_window(app: &adw::Application) -> Ui {
         .application(app)
         .title("锐捷有线认证")
         .default_width(1280)
-        .default_height(820)
+        .default_height(860)
         .content(&toasts)
         .build();
 
@@ -331,7 +331,6 @@ fn build_window(app: &adw::Application) -> Ui {
         ("测试网络连通", ICON_BULB, "ping 阿里公共 DNS"),
         ("重启开机认证", ICON_ROUTER, "systemd 服务"),
         ("打开客户端目录", ICON_FOLDER, "查看已安装文件"),
-        ("打开实时日志", ICON_TERMINAL, "终端 journalctl -f"),
         ("在线帮助", ICON_HELP, "校园网官方帮助页"),
     ];
     let diag_group = adw::PreferencesGroup::builder().title("诊断与工具").build();
@@ -425,7 +424,7 @@ fn build_window(app: &adw::Application) -> Ui {
     // ---- 控制台：连接表单 + 动作（唯一玻璃容器）----
     let console = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
-        .spacing(6)
+        .spacing(2)
         .css_classes(["glass-card", "console"])
         .valign(gtk::Align::Fill)
         .build();
@@ -611,15 +610,11 @@ fn build_window(app: &adw::Application) -> Ui {
     content.append(&compact_status);
     content.append(&row_box);
 
-    // 滚动兜底：窗口高度不足时控制台可滚动
-    let scrolled = gtk::ScrolledWindow::builder().child(&content).build();
-    scrolled.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
-    scrolled.set_hexpand(true);
-    scrolled.set_vexpand(true);
-
     let overlay = gtk::Overlay::new();
     overlay.set_child(Some(&scene_widget));
-    overlay.add_overlay(&scrolled);
+    // 内容直接铺在场景上（不包 ScrolledWindow）：控制台内容已压缩到固定高度，
+    // 窗口高度不足时由舞台吸收，避免出现滚动条。
+    overlay.add_overlay(&content);
     // 标题栏浮在背景之上：headerbar 全透明，只留按钮与标题胶囊
     header.set_halign(gtk::Align::Fill);
     header.set_valign(gtk::Align::Start);
@@ -787,12 +782,12 @@ fn load_theme_css() {
         color: #FFFFFF;
         background-color: alpha(#4A3048, 0.55);
         border-radius: 999px;
-        padding: 2px 14px;
-        margin-top: 2px;
+        padding: 1px 14px;
+        margin-top: 0;
     }
 
     .card-title {
-        font-size: 21pt;
+        font-size: 19pt;
         font-weight: 700;
         color: #3A2438;
     }
@@ -803,7 +798,7 @@ fn load_theme_css() {
         background-color: alpha(#6E4A5E, 0.40);
         border-radius: 999px;
         padding: 2px 12px;
-        margin-bottom: 3px;
+        margin-bottom: 2px;
     }
 
     /* ---- 舞台：透明容器，场景直接透出（无卡片背景）---- */
@@ -892,7 +887,7 @@ fn load_theme_css() {
 
     /* ---- 表单行：图标 + 固定宽 label + 输入框，两列对齐 ---- */
     .form-line {
-        padding: 2px 2px;
+        padding: 1px 2px;
     }
     .form-label {
         font-size: 10pt;
@@ -912,10 +907,10 @@ fn load_theme_css() {
         color: #7A5A70;
     }
 
-    /* 控制台行压缩：诊断 5 行在 820px 高度内完整放下 */
+    /* 控制台行压缩：全部行在 820px 高度内完整放下（固定布局，无滚动） */
     .console row {
-        min-height: 30px;
-        padding: 2px 8px;
+        min-height: 22px;
+        padding: 1px 8px;
     }
     .console row .title {
         font-size: 9.5pt;
@@ -930,7 +925,7 @@ fn load_theme_css() {
         color: #4A1F30;
         font-weight: 700;
         border-radius: 18px;
-        padding: 12px 30px;
+        padding: 8px 20px;
         border: none;
         box-shadow:
             0 6px 22px alpha(#FF6F91, 0.40),
@@ -954,7 +949,7 @@ fn load_theme_css() {
         background-color: alpha(#ffffff, 0.38);
         color: #4A3048;
         border-radius: 18px;
-        padding: 10px 22px;
+        padding: 6px 16px;
         border: 1px solid alpha(#ffffff, 0.6);
         box-shadow: inset 0 1px 0 alpha(#ffffff, 0.7);
         transition: all 180ms ease-out;
@@ -1492,13 +1487,7 @@ fn wire_events(ui: &Ui) {
                     "已打开",
                     system::open_client_folder,
                 ),
-                3 => run_diag(
-                    &ui,
-                    "正在打开实时日志…",
-                    "已打开日志终端",
-                    system::open_live_log,
-                ),
-                4 => run_diag(&ui, "正在打开帮助页…", "已打开", system::open_help),
+                3 => run_diag(&ui, "正在打开帮助页…", "已打开", system::open_help),
                 _ => {}
             }
             ui.more_popover.popdown();

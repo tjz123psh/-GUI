@@ -72,8 +72,6 @@ struct Ui {
     diag: Vec<adw::ActionRow>,
     /// 最近日志预览（走 ActionRow subtitle，左对齐不飘）
     log_row: adw::ActionRow,
-    /// 实时日志行：点击打开 journalctl 终端（复用 system::open_live_log）。
-    live_log_row: adw::ActionRow,
     /// 迁移提示横幅：旧版客户端 / 不安全的开机认证服务配置时显示。
     banner: adw::Banner,
     busy: Arc<AtomicBool>,
@@ -331,6 +329,7 @@ fn build_window(app: &adw::Application) -> Ui {
         ("测试网络连通", ICON_BULB, "ping 阿里公共 DNS"),
         ("重启开机认证", ICON_ROUTER, "systemd 服务"),
         ("打开客户端目录", ICON_FOLDER, "查看已安装文件"),
+        ("打开实时日志", ICON_TERMINAL, "终端 journalctl -f"),
         ("在线帮助", ICON_HELP, "校园网官方帮助页"),
     ];
     let diag_group = adw::PreferencesGroup::builder().title("诊断与工具").build();
@@ -424,7 +423,7 @@ fn build_window(app: &adw::Application) -> Ui {
     // ---- 控制台：连接表单 + 动作（唯一玻璃容器）----
     let console = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
-        .spacing(2)
+        .spacing(6)
         .css_classes(["glass-card", "console"])
         .valign(gtk::Align::Fill)
         .build();
@@ -522,7 +521,7 @@ fn build_window(app: &adw::Application) -> Ui {
     install_wrap.append(&install);
     console.append(&install_wrap);
 
-    // ---- 日志区块：标题 + 实时日志行 + 完整日志行 ----
+    // ---- 日志区块：标题 + 完整日志行（实时日志收进「更多工具」浮层）----
     let log_title = gtk::Label::builder()
         .label("日志")
         .css_classes(["console-heading"])
@@ -530,16 +529,6 @@ fn build_window(app: &adw::Application) -> Ui {
         .margin_top(2)
         .build();
     console.append(&log_title);
-    let live_log_row = adw::ActionRow::builder()
-        .title("打开实时日志")
-        .subtitle("终端 journalctl -f")
-        .activatable(true)
-        .build();
-    set_pointer_cursor(&live_log_row);
-    let live_log_badge = gtk::Box::builder().css_classes(["row-badge"]).build();
-    live_log_badge.append(&icon_image(ICON_TERMINAL, 16));
-    live_log_row.add_prefix(&live_log_badge);
-    console.append(&live_log_row);
     let log_row = adw::ActionRow::builder()
         .title("查看完整日志")
         .subtitle("暂无日志")
@@ -550,19 +539,6 @@ fn build_window(app: &adw::Application) -> Ui {
     log_badge.append(&icon_image(ICON_LOG, 16));
     log_row.add_prefix(&log_badge);
     console.append(&log_row);
-
-    // ---- 诊断与工具：控制台底部常驻 5 行（压缩行高）----
-    let diag_title = gtk::Label::builder()
-        .label("诊断与工具")
-        .css_classes(["console-heading"])
-        .xalign(0.0)
-        .margin_top(2)
-        .build();
-    console.append(&diag_title);
-    let side_diag = make_diag_rows(&diag_actions);
-    for row in &side_diag {
-        console.append(row);
-    }
 
     // 完整日志浮层：等宽文本，可滚动查看全部日志
     let log_view = gtk::TextView::builder()
@@ -659,7 +635,6 @@ fn build_window(app: &adw::Application) -> Ui {
         log_view,
         diag: diag_rows,
         log_row,
-        live_log_row,
         banner,
         busy: Arc::new(AtomicBool::new(false)),
         refreshing: Arc::new(AtomicBool::new(false)),
@@ -782,12 +757,12 @@ fn load_theme_css() {
         color: #FFFFFF;
         background-color: alpha(#4A3048, 0.55);
         border-radius: 999px;
-        padding: 1px 14px;
-        margin-top: 0;
+        padding: 2px 14px;
+        margin-top: 2px;
     }
 
     .card-title {
-        font-size: 19pt;
+        font-size: 20pt;
         font-weight: 700;
         color: #3A2438;
     }
@@ -798,7 +773,7 @@ fn load_theme_css() {
         background-color: alpha(#6E4A5E, 0.40);
         border-radius: 999px;
         padding: 2px 12px;
-        margin-bottom: 2px;
+        margin-bottom: 3px;
     }
 
     /* ---- 舞台：透明容器，场景直接透出（无卡片背景）---- */
@@ -887,7 +862,7 @@ fn load_theme_css() {
 
     /* ---- 表单行：图标 + 固定宽 label + 输入框，两列对齐 ---- */
     .form-line {
-        padding: 1px 2px;
+        padding: 2px 2px;
     }
     .form-label {
         font-size: 10pt;
@@ -909,7 +884,7 @@ fn load_theme_css() {
 
     /* 控制台行压缩：全部行在 820px 高度内完整放下（固定布局，无滚动） */
     .console row {
-        min-height: 22px;
+        min-height: 26px;
         padding: 1px 8px;
     }
     .console row .title {
@@ -1141,7 +1116,6 @@ fn set_busy(ui: &Ui, busy: bool) {
     ui.nic.set_sensitive(!busy);
     ui.username.set_sensitive(!busy);
     ui.password.set_sensitive(!busy);
-    ui.live_log_row.set_sensitive(!busy);
     ui.log_row.set_sensitive(!busy);
     for row in &ui.diag {
         row.set_sensitive(!busy);
@@ -1444,17 +1418,6 @@ fn wire_events(ui: &Ui) {
         }
     });
 
-    // 实时日志行：点击在终端打开 journalctl -f（与诊断区「打开实时日志」同一动作）
-    let live_log_ui = ui.clone();
-    ui.live_log_row.connect_activated(move |_| {
-        run_diag(
-            &live_log_ui,
-            "正在打开实时日志…",
-            "已打开日志终端",
-            system::open_live_log,
-        );
-    });
-
     // 日志行：点击弹出完整日志浮层
     let log_ui = ui.clone();
     ui.log_row.connect_activated(move |_| {
@@ -1499,7 +1462,13 @@ fn wire_events(ui: &Ui) {
                     "已打开",
                     system::open_client_folder,
                 ),
-                3 => run_diag(&ui, "正在打开帮助页…", "已打开", system::open_help),
+                3 => run_diag(
+                    &ui,
+                    "正在打开实时日志…",
+                    "已打开日志终端",
+                    system::open_live_log,
+                ),
+                4 => run_diag(&ui, "正在打开帮助页…", "已打开", system::open_help),
                 _ => {}
             }
             ui.more_popover.popdown();

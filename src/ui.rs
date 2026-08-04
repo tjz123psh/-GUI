@@ -65,13 +65,8 @@ struct Ui {
     /// 连接设置开关（浮层内控制 DHCP 与是否保存密码）。
     dhcp: gtk::Switch,
     save_password: gtk::Switch,
-    /// 完整日志浮层。
-    log_popover: gtk::Popover,
-    log_view: gtk::TextView,
     /// 诊断工具行：测试连通 / 重启 / 打开目录 / 实时日志 / 帮助
     diag: Vec<adw::ActionRow>,
-    /// 最近日志预览（走 ActionRow subtitle，左对齐不飘）
-    log_row: adw::ActionRow,
     /// 最近日志多行预览（日志区块内，实时随状态刷新）。
     log_preview: gtk::Label,
     /// 迁移提示横幅：旧版客户端 / 不安全的开机认证服务配置时显示。
@@ -155,7 +150,6 @@ const ICON_NETWORK: &[u8] = icon_png!("network");
 const ICON_USER: &[u8] = icon_png!("user");
 const ICON_LOCK: &[u8] = icon_png!("lock");
 const ICON_ROUTER: &[u8] = icon_png!("router");
-const ICON_LOG: &[u8] = icon_png!("file-text");
 const ICON_SETTINGS: &[u8] = icon_png!("settings");
 const ICON_TERMINAL: &[u8] = icon_png!("terminal-2");
 const ICON_FOLDER: &[u8] = icon_png!("folder-open");
@@ -538,35 +532,6 @@ fn build_window(app: &adw::Application) -> Ui {
         .wrap(true)
         .build();
     console.append(&log_preview);
-    let log_row = adw::ActionRow::builder()
-        .title("查看完整日志")
-        .subtitle("点击查看完整内容")
-        .activatable(true)
-        .build();
-    set_pointer_cursor(&log_row);
-    let log_badge = gtk::Box::builder().css_classes(["row-badge"]).build();
-    log_badge.append(&icon_image(ICON_LOG, 16));
-    log_row.add_prefix(&log_badge);
-    console.append(&log_row);
-
-    // 完整日志浮层：等宽文本，可滚动查看全部日志
-    let log_view = gtk::TextView::builder()
-        .editable(false)
-        .cursor_visible(false)
-        .wrap_mode(gtk::WrapMode::WordChar)
-        .css_classes(["log-text"])
-        .build();
-    let log_scroll = gtk::ScrolledWindow::builder()
-        .child(&log_view)
-        .min_content_height(220)
-        .max_content_height(320)
-        .hexpand(true)
-        .build();
-    let log_popover = gtk::Popover::builder()
-        .child(&log_scroll)
-        .width_request(380)
-        .build();
-    log_popover.set_parent(&log_row);
 
     // ---- 组合：舞台 + 控制台（控制台固定宽靠右，舞台吃满剩余）----
     let row_box = gtk::Box::builder()
@@ -640,10 +605,7 @@ fn build_window(app: &adw::Application) -> Ui {
         more_popover,
         dhcp,
         save_password,
-        log_popover,
-        log_view,
         diag: diag_rows,
-        log_row,
         log_preview,
         banner,
         busy: Arc::new(AtomicBool::new(false)),
@@ -1135,7 +1097,6 @@ fn set_busy(ui: &Ui, busy: bool) {
     ui.nic.set_sensitive(!busy);
     ui.username.set_sensitive(!busy);
     ui.password.set_sensitive(!busy);
-    ui.log_row.set_sensitive(!busy);
     for row in &ui.diag {
         row.set_sensitive(!busy);
     }
@@ -1437,25 +1398,6 @@ fn wire_events(ui: &Ui) {
         }
     });
 
-    // 日志行：点击弹出完整日志浮层
-    let log_ui = ui.clone();
-    ui.log_row.connect_activated(move |_| {
-        let ui = log_ui.clone();
-        glib::spawn_future_local(async move {
-            let log = glib::spawn_future(async move { system::load_status().last_log })
-                .await
-                .unwrap_or_default();
-            let log = if log.trim().is_empty() {
-                "暂无日志。".to_string()
-            } else {
-                log
-            };
-            let buffer = ui.log_view.buffer();
-            buffer.set_text(&log);
-            ui.log_popover.popup();
-        });
-    });
-
     // 诊断工具行：按顺序接线到已有后端能力
     let diag_ui = ui.clone();
     for (i, row) in ui.diag.iter().enumerate() {
@@ -1504,7 +1446,6 @@ fn refresh_status(ui: &Ui) {
     glib::spawn_future_local(async move {
         let (
             pills,
-            log_text,
             preview,
             autostart,
             conn,
@@ -1556,18 +1497,6 @@ fn refresh_status(ui: &Ui) {
                 ("网卡 无网线".to_string(), "dot-warn")
             };
 
-            let log_text = if status.last_log.is_empty() {
-                "暂无日志".to_string()
-            } else {
-                let trimmed = status.last_log.trim();
-                if trimmed.chars().count() > 60 {
-                    let mut s: String = trimmed.chars().take(60).collect();
-                    s.push('…');
-                    s
-                } else {
-                    trimmed.to_string()
-                }
-            };
             // 预览区：最多显示最近 4 行日志
             let preview = if status.last_log.is_empty() {
                 "暂无日志".to_string()
@@ -1626,7 +1555,6 @@ fn refresh_status(ui: &Ui) {
 
             (
                 vec![client, proc, service, nic_pill],
-                log_text,
                 preview,
                 status.service_enabled == "enabled",
                 conn,
@@ -1645,7 +1573,6 @@ fn refresh_status(ui: &Ui) {
                 ("服务 加载中…".to_string(), "dot-warn"),
                 ("网卡 加载中…".to_string(), "dot-warn"),
             ],
-            "暂无日志".to_string(),
             "暂无日志".to_string(),
             false,
             false,
@@ -1675,7 +1602,6 @@ fn refresh_status(ui: &Ui) {
         };
         ui_done.stage_sub.set_label(&sub);
         ui_done.compact_sub.set_label(&sub);
-        ui_done.log_row.set_subtitle(&log_text);
         ui_done.log_preview.set_label(&preview);
         // 迁移横幅：仅旧版客户端 / 不安全服务模板时显示
         ui_done.banner.set_title(&banner_title);

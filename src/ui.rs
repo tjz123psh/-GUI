@@ -28,6 +28,14 @@ const STANDARD_MAX: i32 = 940;
 /// 控制台固定宽度：不随窗口拉宽，多余宽度全部交给场景舞台。
 const CONSOLE_WIDTH: i32 = 420;
 
+/// 最近一次认证结果（会话内记录，供「连接详情」区块显示）。
+#[derive(Clone)]
+struct LastAuth {
+    ok: bool,
+    summary: String,
+    at: std::time::SystemTime,
+}
+
 /// 窗口内需要被多个回调共享的最小状态集。
 #[derive(Clone)]
 struct Ui {
@@ -49,6 +57,12 @@ struct Ui {
     compact_sub: gtk::Label,
     /// 右侧操作面板（玻璃卡，唯一容器）。
     console: gtk::Box,
+    /// 连接详情区三行：账号 / 状态 / 最近认证结果。
+    detail_account: gtk::Label,
+    detail_state: gtk::Label,
+    detail_last: gtk::Label,
+    /// 会话内最近一次认证结果（连接成功/失败时更新）。
+    last_auth: Arc<std::sync::Mutex<Option<LastAuth>>>,
     nic: gtk::DropDown,
     nic_model: gtk::StringList,
     nics: Arc<Vec<String>>,
@@ -267,7 +281,7 @@ fn build_window(app: &adw::Application) -> Ui {
         .application(app)
         .title("锐捷有线认证")
         .default_width(1280)
-        .default_height(860)
+        .default_height(900)
         .content(&toasts)
         .build();
 
@@ -541,6 +555,33 @@ fn build_window(app: &adw::Application) -> Ui {
         .build();
     console.append(&log_preview);
 
+    // ---- 连接详情区：认证账号 / 连接状态 / 最近认证结果（动态真实信息）----
+    let conn_title = gtk::Label::builder()
+        .label("连接详情")
+        .css_classes(["console-heading"])
+        .xalign(0.0)
+        .margin_top(2)
+        .build();
+    console.append(&conn_title);
+    let detail_account = gtk::Label::builder()
+        .label("认证账号 -")
+        .css_classes(["conn-row"])
+        .xalign(0.0)
+        .build();
+    console.append(&detail_account);
+    let detail_state = gtk::Label::builder()
+        .label("连接状态 未连接")
+        .css_classes(["conn-row"])
+        .xalign(0.0)
+        .build();
+    console.append(&detail_state);
+    let detail_last = gtk::Label::builder()
+        .label("最近认证 暂无记录")
+        .css_classes(["conn-row"])
+        .xalign(0.0)
+        .build();
+    console.append(&detail_last);
+
     // ---- 组合：舞台 + 控制台（控制台固定宽靠右，舞台吃满剩余）----
     let row_box = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
@@ -616,6 +657,10 @@ fn build_window(app: &adw::Application) -> Ui {
         diag: diag_rows,
         log_preview,
         net_info,
+        detail_account,
+        detail_state,
+        detail_last,
+        last_auth: Arc::new(std::sync::Mutex::new(None)),
         banner,
         busy: Arc::new(AtomicBool::new(false)),
         refreshing: Arc::new(AtomicBool::new(false)),
@@ -850,6 +895,12 @@ fn load_theme_css() {
         font-size: 8.5pt;
         color: #6E5568;
         padding: 0 2px 3px 76px;
+    }
+    /* 连接详情行：账号 / 状态 / 最近认证结果 */
+    .conn-row {
+        font-size: 9pt;
+        color: #3E2B3A;
+        padding: 1px 2px;
     }
     .form-label {
         font-size: 10pt;
@@ -1159,6 +1210,14 @@ where
                     ui_done.scene.set_mode(scene::Mode::Success);
                     ui_done.link.set_mode(scene::Mode::Success);
                     ui_done.set_stage(text, true);
+                    // 连接动作成功：记录最近认证结果（连接详情区显示）
+                    if let Ok(mut guard) = ui_done.last_auth.lock() {
+                        *guard = Some(LastAuth {
+                            ok: true,
+                            summary: String::new(),
+                            at: std::time::SystemTime::now(),
+                        });
+                    }
                 } else {
                     ui_done.scene.set_mode(scene::Mode::Idle);
                     ui_done.link.set_mode(scene::Mode::Idle);
@@ -1309,6 +1368,28 @@ where
     });
 }
 
+/// 把会话内最近认证记录格式化为「成功/失败：信息（相对时间）」。
+fn last_auth_text(last: &Option<LastAuth>) -> String {
+    use std::time::Duration;
+    let Some(record) = last else {
+        return "暂无记录".to_string();
+    };
+    let elapsed = record.at.elapsed().unwrap_or_default();
+    let ago = if elapsed < Duration::from_secs(60) {
+        "刚刚".to_string()
+    } else if elapsed < Duration::from_secs(3600) {
+        format!("{} 分钟前", elapsed.as_secs() / 60)
+    } else {
+        format!("{} 小时前", elapsed.as_secs() / 3600)
+    };
+    if record.ok {
+        format!("成功（{ago}）")
+    } else {
+        let summary: String = record.summary.chars().take(40).collect();
+        format!("失败：{summary}（{ago}）")
+    }
+}
+
 /// 打开官方客户端安装包选择器并执行安装（安装按钮与迁移横幅共用）。
 fn open_install_dialog(ui: &Ui) {
     let dialog = gtk::FileDialog::builder()
@@ -1342,11 +1423,23 @@ fn wire_events(ui: &Ui) {
             return;
         }
         let _ = config::save(&settings);
+        let last_auth = settings_ui.last_auth.clone();
         run_backend(
             &settings_ui,
             "正在连接…",
             Some("已连接"),
-            move || system::authenticate(&settings, &password),
+            move || {
+                let result = system::authenticate(&settings, &password);
+                // 失败时记录最近认证结果（连接详情区显示）
+                if let (Err(err), Ok(mut guard)) = (&result, last_auth.lock()) {
+                    *guard = Some(LastAuth {
+                        ok: false,
+                        summary: err.to_string(),
+                        at: std::time::SystemTime::now(),
+                    });
+                }
+                result
+            },
         );
     });
 
@@ -1635,6 +1728,28 @@ fn refresh_status(ui: &Ui) {
         ui_done.compact_sub.set_label(&sub);
         ui_done.log_preview.set_label(&preview);
         ui_done.net_info.set_label(&net_text);
+        // 连接详情区：账号 / 状态 / 最近认证结果
+        ui_done
+            .detail_account
+            .set_label(&format!("认证账号 {}", ui_done.username.text()));
+        ui_done.detail_state.set_label(&format!(
+            "连接状态 {}",
+            if conn {
+                detail.clone()
+            } else {
+                "未连接".to_string()
+            }
+        ));
+        let last_text = {
+            let guard = ui_done
+                .last_auth
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            last_auth_text(&guard)
+        };
+        ui_done
+            .detail_last
+            .set_label(&format!("最近认证 {last_text}"));
         // 迁移横幅：仅旧版客户端 / 不安全服务模板时显示
         ui_done.banner.set_title(&banner_title);
         ui_done

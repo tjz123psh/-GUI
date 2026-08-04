@@ -15,6 +15,7 @@ use std::process::{Command, Stdio};
 const PKEXEC_PATH: &str = "/usr/bin/pkexec";
 const SUDO_PATH: &str = "/usr/bin/sudo";
 const SYSTEMCTL_PATH: &str = "/usr/bin/systemctl";
+const IP_BIN: &str = "/usr/bin/ip";
 /// pkexec 授权弹窗等待上限：用户一直不响应时终止等待并报错，
 /// 避免 GUI 停留在"忙"状态、所有点击被吞掉却无法取消（旧实现无超时）。
 const PKEXEC_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
@@ -100,6 +101,47 @@ pub fn interface_has_carrier(name: &str) -> bool {
     fs::read_to_string(Path::new("/sys/class/net").join(name).join("carrier"))
         .map(|value| value.trim() == "1")
         .unwrap_or(false)
+}
+
+/// 读取网卡当前 IPv4 地址（如 "192.168.1.5"）。无地址/无网卡时返回 None。
+pub fn interface_ipv4(name: &str) -> Option<String> {
+    let output = Command::new(IP_BIN)
+        .args(["-4", "-o", "addr", "show", "dev", name])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| {
+            let mut parts = line.split_whitespace();
+            let _index = parts.next()?;
+            let _device = parts.next()?;
+            if parts.next()? != "inet" {
+                return None;
+            }
+            parts.next()?.split('/').next().map(|addr| addr.to_string())
+        })
+}
+
+/// 读取网卡默认网关（如 "192.168.1.1"）。无路由时返回 None。
+pub fn interface_gateway(name: &str) -> Option<String> {
+    let output = Command::new(IP_BIN)
+        .args(["route", "show", "default", "dev", name])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut words = text.split_whitespace();
+    while let Some(word) = words.next() {
+        if word == "via" {
+            return words.next().map(str::to_string);
+        }
+    }
+    None
 }
 
 pub fn install_official_client(zip_path: &Path) -> Result<()> {

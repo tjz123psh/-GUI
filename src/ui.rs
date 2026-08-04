@@ -69,6 +69,8 @@ struct Ui {
     diag: Vec<adw::ActionRow>,
     /// 最近日志多行预览（日志区块内，实时随状态刷新）。
     log_preview: gtk::Label,
+    /// 当前网卡 IP/网关信息（网卡行下方小字，随状态刷新）。
+    net_info: gtk::Label,
     /// 迁移提示横幅：旧版客户端 / 不安全的开机认证服务配置时显示。
     banner: adw::Banner,
     busy: Arc<AtomicBool>,
@@ -475,6 +477,12 @@ fn build_window(app: &adw::Application) -> Ui {
     console.append(&password_row);
     let nic_row = form_line(ICON_NETWORK, "网卡", &nic);
     console.append(&nic_row);
+    let net_info = gtk::Label::builder()
+        .label("未获取到 IP")
+        .css_classes(["net-info"])
+        .xalign(0.0)
+        .build();
+    console.append(&net_info);
 
     let autostart = gtk::Switch::builder().active(false).build();
     // GTK 默认 valign=Fill：放在 ActionRow 的 suffix 里会被行高纵向拉伸
@@ -607,6 +615,7 @@ fn build_window(app: &adw::Application) -> Ui {
         save_password,
         diag: diag_rows,
         log_preview,
+        net_info,
         banner,
         busy: Arc::new(AtomicBool::new(false)),
         refreshing: Arc::new(AtomicBool::new(false)),
@@ -834,7 +843,13 @@ fn load_theme_css() {
 
     /* ---- 表单行：图标 + 固定宽 label + 输入框，两列对齐 ---- */
     .form-line {
-        padding: 2px 2px;
+        padding: 1px 2px;
+    }
+    /* 网络详情小字：网卡行下方的 IP/网关信息 */
+    .net-info {
+        font-size: 8.5pt;
+        color: #6E5568;
+        padding: 0 2px 3px 76px;
     }
     .form-label {
         font-size: 10pt;
@@ -1447,6 +1462,7 @@ fn refresh_status(ui: &Ui) {
         let (
             pills,
             preview,
+            net_text,
             autostart,
             conn,
             detail,
@@ -1521,6 +1537,19 @@ fn refresh_status(ui: &Ui) {
                 .find(|name| system::interface_has_carrier(name))
                 .cloned()
                 .unwrap_or_else(|| nics.first().cloned().unwrap_or_default());
+            // 网络详情：当前网卡的 IP 与网关（认证成功后"拿到 IP 没"最直观）
+            let net_text = if active_nic.is_empty() {
+                "未获取到 IP".to_string()
+            } else {
+                match (
+                    system::interface_ipv4(&active_nic),
+                    system::interface_gateway(&active_nic),
+                ) {
+                    (Some(ip), Some(gw)) => format!("IP {ip} · 网关 {gw}"),
+                    (Some(ip), None) => format!("IP {ip}"),
+                    (None, _) => "未获取到 IP".to_string(),
+                }
+            };
             let detail = if let Some(secs) = status.client_uptime_seconds {
                 if secs < 60 {
                     format!("已连接 {secs}s")
@@ -1556,6 +1585,7 @@ fn refresh_status(ui: &Ui) {
             (
                 vec![client, proc, service, nic_pill],
                 preview,
+                net_text,
                 status.service_enabled == "enabled",
                 conn,
                 detail,
@@ -1574,6 +1604,7 @@ fn refresh_status(ui: &Ui) {
                 ("网卡 加载中…".to_string(), "dot-warn"),
             ],
             "暂无日志".to_string(),
+            "未获取到 IP".to_string(),
             false,
             false,
             "未连接".to_string(),
@@ -1603,6 +1634,7 @@ fn refresh_status(ui: &Ui) {
         ui_done.stage_sub.set_label(&sub);
         ui_done.compact_sub.set_label(&sub);
         ui_done.log_preview.set_label(&preview);
+        ui_done.net_info.set_label(&net_text);
         // 迁移横幅：仅旧版客户端 / 不安全服务模板时显示
         ui_done.banner.set_title(&banner_title);
         ui_done

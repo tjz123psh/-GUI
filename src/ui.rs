@@ -268,6 +268,17 @@ pub fn activate(app: &adw::Application) {
     let ui = build_window(app);
     refresh_status(&ui);
     ui.window.present();
+
+    // 连接状态/时长/IP 轻量实时刷新：连接成功或断开后 run_* 会立即刷新，
+    // 这里每 10 秒轮询一次保证「已连接 X 分钟」、IP、服务状态持续更新。
+    // 认证动作进行中（busy）时跳过，避免干扰。
+    let timer_ui = ui.clone();
+    glib::timeout_add_seconds_local(10, move || {
+        if !timer_ui.busy.load(Ordering::Relaxed) {
+            refresh_status(&timer_ui);
+        }
+        glib::ControlFlow::Continue
+    });
 }
 
 fn build_window(app: &adw::Application) -> Ui {
@@ -1225,11 +1236,10 @@ where
             }
         }
         set_busy(&ui_done, false);
-        // 非连接类动作成功后同步真实状态（含自启开关与服务胶囊）。
-        // 必须先解除 busy，refresh_status 才会把开关同步到服务实际状态。
-        if ok_message.is_none() {
-            refresh_status(&ui_done);
-        }
+        // 无论成功/失败、无论连接类还是安装类动作，完成后都同步真实状态
+        // （连接详情区、自启开关、服务胶囊实时反映）。必须先解除 busy，
+        // refresh_status 才会把开关同步到服务实际状态。
+        refresh_status(&ui_done);
     });
 }
 
@@ -1267,6 +1277,8 @@ where
             }
         }
         set_busy(&ui_done, false);
+        // 断开/诊断完成后同步真实状态（连接详情区实时反映）
+        refresh_status(&ui_done);
     });
 }
 
@@ -1364,6 +1376,8 @@ where
             }
         }
         set_busy(&ui_done, false);
+        // 断开完成后同步真实状态（连接详情区实时反映）
+        refresh_status(&ui_done);
     });
 }
 

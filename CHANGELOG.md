@@ -2,6 +2,13 @@
 
 ## Unreleased - 2026-08-03
 
+### 深度审查修复轮（同日跟进，用户要求剖析隐患/边界/bug 后执行）
+
+- **修复连接状态误报**：`run_backend` 区分连接类与非连接类成功态——「安装客户端」「启用开机认证」此前复用连接动作的成功分支，会把舞台大状态字显示为「已连接」并触发成功霞光；现改为非连接类成功后回到平静场景并刷新真实状态。
+- **自启开关失败回滚**：`enable-service`/`disable-service` 失败时开关位置不再与服务真实状态脱节（回滚 + 刷新同步）。
+- **systemd 启动限流**：生成的 unit 增加 `StartLimitIntervalSec=60`/`StartLimitBurst=3`，防止官方客户端崩溃时 `Restart=on-failure` 无限重启刷日志（实测：新 helper 生成的 unit 已含限流，SEGV 场景下启动 3 次后停止重试）。
+- 验证：fmt/clippy/24 测试全绿；helper 与 GUI 已重部署（helper 哈希 8e3809d9 系）。
+
 ### 安装脚本：构建后自动清理（同日跟进）
 
 - `install.sh` 在安装完成后自动 `cargo clean` 删除源码目录下的编译中间产物（`target/`，约数百 MB 至数 GB），避免源码构建式安装留下构建垃圾；设置 `RJSUPPLICANT_KEEP_BUILD=1` 可跳过清理（保留增量构建缓存），`--help` 已注明。

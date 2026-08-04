@@ -1147,7 +1147,10 @@ fn toast(ui: &Ui, text: &str) {
 
 /// 在后台线程执行后端调用 f，结束后切回主线程更新界面。
 /// 成功/失败分别触发场景与链路动效。
-fn run_backend<F>(ui: &Ui, busy_message: &str, f: F)
+/// `ok_message`：连接类动作传 `Some`（成功后大状态字显示该文案并触发成功霞光）；
+/// 非连接类动作（安装客户端等）传 `None`（成功后回到平静场景并刷新真实状态，
+/// 避免把"安装成功/自启开启"误报成"已连接"）。
+fn run_backend<F>(ui: &Ui, busy_message: &str, ok_message: Option<&'static str>, f: F)
 where
     F: FnOnce() -> anyhow::Result<()> + Send + 'static,
 {
@@ -1176,13 +1179,23 @@ where
                 toast(&ui_done, &err);
             }
             None => {
-                ui_done.scene.set_mode(scene::Mode::Success);
-                ui_done.link.set_mode(scene::Mode::Success);
-                ui_done.set_stage("已连接", true);
+                if let Some(text) = ok_message {
+                    ui_done.scene.set_mode(scene::Mode::Success);
+                    ui_done.link.set_mode(scene::Mode::Success);
+                    ui_done.set_stage(text, true);
+                } else {
+                    ui_done.scene.set_mode(scene::Mode::Idle);
+                    ui_done.link.set_mode(scene::Mode::Idle);
+                }
                 toast(&ui_done, "完成");
             }
         }
         set_busy(&ui_done, false);
+        // 非连接类动作成功后同步真实状态（含自启开关与服务胶囊）。
+        // 必须先解除 busy，refresh_status 才会把开关同步到服务实际状态。
+        if ok_message.is_none() {
+            refresh_status(&ui_done);
+        }
     });
 }
 
@@ -1220,6 +1233,66 @@ where
             }
         }
         set_busy(&ui_done, false);
+    });
+}
+
+/// 开机自启开关动作：后台启用/禁用 systemd 服务。
+/// 失败时回滚开关位置（服务实际状态未改变，避免开关状态与真实状态脱节）；
+/// 成功后刷新真实状态（服务胶囊/开关同步）。
+fn run_service_toggle(ui: &Ui, on: bool, settings: config::Settings) {
+    if ui.busy.load(Ordering::Relaxed) || ui.refreshing.load(Ordering::Relaxed) {
+        return;
+    }
+    set_busy(ui, true);
+    toast(
+        ui,
+        if on {
+            "正在启用开机认证…"
+        } else {
+            "正在关闭开机认证…"
+        },
+    );
+
+    let ui_done = ui.clone();
+    glib::spawn_future_local(async move {
+        let result = glib::spawn_future(async move {
+            if on {
+                system::enable_service(&settings)
+            } else {
+                system::disable_service()
+            }
+        })
+        .await;
+        let message = match result {
+            Ok(Ok(())) => None,
+            Ok(Err(err)) if !err.to_string().is_empty() => Some(err.to_string()),
+            Err(err) => Some(err.to_string()),
+            _ => None,
+        };
+        match message {
+            Some(err) => {
+                // 失败：回滚开关（busy 为 true，回滚触发的 notify 会被 busy 保护跳过）
+                ui_done.autostart.set_active(!on);
+                ui_done.scene.set_mode(scene::Mode::Failed);
+                ui_done.link.set_mode(scene::Mode::Failed);
+                toast(&ui_done, &err);
+            }
+            None => {
+                ui_done.scene.set_mode(scene::Mode::Idle);
+                ui_done.link.set_mode(scene::Mode::Idle);
+                toast(
+                    &ui_done,
+                    if on {
+                        "开机认证已启用"
+                    } else {
+                        "开机认证已关闭"
+                    },
+                );
+            }
+        }
+        set_busy(&ui_done, false);
+        // 成功后同步真实状态（开关位置、服务胶囊）；失败后也刷新，反映服务未变的真相
+        refresh_status(&ui_done);
     });
 }
 
@@ -1271,7 +1344,7 @@ fn open_install_dialog(ui: &Ui) {
         if let Ok(file) = future.await
             && let Some(path) = file.path()
         {
-            run_backend(&ui2, "正在安装客户端…", move || {
+            run_backend(&ui2, "正在安装客户端…", None, move || {
                 system::install_official_client(&path)
             });
         }
@@ -1293,9 +1366,12 @@ fn wire_events(ui: &Ui) {
             return;
         }
         let _ = config::save(&settings);
-        run_backend(&settings_ui, "正在连接…", move || {
-            system::authenticate(&settings, &password)
-        });
+        run_backend(
+            &settings_ui,
+            "正在连接…",
+            Some("已连接"),
+            move || system::authenticate(&settings, &password),
+        );
     });
 
     let disconnect = ui.clone();
@@ -1322,16 +1398,14 @@ fn wire_events(ui: &Ui) {
         let settings = ui.settings();
         if on {
             match config::validate(&settings) {
-                Ok(()) => run_backend(&ui, "正在启用开机认证…", move || {
-                    system::enable_service(&settings)
-                }),
+                Ok(()) => run_service_toggle(&ui, true, settings),
                 Err(err) => {
                     switch.set_active(false);
                     toast(&ui, &err.to_string());
                 }
             }
         } else {
-            run_backend_quiet(&ui, "正在关闭开机认证…", system::disable_service);
+            run_service_toggle(&ui, false, settings);
         }
     });
 

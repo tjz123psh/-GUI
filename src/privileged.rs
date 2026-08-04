@@ -93,11 +93,13 @@ pub fn service_file(options: &AuthOptions) -> String {
         .into_owned();
 
     format!(
-        "[Unit]\n\
+        "         [Unit]\n\
          Description=Ruijie RG-SU wired authentication client\n\
          Documentation=https://etr.gdufs.edu.cn/info/1303/5137.htm\n\
          After=network-online.target\n\
          Wants=network-online.target\n\
+         StartLimitIntervalSec=60\n\
+         StartLimitBurst=3\n\
          \n\
          [Service]\n\
          Type=forking\n\

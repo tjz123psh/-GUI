@@ -2,7 +2,7 @@
 
 - 最后更新：2026-08-03
 - 当前版本：0.3.0
-- 项目状态：后端与提权链功能冻结；樱花学园前端已完成皮肤、渐进披露浮层与**舞台+控制台布局重设计**（左侧透明舞台透出樱花场景：大状态字 + 设备↔网关链路图 + 状态胶囊；右侧单张玻璃控制台），多轮修复与逐屏视觉验收（沉浸式标题栏、Tabler 图标、深紫玻璃胶囊文字对比度、深紫 popover、链路图标替换、按钮左移），系统集成已验证（polkit agent 补齐、unit 模板 WorkingDirectory 引号 bug 修复、实时日志链路确认），等待校园有线网实机验证
+- 项目状态：后端与提权链功能冻结；樱花学园前端已完成皮肤、渐进披露浮层与**舞台+控制台布局重设计**（左侧透明舞台透出樱花场景：大状态字 + 设备↔网关链路图 + 状态胶囊；右侧单张玻璃控制台，含表单+网卡 IP/网关+自启+连接断开安装+日志预览+连接详情），多轮修复与逐屏视觉验收（沉浸式标题栏、Tabler 图标、深紫玻璃胶囊文字对比度、深紫 popover、链路图标替换、按钮左移、固定无滚动布局、状态实时刷新），系统集成已验证（polkit agent 补齐、unit 模板 WorkingDirectory 引号 bug 修复、实时日志链路确认），等待校园有线网实机验证
 - 最终验收代码基线：`9ff5645`
 - 当前代码基线：`7842361` + 未提交前端皮肤改动（不要 reset/stash 覆盖）
 - 主分支：`main`
@@ -29,6 +29,16 @@
 2026-08-03 系统集成验证轮（用户反馈"右上角设置/刷新按钮放左边"+"实时日志终端没输出"后触发，用户确认安装 polkit agent）：headerbar 的刷新/设置按钮从 `pack_end` 改为 `pack_start`（左上角，标题胶囊跟随在按钮右侧）；「打开实时日志」终端之前为空是正常现象（journalctl 按 unit 过滤，服务从未运行过、无条目）；为触发真实特权链路，用 `gsudo` 跑 helper `enable-service`，**发现并修复 unit 模板 bug**：systemd `WorkingDirectory=` 不接受引号（`ExecStart` 接受），`src/privileged.rs` 的 `service_file()`/`service_content_uses_owned_paths()` 中 workdir 去掉 `systemd_quote`（system.rs 的 GUI 侧模板本就无引号，未动），helper 重部署（745808 字节）后写 unit + enable 成功；**服务启动失败=官方 2014 闭源客户端在 root 下 SEGV**（栈 `CContextControlThread::DispathMessage→CLnxThread::Run→__libc_msgrcv`、`GetDHCPIPInfo`，与现代 glibc 不兼容），普通用户运行则提示权限不够；已 `disable` 服务防开机崩溃循环（unit 文件保留为修复后正确模板），journalctl 留有崩溃栈历史可验证实时日志链路。**polkit agent 补齐**：本机此前无 agent（GUI 特权操作静默失败），`gsudo pacman -S polkit-gnome` 安装，`~/.config/niri/config.kdl` 新增 `spawn-at-startup "/usr/lib/polkit-gnome/polkit-gnome-authentication-agent-1"`；`pkexec /bin/true` 实测授权弹窗→通过。GUI 部署哈希 2f1b0d19。前端自本轮起不再有新功能改动，等待校园有线网实机验证（第 13 节清单）。前端接线审计补全：`client_requires_migration`/`service_requires_migration`/`service_active` 三个此前未消费的 `ClientStatus` 字段现已接入——控制台顶部新增 `adw::Banner` 迁移横幅（旧版客户端时带"现在处理"按钮直达安装选择器；服务模板不安全时提示操作自启开关），服务状态胶囊区分"已启用/异常/未启用"（enabled 但 `service_active != active` 显示"服务 异常"红点，修复客户端崩溃后误报健康的问题）；安装选择器逻辑提取为 `open_install_dialog()` 供安装按钮与横幅共用。控制台垂直间距压缩（spacing 10→6、行高 34→30、表单 4→2、heading margin 6→2、玻璃卡 padding 24→16）与内容区上边距 48（卡片顶明显低于标题栏关闭按钮）。部署哈希 1bc3d5cd（前端）+ helper 745808 字节。日志区块整合：控制台「最近日志」标题改「日志」，「查看完整日志」行前新增「打开实时日志」行（`system::open_live_log`，与诊断区同一动作），部署哈希 6e45cbf1。
 
 本机已经通过一键脚本安装当前版本。验收时确认 GUI 与 helper 的哈希和当前 Release 完全一致，helper、wrapper、官方客户端及 policy 均为正确的 root-owned 权限，学校官方 ZIP 的 SHA-256 也匹配固定值。验收没有主动发起认证或创建/改动 systemd 服务；测试 GUI 已关闭。
+
+2026-08-04 日志预览区轮（用户"面板显得空"后执行）：控制台「日志」区块新增最近日志预览——等宽字体显示最近 4 行日志（白色玻璃托底），随状态刷新实时更新；内容从 ~570px 填充到 ~750px，底部留白大幅减少。提交 35ff775。
+
+2026-08-04 日志区块精简轮（用户"查看完整日志点击没反应/没有效信息"后执行）：移除「查看完整日志」行与完整日志浮层（TextView+Popover）——预览区已覆盖快速查看，完整日志可用「更多工具」里的「打开实时日志」终端查看；顺带清理 ICON_LOG、.log-text、refresh_status 的 log_text 死代码。提交 5fa0cce。
+
+2026-08-04 网络详情轮（用户选"面板加 IP/网关"）：控制台网卡行下方新增网络详情小字（当前网卡 IPv4 + 默认网关，无地址显示「未获取到 IP」）；后端新增 `system::interface_ipv4`/`interface_gateway`（`ip -4 -o addr show` + `ip route show default` 解析）。提交 aef5739。
+
+2026-08-04 连接详情区轮（用户选"日志下方空白加连接详情"）：控制台日志下方新增「连接详情」——认证账号/连接状态（含时长）/最近认证结果（成功失败+相对时间，会话内 LastAuth 记录，失败在后台闭包记、成功在 run_backend 分支记）；Pango markup 单行分色（标签浅紫灰/值深色、状态粉绿红加粗、值经 markup_escape_text 转义）；默认窗口 860→900。提交 04ebf1d + 336ae9c。
+
+2026-08-04 状态实时刷新轮（用户"能实时显示吗，而不是硬编码"）：run_backend/run_backend_quiet/run_diag 的 set_busy(false) 后无条件 refresh_status（动作后立即反映真实状态；连接失败大状态字会被刷新为「未连接」，toast 保留错误信息）；activate 加 10 秒 `timeout_add_seconds_local` 轮询（busy 时跳过），连接时长/IP/服务状态持续更新。提交 fd0ae5a。
 
 2026-08-04 诊断工具收进浮层轮（用户反馈"为什么设计成点击/手状但点击无效果"+ 选"收进更多工具浮层"后执行）：**根因**——控制台底部「诊断与工具」行此前设置了 pointer cursor 却从未绑定 `connect_activated`（`Ui.diag` 绑定的是浮层内行），用户点击自然无反应；已删除控制台底部整块诊断区。「更多工具」浮层现含连接设置（DHCP/保存密码）+ 诊断与工具 5 行（测试连通/重启开机认证/打开客户端目录/打开实时日志/在线帮助，全部绑定动作）；控制台只留核心流程（账号/密码/网卡/自启/连接断开/安装/查看完整日志），固定无滚动、更简洁。日志区块移除「打开实时日志」行（浮层内有）。控制台间距适度恢复（spacing 2→6、行高 22→26、标题 20pt），内容约 570px 在 860 默认窗口完整显示、底部留白透场景。验证：fmt/clippy/24 测试全绿；浮层键盘打开正常（Tab×2+Enter）；控制台最后内容 y≈568（此前 850）。部署哈希与 target 一致；运行窗口 43。
 

@@ -72,6 +72,8 @@ struct Ui {
     diag: Vec<adw::ActionRow>,
     /// 最近日志预览（走 ActionRow subtitle，左对齐不飘）
     log_row: adw::ActionRow,
+    /// 最近日志多行预览（日志区块内，实时随状态刷新）。
+    log_preview: gtk::Label,
     /// 迁移提示横幅：旧版客户端 / 不安全的开机认证服务配置时显示。
     banner: adw::Banner,
     busy: Arc<AtomicBool>,
@@ -521,7 +523,7 @@ fn build_window(app: &adw::Application) -> Ui {
     install_wrap.append(&install);
     console.append(&install_wrap);
 
-    // ---- 日志区块：标题 + 完整日志行（实时日志收进「更多工具」浮层）----
+    // ---- 日志区块：标题 + 最近日志预览 + 完整日志行（实时日志收进「更多工具」浮层）----
     let log_title = gtk::Label::builder()
         .label("日志")
         .css_classes(["console-heading"])
@@ -529,9 +531,16 @@ fn build_window(app: &adw::Application) -> Ui {
         .margin_top(2)
         .build();
     console.append(&log_title);
+    let log_preview = gtk::Label::builder()
+        .label("暂无日志")
+        .css_classes(["log-preview"])
+        .xalign(0.0)
+        .wrap(true)
+        .build();
+    console.append(&log_preview);
     let log_row = adw::ActionRow::builder()
         .title("查看完整日志")
-        .subtitle("暂无日志")
+        .subtitle("点击查看完整内容")
         .activatable(true)
         .build();
     set_pointer_cursor(&log_row);
@@ -635,6 +644,7 @@ fn build_window(app: &adw::Application) -> Ui {
         log_view,
         diag: diag_rows,
         log_row,
+        log_preview,
         banner,
         busy: Arc::new(AtomicBool::new(false)),
         refreshing: Arc::new(AtomicBool::new(false)),
@@ -886,6 +896,15 @@ fn load_theme_css() {
     .console row {
         min-height: 26px;
         padding: 1px 8px;
+    }
+    /* 最近日志预览：等宽小字，玻璃托底，随状态实时刷新 */
+    .log-preview {
+        font-size: 8.5pt;
+        font-family: monospace;
+        color: #3E2B3A;
+        background-color: alpha(#ffffff, 0.55);
+        border-radius: 10px;
+        padding: 8px 12px;
     }
     .console row .title {
         font-size: 9.5pt;
@@ -1486,6 +1505,7 @@ fn refresh_status(ui: &Ui) {
         let (
             pills,
             log_text,
+            preview,
             autostart,
             conn,
             detail,
@@ -1548,6 +1568,22 @@ fn refresh_status(ui: &Ui) {
                     trimmed.to_string()
                 }
             };
+            // 预览区：最多显示最近 4 行日志
+            let preview = if status.last_log.is_empty() {
+                "暂无日志".to_string()
+            } else {
+                status
+                    .last_log
+                    .trim()
+                    .lines()
+                    .rev()
+                    .take(4)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
 
             // 连接状态 / 副行（网卡 · 时长）
             let conn = status.client_running;
@@ -1591,6 +1627,7 @@ fn refresh_status(ui: &Ui) {
             (
                 vec![client, proc, service, nic_pill],
                 log_text,
+                preview,
                 status.service_enabled == "enabled",
                 conn,
                 detail,
@@ -1608,6 +1645,7 @@ fn refresh_status(ui: &Ui) {
                 ("服务 加载中…".to_string(), "dot-warn"),
                 ("网卡 加载中…".to_string(), "dot-warn"),
             ],
+            "暂无日志".to_string(),
             "暂无日志".to_string(),
             false,
             false,
@@ -1638,6 +1676,7 @@ fn refresh_status(ui: &Ui) {
         ui_done.stage_sub.set_label(&sub);
         ui_done.compact_sub.set_label(&sub);
         ui_done.log_row.set_subtitle(&log_text);
+        ui_done.log_preview.set_label(&preview);
         // 迁移横幅：仅旧版客户端 / 不安全服务模板时显示
         ui_done.banner.set_title(&banner_title);
         ui_done

@@ -560,7 +560,7 @@ fn build_window(app: &adw::Application) -> Ui {
         .label("连接详情")
         .css_classes(["console-heading"])
         .xalign(0.0)
-        .margin_top(2)
+        .margin_top(10)
         .build();
     console.append(&conn_title);
     let detail_account = gtk::Label::builder()
@@ -896,11 +896,10 @@ fn load_theme_css() {
         color: #6E5568;
         padding: 0 2px 3px 76px;
     }
-    /* 连接详情行：账号 / 状态 / 最近认证结果 */
+    /* 连接详情行：账号 / 状态 / 最近认证结果（标签与值由 markup 分色） */
     .conn-row {
-        font-size: 9pt;
-        color: #3E2B3A;
-        padding: 1px 2px;
+        font-size: 10pt;
+        padding: 2px 2px;
     }
     .form-label {
         font-size: 10pt;
@@ -1368,11 +1367,11 @@ where
     });
 }
 
-/// 把会话内最近认证记录格式化为「成功/失败：信息（相对时间）」。
-fn last_auth_text(last: &Option<LastAuth>) -> String {
+/// 把会话内最近认证记录格式化为（文本, 语义色）：成功绿 / 失败红 / 无记录中性色。
+fn last_auth_text(last: &Option<LastAuth>) -> (String, &'static str) {
     use std::time::Duration;
     let Some(record) = last else {
-        return "暂无记录".to_string();
+        return ("暂无记录".to_string(), "#6E5568");
     };
     let elapsed = record.at.elapsed().unwrap_or_default();
     let ago = if elapsed < Duration::from_secs(60) {
@@ -1383,10 +1382,10 @@ fn last_auth_text(last: &Option<LastAuth>) -> String {
         format!("{} 小时前", elapsed.as_secs() / 3600)
     };
     if record.ok {
-        format!("成功（{ago}）")
+        (format!("成功（{ago}）"), "#2E8B57")
     } else {
         let summary: String = record.summary.chars().take(40).collect();
-        format!("失败：{summary}（{ago}）")
+        (format!("失败：{summary}（{ago}）"), "#C63F38")
     }
 }
 
@@ -1728,28 +1727,31 @@ fn refresh_status(ui: &Ui) {
         ui_done.compact_sub.set_label(&sub);
         ui_done.log_preview.set_label(&preview);
         ui_done.net_info.set_label(&net_text);
-        // 连接详情区：账号 / 状态 / 最近认证结果
-        ui_done
-            .detail_account
-            .set_label(&format!("认证账号 {}", ui_done.username.text()));
-        ui_done.detail_state.set_label(&format!(
-            "连接状态 {}",
-            if conn {
-                detail.clone()
-            } else {
-                "未连接".to_string()
-            }
+        // 连接详情区：账号 / 状态 / 最近认证结果（标签浅色、值深色，状态语义着色）
+        let account = ui_done.username.text();
+        ui_done.detail_account.set_markup(&format!(
+            "<span color='#6E5568'>认证账号</span> <span color='#3E2B3A'>{}</span>",
+            glib::markup_escape_text(&account)
         ));
-        let last_text = {
-            let guard = ui_done
-                .last_auth
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner());
-            last_auth_text(&guard)
+        let (state_text, state_color) = if conn {
+            (detail.clone(), "#C14D7C")
+        } else {
+            ("未连接".to_string(), "#3E2B3A")
         };
-        ui_done
-            .detail_last
-            .set_label(&format!("最近认证 {last_text}"));
+        ui_done.detail_state.set_markup(&format!(
+            "<span color='#6E5568'>连接状态</span> <span color='{state_color}'><b>{}</b></span>",
+            glib::markup_escape_text(&state_text)
+        ));
+        let guard = ui_done
+            .last_auth
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let (last_text, last_color) = last_auth_text(&guard);
+        drop(guard);
+        ui_done.detail_last.set_markup(&format!(
+            "<span color='#6E5568'>最近认证</span> <span color='{last_color}'><b>{}</b></span>",
+            glib::markup_escape_text(&last_text)
+        ));
         // 迁移横幅：仅旧版客户端 / 不安全服务模板时显示
         ui_done.banner.set_title(&banner_title);
         ui_done

@@ -15,6 +15,9 @@ use std::process::{Command, Stdio};
 const PKEXEC_PATH: &str = "/usr/bin/pkexec";
 const SUDO_PATH: &str = "/usr/bin/sudo";
 const SYSTEMCTL_PATH: &str = "/usr/bin/systemctl";
+/// pkexec 授权弹窗等待上限：用户一直不响应时终止等待并报错，
+/// 避免 GUI 停留在"忙"状态、所有点击被吞掉却无法取消（旧实现无超时）。
+const PKEXEC_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommandSpec {
@@ -256,7 +259,20 @@ fn run_elevated_wait_with_input(
                 return Err(err).context("无法写入 helper 密码输入通道");
             }
         }
-        let status = child.wait()?;
+        // 等待授权结果，但带超时：用户不响应 polkit 弹窗时，
+        // 120 秒后终止并报错，而不是让 GUI 无限停留在忙碌状态。
+        let deadline = std::time::Instant::now() + PKEXEC_WAIT_TIMEOUT;
+        let status = loop {
+            if let Some(status) = child.try_wait().context("无法等待系统授权")? {
+                break status;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                anyhow::bail!("{} 授权等待超时，请重试", action_label(&action));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        };
 
         if status.success() {
             return Ok(());

@@ -1130,10 +1130,22 @@ fn load_theme_css() {
 
 fn set_busy(ui: &Ui, busy: bool) {
     ui.busy.store(busy, Ordering::Relaxed);
+    // 忙碌期间禁用全部交互控件：避免控件仍是可点外观（手状光标）却
+    // 被 busy 保护吞掉点击，让用户误以为点击无效。
     ui.connect.set_sensitive(!busy);
     ui.disconnect.set_sensitive(!busy);
     ui.install.set_sensitive(!busy);
     ui.refresh.set_sensitive(!busy);
+    ui.autostart.set_sensitive(!busy);
+    ui.more.set_sensitive(!busy);
+    ui.nic.set_sensitive(!busy);
+    ui.username.set_sensitive(!busy);
+    ui.password.set_sensitive(!busy);
+    ui.live_log_row.set_sensitive(!busy);
+    ui.log_row.set_sensitive(!busy);
+    for row in &ui.diag {
+        row.set_sensitive(!busy);
+    }
 }
 
 fn toast(ui: &Ui, text: &str) {

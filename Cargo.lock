@@ -517,6 +517,8 @@ version = "0.3.0"
 dependencies = [
  "anyhow",
  "cairo-rs",
+ "futures-channel",
+ "futures-util",
  "gtk4",
  "libadwaita",
  "libc",

@@ -13,6 +13,8 @@
 
 use crate::{config, scene, system};
 use adw::prelude::*;
+use futures_channel::mpsc;
+use futures_util::StreamExt;
 use gtk4 as gtk;
 use gtk4::glib;
 use libadwaita as adw;
@@ -1199,14 +1201,23 @@ where
     ui.scene.set_mode(scene::Mode::Connecting);
     ui.link.set_mode(scene::Mode::Connecting);
 
+    // 阻塞调用（pkexec 等待、systemctl、官方客户端运行）放在独立线程执行：
+    // glib::spawn_future 在主上下文线程上运行，阻塞体会冻结整个界面（实测：
+    // 点击连接后 UI 卡死）。结果经 futures-channel 异步送回主循环，不阻塞 UI。
     let ui_done = ui.clone();
     glib::spawn_future_local(async move {
-        let result = glib::spawn_future(async move { f() }).await;
+        let (tx, mut rx) = mpsc::unbounded();
+        std::thread::spawn(move || {
+            let _ = tx.unbounded_send(f());
+        });
+        let result = rx
+            .next()
+            .await
+            .unwrap_or_else(|| Err(anyhow::anyhow!("后台任务异常退出")));
         let message = match result {
-            Ok(Ok(())) => None,
-            Ok(Err(err)) if !err.to_string().is_empty() => Some(err.to_string()),
+            Ok(()) => None,
+            Err(err) if !err.to_string().is_empty() => Some(err.to_string()),
             Err(err) => Some(err.to_string()),
-            _ => None,
         };
         match message {
             Some(err) => {
@@ -1257,12 +1268,18 @@ where
     let ui_done = ui.clone();
     let ok_message = ok_message.to_string();
     glib::spawn_future_local(async move {
-        let result = glib::spawn_future(async move { f() }).await;
+        let (tx, mut rx) = mpsc::unbounded();
+        std::thread::spawn(move || {
+            let _ = tx.unbounded_send(f());
+        });
+        let result = rx
+            .next()
+            .await
+            .unwrap_or_else(|| Err(anyhow::anyhow!("后台任务异常退出")));
         let message = match result {
-            Ok(Ok(())) => None,
-            Ok(Err(err)) if !err.to_string().is_empty() => Some(err.to_string()),
+            Ok(()) => None,
+            Err(err) if !err.to_string().is_empty() => Some(err.to_string()),
             Err(err) => Some(err.to_string()),
-            _ => None,
         };
         match message {
             Some(err) => {
@@ -1301,19 +1318,23 @@ fn run_service_toggle(ui: &Ui, on: bool, settings: config::Settings) {
 
     let ui_done = ui.clone();
     glib::spawn_future_local(async move {
-        let result = glib::spawn_future(async move {
-            if on {
+        let (tx, mut rx) = mpsc::unbounded();
+        std::thread::spawn(move || {
+            let result = if on {
                 system::enable_service(&settings)
             } else {
                 system::disable_service()
-            }
-        })
-        .await;
+            };
+            let _ = tx.unbounded_send(result);
+        });
+        let result = rx
+            .next()
+            .await
+            .unwrap_or_else(|| Err(anyhow::anyhow!("后台任务异常退出")));
         let message = match result {
-            Ok(Ok(())) => None,
-            Ok(Err(err)) if !err.to_string().is_empty() => Some(err.to_string()),
+            Ok(()) => None,
+            Err(err) if !err.to_string().is_empty() => Some(err.to_string()),
             Err(err) => Some(err.to_string()),
-            _ => None,
         };
         match message {
             Some(err) => {
@@ -1355,12 +1376,18 @@ where
 
     let ui_done = ui.clone();
     glib::spawn_future_local(async move {
-        let result = glib::spawn_future(async move { f() }).await;
+        let (tx, mut rx) = mpsc::unbounded();
+        std::thread::spawn(move || {
+            let _ = tx.unbounded_send(f());
+        });
+        let result = rx
+            .next()
+            .await
+            .unwrap_or_else(|| Err(anyhow::anyhow!("后台任务异常退出")));
         let message = match result {
-            Ok(Ok(())) => None,
-            Ok(Err(err)) if !err.to_string().is_empty() => Some(err.to_string()),
+            Ok(()) => None,
+            Err(err) if !err.to_string().is_empty() => Some(err.to_string()),
             Err(err) => Some(err.to_string()),
-            _ => None,
         };
         match message {
             Some(err) => {
@@ -1432,8 +1459,8 @@ fn wire_events(ui: &Ui) {
             return;
         }
         if password.is_empty() {
-            toast(&settings_ui, "请输入密码");
-            return;
+            // 允许空密码：后端不传 -p，由官方客户端复用已保存密码（save_password=1 时）。
+            toast(&settings_ui, "密码留空，将尝试复用已保存的密码");
         }
         let _ = config::save(&settings);
         let last_auth = settings_ui.last_auth.clone();
@@ -1564,19 +1591,11 @@ fn refresh_status(ui: &Ui) {
     let ui_done = ui.clone();
     let nics = ui.nics.clone();
     ui.refreshing.store(true, Ordering::Relaxed);
+    // 状态读取（journalctl/systemctl/ps/IP 命令）也是阻塞 I/O：放到工作线程，
+    // 避免 10 秒轮询在主循环上造成界面卡顿；结果经 futures-channel 异步送回。
     glib::spawn_future_local(async move {
-        let (
-            pills,
-            preview,
-            net_text,
-            autostart,
-            conn,
-            detail,
-            active_nic,
-            banner_show,
-            banner_title,
-            banner_action,
-        ) = glib::spawn_future(async move {
+        let (tx, mut rx) = mpsc::unbounded();
+        std::thread::spawn(move || {
             let status = system::load_status();
 
             let client = if status.client_installed {
@@ -1688,7 +1707,7 @@ fn refresh_status(ui: &Ui) {
                 (false, String::new(), String::new())
             };
 
-            (
+            let computed = (
                 vec![client, proc, service, nic_pill],
                 preview,
                 net_text,
@@ -1699,26 +1718,40 @@ fn refresh_status(ui: &Ui) {
                 banner_show,
                 banner_title,
                 banner_action,
+            );
+            let _ = tx.unbounded_send(computed);
+        });
+        let computed = rx.next().await.unwrap_or_else(|| {
+            (
+                vec![
+                    ("客户端 加载中…".to_string(), "dot-warn"),
+                    ("进程 加载中…".to_string(), "dot-warn"),
+                    ("服务 加载中…".to_string(), "dot-warn"),
+                    ("网卡 加载中…".to_string(), "dot-warn"),
+                ],
+                "暂无日志".to_string(),
+                "未获取到 IP".to_string(),
+                false,
+                false,
+                "未连接".to_string(),
+                String::new(),
+                false,
+                String::new(),
+                String::new(),
             )
-        })
-        .await
-        .unwrap_or((
-            vec![
-                ("客户端 加载中…".to_string(), "dot-warn"),
-                ("进程 加载中…".to_string(), "dot-warn"),
-                ("服务 加载中…".to_string(), "dot-warn"),
-                ("网卡 加载中…".to_string(), "dot-warn"),
-            ],
-            "暂无日志".to_string(),
-            "未获取到 IP".to_string(),
-            false,
-            false,
-            "未连接".to_string(),
-            String::new(),
-            false,
-            String::new(),
-            String::new(),
-        ));
+        });
+        let (
+            pills,
+            preview,
+            net_text,
+            autostart,
+            conn,
+            detail,
+            active_nic,
+            banner_show,
+            banner_title,
+            banner_action,
+        ) = computed;
 
         // 状态胶囊：圆点 + 值
         let dot_classes = ["dot-ok", "dot-warn"];

@@ -101,7 +101,7 @@ install_system_deps() {
 
   if need_cmd pacman; then
     log "安装/确认 Arch Linux 依赖。"
-    local dependencies=(gtk4 libadwaita polkit desktop-file-utils unzip)
+    local dependencies=(gtk4 libadwaita polkit desktop-file-utils unzip net-tools)
     if cargo --version >/dev/null 2>&1 && rustc --version >/dev/null 2>&1; then
       log "检测到可用 Rust 工具链，保留当前 rustup/cargo 配置。"
     else
@@ -147,6 +147,8 @@ cleanup_build_artifacts() {
     return
   fi
   if [[ -d "${ROOT_DIR}/target" ]]; then
+    # 清理原则：只删"运行中能再生成"的编译缓存（由锁文件可完整重建）；
+    # 源码目录、用户设置、已安装程序与官方客户端 ZIP 一律保留。
     log "清理编译中间产物（重装时会自动重新构建）。"
     cargo clean --locked --manifest-path "${ROOT_DIR}/Cargo.toml"
   fi

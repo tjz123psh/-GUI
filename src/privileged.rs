@@ -23,6 +23,9 @@ pub enum HelperRequest {
     EnableService(AuthOptions),
     DisableService,
     RestartService,
+    /// 仅由 systemd 在 ExecStartPost 中以 root 调用：恢复被官方客户端
+    /// 主动停掉的 NetworkManager，防止开机认证后无线网络连接受损。
+    RestoreNetwork,
 }
 
 impl HelperRequest {
@@ -49,6 +52,7 @@ impl HelperRequest {
             }
             "disable-service" if args.len() == 1 => Ok(Self::DisableService),
             "restart-service" if args.len() == 1 => Ok(Self::RestartService),
+            "restore-network" if args.len() == 1 => Ok(Self::RestoreNetwork),
             _ => anyhow::bail!("不支持的 helper 子命令或参数数量：{command}"),
         }
     }
@@ -64,6 +68,7 @@ impl HelperRequest {
             Self::EnableService(options) => options_arguments("enable-service", options),
             Self::DisableService => vec!["disable-service".to_string()],
             Self::RestartService => vec!["restart-service".to_string()],
+            Self::RestoreNetwork => vec!["restore-network".to_string()],
         }
     }
 }
@@ -106,6 +111,7 @@ pub fn service_file(options: &AuthOptions) -> String {
          GuessMainPID=yes\n\
          ExecStart={client} -a 1 -d {dhcp} -n {nic} -u {username} -S {save}\n\
          ExecStop={client} -q\n\
+         ExecStartPost=\"{HELPER_PATH}\" restore-network\n\
          Restart=on-failure\n\
          RestartSec=10\n\
          TimeoutStartSec=30\n\
@@ -120,12 +126,14 @@ pub fn service_file(options: &AuthOptions) -> String {
 pub fn service_content_uses_owned_paths(content: &str) -> bool {
     let expected_program = format!("ExecStart=\"{CLIENT_WRAPPER_PATH}\"");
     let expected_stop = format!("ExecStop=\"{CLIENT_WRAPPER_PATH}\" -q");
+    let expected_post = format!("ExecStartPost=\"{HELPER_PATH}\" restore-network");
     let expected_workdir = format!(
         "WorkingDirectory={}",
         Path::new(CLIENT_DIR).join(current_arch_dir()).display()
     );
     let mut start_count = 0;
     let mut stop_count = 0;
+    let mut post_count = 0;
     let mut workdir_count = 0;
 
     for line in content.lines() {
@@ -134,6 +142,8 @@ pub fn service_content_uses_owned_paths(content: &str) -> bool {
                 start_count += 1;
             } else if line == expected_stop {
                 stop_count += 1;
+            } else if line == expected_post {
+                post_count += 1;
             } else {
                 return false;
             }
@@ -147,7 +157,7 @@ pub fn service_content_uses_owned_paths(content: &str) -> bool {
         }
     }
 
-    start_count == 1 && stop_count == 1 && workdir_count == 1
+    start_count == 1 && stop_count == 1 && post_count == 1 && workdir_count == 1
 }
 
 fn valid_service_start(line: &str) -> bool {
@@ -334,7 +344,31 @@ mod tests {
         assert!(content.contains("Type=forking"));
         assert!(content.contains(CLIENT_WRAPPER_PATH));
         assert!(content.contains("-n \"enp4s0.20\" -u \"20260001@gdufs\""));
+        assert!(content.contains(
+            "ExecStartPost=\"/usr/lib/rjsupplicant-gui/rjsupplicant-helper\" restore-network"
+        ));
         assert!(!content.contains("/home/"));
+    }
+
+    #[test]
+    fn parses_restore_network_action() {
+        assert_eq!(
+            HelperRequest::parse(&["restore-network".to_string()]).expect("parse"),
+            HelperRequest::RestoreNetwork
+        );
+        assert!(
+            HelperRequest::parse(&["restore-network".to_string(), "extra".to_string()]).is_err()
+        );
+    }
+
+    #[test]
+    fn old_service_without_restore_post_is_unsafe() {
+        let content = service_file(&options());
+        let legacy = content.replace(
+            "ExecStartPost=\"/usr/lib/rjsupplicant-gui/rjsupplicant-helper\" restore-network\n",
+            "",
+        );
+        assert!(!service_content_uses_owned_paths(&legacy));
     }
 
     #[test]

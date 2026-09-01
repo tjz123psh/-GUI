@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use rjsupplicant_gui::client_install;
 use rjsupplicant_gui::privileged::{
     AuthOptions, CLIENT_DIR, CLIENT_WRAPPER_PATH, HelperRequest, SERVICE_PATH, client_binary_path,
-    service_content_uses_owned_paths, service_file,
+    client_log_path, service_content_uses_owned_paths, service_file,
 };
 use std::fs;
 use std::io::{IsTerminal, Read, Write};
@@ -38,13 +38,34 @@ fn run() -> Result<()> {
             options.password = read_auth_password()?;
             authenticate(&options)
         }
-        HelperRequest::Disconnect => disconnect(),
-        HelperRequest::EnableService(options) => enable_service(&options),
-        HelperRequest::DisableService => disable_service(),
+        HelperRequest::Disconnect => {
+            let result = disconnect();
+            restore_network_services();
+            result
+        }
+        HelperRequest::EnableService(options) => {
+            let result = enable_service(&options);
+            restore_network_services();
+            result
+        }
+        HelperRequest::DisableService => {
+            let result = disable_service();
+            restore_network_services();
+            result
+        }
         HelperRequest::RestartService => {
             ensure_client_installed()?;
             ensure_service_is_safe()?;
-            run_checked(SYSTEMCTL, &["restart", SERVICE_NAME], "重启认证服务失败")
+            let result = run_checked(SYSTEMCTL, &["restart", SERVICE_NAME], "重启认证服务失败");
+            restore_network_services();
+            result
+        }
+        HelperRequest::RestoreNetwork => {
+            // 供 service 的 ExecStartPost 调用：等 8 秒让客户端完成启动与
+            // NM 停止操作后再恢复，复刻手动认证的 DHCP 注入时序。
+            std::thread::sleep(std::time::Duration::from_secs(8));
+            restore_network_services();
+            Ok(())
         }
     }
 }
@@ -66,7 +87,108 @@ fn ensure_root() -> Result<()> {
 fn authenticate(options: &AuthOptions) -> Result<()> {
     ensure_client_installed()?;
     let args = client_arguments(options, true);
-    run_owned_checked(CLIENT_WRAPPER_PATH, &args, "有线认证失败")
+    let log_path = client_log_path();
+    let log_offset = fs::metadata(&log_path).map(|meta| meta.len()).unwrap_or(0);
+
+    // 官方客户端启动时会主动 `systemctl stop NetworkManager`（strace 实测），
+    // 且其内置 DHCP（2014 二进制）在现代内核上不发出任何报文（pcap 实测）。
+    // 约 8 秒后恢复 NetworkManager：NM 的内部 DHCP 拿到地址并建立 eno1 默认
+    // 路由，客户端轮询 /proc/net/route 确认后即认证成功并保持会话（实机验证）。
+    let mut child = Command::new(CLIENT_WRAPPER_PATH)
+        .args(&args)
+        .spawn()
+        .with_context(|| "有线认证失败：无法启动客户端")?;
+    // 前 8 秒等待客户端完成启动与 NM 停止操作；期间若日志已报告失败
+    // （如网线未插）或已认证成功（如沿用已保存的租约），立即返回。
+    let restore_at = std::time::Instant::now() + std::time::Duration::from_secs(8);
+    loop {
+        if child
+            .try_wait()
+            .with_context(|| "有线认证失败：等待客户端退出失败")?
+            .is_some()
+        {
+            return Ok(());
+        }
+        if let Some(new_log) = new_log_tail(&log_path, log_offset) {
+            if let Some(reason) = auth_failure_reason(&new_log) {
+                return Err(anyhow::anyhow!("{reason}"));
+            }
+            if new_log.contains("认证成功") {
+                restore_network_services();
+                return Ok(());
+            }
+        }
+        if std::time::Instant::now() >= restore_at {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    restore_network_services();
+    let result = wait_for_auth_result(&mut child, &log_path, log_offset);
+    restore_network_services();
+    result
+}
+
+/// 认证结果判定时长：失败路径约 45 秒（DHCP 超时）后客户端退出；
+/// 成功路径客户端保持前台会话运行，必须尽早返回，否则 GUI 的
+/// pkexec 等待会在 120 秒超时后杀掉整个已认证会话。
+const AUTH_RESULT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn wait_for_auth_result(
+    child: &mut std::process::Child,
+    log_path: &Path,
+    log_offset: u64,
+) -> Result<()> {
+    // 客户端退出码不可靠（DHCP 失败也返回 0），成败以启动后新增的官方日志判定。
+    let deadline = std::time::Instant::now() + AUTH_RESULT_TIMEOUT;
+    loop {
+        if child
+            .try_wait()
+            .with_context(|| "有线认证失败：等待客户端退出失败")?
+            .is_some()
+        {
+            // 客户端已退出（失败或崩溃）：返回后由 GUI 状态轮询呈现真实状态。
+            return Ok(());
+        }
+        if let Some(new_log) = new_log_tail(log_path, log_offset) {
+            if new_log.contains("认证成功") {
+                return Ok(());
+            }
+            if let Some(reason) = auth_failure_reason(&new_log) {
+                return Err(anyhow::anyhow!("{reason}"));
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
+fn new_log_tail(path: &Path, offset: u64) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = fs::File::open(path).ok()?;
+    let size = file.metadata().ok()?.len();
+    if size <= offset {
+        return None;
+    }
+    file.seek(SeekFrom::Start(offset)).ok()?;
+    let mut text = String::new();
+    file.read_to_string(&mut text).ok()?;
+    Some(text)
+}
+
+fn auth_failure_reason(new_log: &str) -> Option<String> {
+    const MARKERS: &[&str] = &[
+        "网线没有连接上",
+        "无法连接认证服务器",
+        "认证失败",
+        "无法获取动态IP地址",
+    ];
+    MARKERS
+        .iter()
+        .find(|marker| new_log.contains(**marker))
+        .map(|marker| marker.to_string())
 }
 
 fn read_auth_password() -> Result<Option<String>> {
@@ -242,18 +364,16 @@ fn command_succeeds(program: &str, args: &[&str]) -> bool {
         .unwrap_or(false)
 }
 
-fn run_checked(program: &str, args: &[&str], context: &str) -> Result<()> {
-    let status = Command::new(program)
-        .args(args)
-        .status()
-        .with_context(|| format!("{context}：无法启动命令"))?;
-    if status.success() {
-        return Ok(());
-    }
-    anyhow::bail!("{context}：{status}")
+/// 官方客户端启动时会主动停止 NetworkManager（strace 实测确认，属其设计行为）；
+/// 在客户端可能运行过的每个动作后恢复，避免本机无线网络被连带断开。
+/// 幂等：NetworkManager 已运行时 `start` 是空操作。
+fn restore_network_services() {
+    let _ = Command::new(SYSTEMCTL)
+        .args(["start", "NetworkManager.service"])
+        .status();
 }
 
-fn run_owned_checked(program: &str, args: &[String], context: &str) -> Result<()> {
+fn run_checked(program: &str, args: &[&str], context: &str) -> Result<()> {
     let status = Command::new(program)
         .args(args)
         .status()
@@ -303,5 +423,26 @@ mod tests {
         );
         assert!(validate_password_input(vec![0]).is_err());
         assert!(validate_password_input(vec![b'x'; MAX_PASSWORD_BYTES + 1]).is_err());
+    }
+
+    #[test]
+    fn detects_auth_failure_markers() {
+        assert_eq!(
+            auth_failure_reason("网线没有连接上，请检查网卡连接").as_deref(),
+            Some("网线没有连接上")
+        );
+        assert_eq!(
+            auth_failure_reason("2026-09-01 17:15:44 无法获取动态IP地址").as_deref(),
+            Some("无法获取动态IP地址")
+        );
+        assert_eq!(
+            auth_failure_reason("认证失败无法连接认证服务器。").as_deref(),
+            Some("无法连接认证服务器")
+        );
+        assert_eq!(
+            auth_failure_reason("认证成功\n管理中心提示： 欢迎使用广外大网络！").as_deref(),
+            None
+        );
+        assert_eq!(auth_failure_reason("").as_deref(), None);
     }
 }

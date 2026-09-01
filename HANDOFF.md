@@ -1,10 +1,10 @@
 # rjsupplicant-gui 项目交接文档
 
-- 最后更新：2026-08-03
-- 当前版本：0.3.0
-- 项目状态：后端与提权链功能冻结；樱花学园前端已完成皮肤、渐进披露浮层与**舞台+控制台布局重设计**（左侧透明舞台透出樱花场景：大状态字 + 设备↔网关链路图 + 状态胶囊；右侧单张玻璃控制台，含表单+网卡 IP/网关+自启+连接断开安装+日志预览+连接详情），多轮修复与逐屏视觉验收（沉浸式标题栏、Tabler 图标、深紫玻璃胶囊文字对比度、深紫 popover、链路图标替换、按钮左移、固定无滚动布局、状态实时刷新），系统集成已验证（polkit agent 补齐、unit 模板 WorkingDirectory 引号 bug 修复、实时日志链路确认），等待校园有线网实机验证
+- 最后更新：2026-09-01
+- 当前版本：0.3.0（实机联调修复轮：主线程卡死、Wi-Fi 连带断连、DHCP 无 IP 三个问题已修复并有实机证据，见 3.2 节）
+- 项目状态：后端与提权链功能冻结；前端皮肤完成；**2026-09-01 校园有线网实机联调**：手动认证已实测成功（认证成功 + 中文欢迎横幅 + eno1 获 IP），点击连接卡死、连接后热点 Wi-Fi 断连、认证成功但拿不到 IP（2014 客户端内置 DHCP 不发包）已定位并修复；等待用户在 GUI 内最终手动确认真实认证、错误密码、polkit 交互与开机自启路径
 - 最终验收代码基线：`9ff5645`
-- 当前代码基线：`7842361` + 未提交前端皮肤改动（不要 reset/stash 覆盖）
+- 当前代码基线：`73314ff` + 未提交的实机联调修复轮改动（src/ui.rs、src/privileged.rs、src/bin/rjsupplicant-helper.rs、Cargo.toml/lock、scripts/install.sh、HANDOFF/CHANGELOG；不要 reset/stash 覆盖）
 - 主分支：`main`
 - 远端：`git@github.com:tjz123psh/-GUI.git`
 
@@ -141,6 +141,18 @@
 - GTK CSS **没有** `prefers-color-scheme`。当前皮肤强制深色，不实现浅色变体；若未来要支持浅色，需要读 `adw::StyleManager` 并在窗口挂主题类。
 - 不要覆盖 libadwaita 的具名调色板颜色，也不要在 `window` 上直接设 `color`——曾因此弄坏主题并把原生对话框染色。
 - 响应式用 widget 属性断点（`connect_resize`），不要改用 CSS media query（GTK 不支持）。
+
+## 3.2 实机联调修复轮（2026-09-01，校园有线网实测）
+
+校园有线网环境（eno1 直连、账号 20251003089、`save_password=1`）实测结论与修复，全部有日志/strace/pcap 实证：
+
+1. **点击连接后界面卡死（用户首报）**：`glib::spawn_future` 在主上下文线程执行阻塞体（pkexec 等待循环最长 120 秒），冻结整个 GTK 主循环。修复：`run_backend`/`run_diag`/`run_service_toggle`/`run_backend_quiet`/`refresh_status` 五个入口改为工作线程 + `futures-channel` 异步回传（`mpsc::unbounded` + `StreamExt::next`），UI 更新仍在主线程；新增直接依赖 `futures-channel`/`futures-util`（glib 传递依赖已存在，零新增编译）。空密码不再被 GUI 拦截（复用已保存密码）。
+2. **连接后热点 Wi-Fi 断连（用户次报）**：strace 实证官方客户端启动时主动 `systemctl stop NetworkManager`（2014 客户端设计行为）。修复：helper 在认证/断开/自启/重启后自动 `systemctl start NetworkManager`（幂等）；开机认证 unit 加 `ExecStartPost="…helper" restore-network`（新白名单动作，systemd 直接以 root 调用，无需新 polkit 条目；`service_content_uses_owned_paths` 同步校验该行，旧 unit 重新启用即迁移）。实测断开后 NM 保持 active、Wi-Fi 正常。
+3. **认证成功但拿不到 IP**：pcap 实证 802.1x 实际成功（EAP 交换推进到服务器授权消息、端口放行、学校 DHCP 正常、48h 租约），但 2014 客户端内置 DHCP 在现代内核上**不发任何报文**（抓包 0 个 DHCP 包），45 秒后报「无法获取动态IP地址」。修复：helper 认证时启动客户端约 8 秒后恢复 NM，NM 内部 DHCP 获取地址并建立 eno1 默认路由，客户端轮询 `/proc/net/route` 确认后即「认证成功」并保持会话（实机：18:07 认证成功、helper 8s 返回、会话保持、eno1=`192.168.129.140/23`）。
+4. **helper 认证结果判定重写**：客户端退出码不可靠（失败也返回 0），改按官方日志新增行判定（成功=「认证成功」；失败=`网线没有连接上/无法连接认证服务器/认证失败/无法获取动态IP地址`，立即返回对应错误）；成功后 helper 立即返回（客户端转孤儿进程保持会话），避免 GUI 的 pkexec 120 秒超时杀掉已认证会话；60 秒兜底。
+5. **net-tools 依赖**：客户端调用 `ifconfig`（strace 见 7 处），缺失使「正在启用网卡」失败；`scripts/install.sh` 依赖清单加入 net-tools。
+
+已验证链路：GUI→pkexec→helper→wrapper→官方客户端 全程真实跑通；断开路径（helper disconnect → 客户端退出 → NM 保持）。待用户最终手动验证：GUI 内输入密码连接全程 UX、错误密码反馈、polkit 授权对话框交互、开机自启（service 路径，含 ExecStartPost 时序）。
 
 ## 4. 技术栈与仓库结构
 
@@ -361,12 +373,27 @@ scripts/install.sh --uninstall
 
 卸载会中断当前有线认证，停止并删除 `rjsupplicant.service`，必要时通过 helper 或旧 wrapper 断开手动认证进程，再移除 GUI、root-owned helper、polkit policy、新旧 wrapper、官方客户端目录、桌面入口和图标，但保留 `${XDG_CONFIG_HOME:-~/.config}/rjsupplicant-gui` 中的用户偏好。服务停止或手动断开失败时会在删除相关文件前中止。`tests/install_uninstall.sh` 将 HOME、XDG、systemd、libexec、客户端和 policy 路径全部指向临时目录，不接触本机服务或网络。
 
+### 安装后清理原则（通用，可转述给其他项目）
+
+核心一句话：**删掉"程序运行中自己能再生成的东西"；保留"重启后依赖它恢复现场、或含密钥与程序本体的东西"**。
+
+本项目的安装脚本只在安装成功后自动清理编译中间产物（`target/`，`cargo clean`，`RJSUPPLICANT_KEEP_BUILD=1` 可跳过保留增量缓存），其余全部保留：
+
+- **保留**：源码目录（更新/卸载依赖它）；`~/Downloads` 的官方客户端 ZIP（已固定 SHA-256 校验、重装与恢复依赖它，且属用户下载区）；已安装的 GUI/helper/客户端/desktop/图标/policy（程序本体）；`settings.conf`（用户偏好，0600）；官方客户端 `run.log` 与 systemd 服务（运行状态与认证结果判断依据，服务由 GUI 按需生成）。
+- **删除**：`target/` 编译缓存（由 `Cargo.lock` 可完整重建，删除只影响下次构建速度）。
+
+通用判据（遇到不确定的文件先问三句）：① 程序运行中会自动重建吗？→会：可删；② 重启后依赖它恢复现场吗？（游标、进度、登录态）→依赖：保留；③ 含密钥或删了程序跑不起来吗？→是：保留。三问全过才放进自动清理。
+
+可原样转述给别的项目的一段话：
+
+> 安装脚本末尾应自动清理编译缓存、依赖缓存、历史日志和工具残留——这些程序运行时会自动重建，删除不影响功能，只省空间。但必须保留：状态/游标文件（重启恢复现场用）、含密钥的配置文件、程序本体和依赖目录、用户数据。判断标准就一条：凡"运行中能自己再生成的"删掉，"删了无法恢复或程序跑不起来的"一律不碰。
+
 ## 9. 开发与验证
 
 安装开发依赖：
 
 ```bash
-sudo pacman -S --needed rust gtk4 libadwaita polkit desktop-file-utils unzip shellcheck libxml2
+sudo pacman -S --needed rust gtk4 libadwaita polkit desktop-file-utils unzip net-tools shellcheck libxml2
 ```
 
 完整验证：
@@ -477,6 +504,8 @@ timeout 3s target/release/rjsupplicant-gui
 ## 11. 已知限制
 
 - 官方客户端是闭源旧程序，类似 `sysctl: 写入错误: 错误的文件描述符` 的兼容性错误无法在 GUI 内部根治。
+- 官方客户端启动时会主动停止 NetworkManager（strace 实证），helper 已在认证/断开/自启/重启后自动恢复；期间有约 8 秒的无线离线窗口，属客户端设计行为、无法阻止。
+- 官方客户端内置 DHCP 在现代内核上不发任何报文（pcap 实证，认证实际成功、端口放行、学校 DHCP 正常），helper 通过认证后约 8 秒恢复 NM、由 NM 内部 DHCP 补位；该注入依赖客户端的 `/proc/net/route` 轮询判定，属兼容性补丁。
 - 官方客户端没有协议级成功回调，GUI 只能可靠判断进程、链路和服务状态，账号是否通过仍需看日志。
 - GUI 到 helper 的密码使用标准输入且不回显；首次或修改密码时，密码仍会短暂出现在官方闭源客户端命令行参数中。
 - root-owned helper 和 policy 必须先通过安装脚本部署；没有 `pkexec` 时，GUI 才回退到 kitty、foot、alacritty 或 xterm 中用 `sudo` 调用同一 helper。
@@ -530,11 +559,11 @@ update-desktop-database ~/.local/share/applications
 
 后端只有在校园有线网实机验证出现问题时再恢复工作，验证范围为：
 
-1. 正确账号和密码能否完成认证，日志是否能明确判断结果。
-2. 错误密码时 GUI 状态、提示和日志是否符合实际结果。
-3. 手动断开、重新连接以及 service 正在运行时的断开行为是否正确。
-4. polkit 授权、取消授权和授权保留期间的六个 helper 动作是否正常。
-5. 启用开机自动认证后重启，systemd 是否自动认证；关闭自启后是否彻底停止并禁用服务。
+1. 正确账号和密码能否完成认证，日志是否能明确判断结果。**2026-09-01 已通过 CLI 直测验证：认证成功 + 中文欢迎横幅 + eno1 获 IP（192.168.129.140/23）；GUI 内最终手动确认待用户执行**。
+2. 错误密码时 GUI 状态、提示和日志是否符合实际结果。（未测）
+3. 手动断开、重新连接以及 service 正在运行时的断开行为是否正确。**手动断开已 CLI 验证（断开成功、NM 保持 active、Wi-Fi 恢复）**。
+4. polkit 授权、取消授权和授权保留期间的六个 helper 动作是否正常。**授权（pkexec 弹窗输密码）已多次实测通过；取消/保留协议未专项验证**。
+5. 启用开机自动认证后重启，systemd 是否自动认证；关闭自启后是否彻底停止并禁用服务。（未测；unit 已带 ExecStartPost restore-network，注意验证其 8 秒等待时序与 StartLimitBurst 限流）
 
 若以上项目全部通过，`v0.3.0` 即可视为个人使用的最终版本。若出现问题，应先记录操作步骤、界面状态和脱敏后的 `run.log`/journal，再针对具体故障修改；不要在没有复现证据时继续重构。
 

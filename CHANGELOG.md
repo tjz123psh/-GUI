@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased - 2026-09-01
+
+### 实机联调修复轮（校园有线网实测，用户在场配合授权）
+
+- **启动卡死修复（主线程阻塞根因）**：`run_backend`/`run_diag`/`run_service_toggle`/`run_backend_quiet`/`refresh_status` 的阻塞调用（pkexec 等待、systemctl、客户端运行、状态读取）原先在 `glib::spawn_future` 主上下文线程上执行，阻塞体冻结整个 UI（实测：点击连接后界面卡死）。改为真实工作线程 + `futures-channel` 异步回传结果（新增直接依赖 `futures-channel`/`futures-util`，均在 glib 依赖树内、零新增编译），UI 更新仍在主线程。
+- **空密码复用已保存密码**：GUI 连接不再拦截空密码（后端本就支持客户端复用已保存密码），留空时 toast 提示。
+- **连接后热点 Wi-Fi 断连（根因实证）**：strace 证实官方客户端启动时主动执行 `systemctl stop NetworkManager`（其设计行为，非本项目代码）。helper 在认证/断开/自启/重启等所有客户端运行过的动作后自动恢复 NM；开机认证 unit 增加 `ExecStartPost="…rjsupplicant-helper" restore-network`（新增白名单动作，systemd 直接以 root 调用，无需新增 polkit 条目），安全校验器同步接受该行（旧 unit 需重新启用触发迁移）。
+- **认证成功但拿不到 IP（根因实证）**：pcap 证实客户端内置 DHCP（2014 二进制）在现代内核上**不发任何报文**；802.1x 实际成功、端口放行、学校 DHCP 正常（48 小时租约）。helper 认证流程改为：启动客户端约 8 秒后恢复 NM，由 NM 的内部 DHCP 获取地址并建立 eno1 默认路由，客户端轮询 `/proc/net/route` 确认后认证成功并保持会话（实机：4 秒认证成功、helper 8 秒返回、会话保持、NM 恢复、eno1 获 `192.168.129.140/23`）。
+- **helper 认证结果判定重写**：客户端退出码不可靠（DHCP 失败也返回 0），改为轮询官方日志新增行判定（成功=「认证成功」；失败=`网线没有连接上 / 无法连接认证服务器 / 认证失败 / 无法获取动态IP地址` 并立即返回对应错误）；成功后立即返回、不阻塞到会话结束（避免 GUI 的 pkexec 120 秒超时杀掉已认证会话）；最长 60 秒兜底。
+- **安装依赖补 net-tools**：客户端依赖 `ifconfig`（strace 见 7 处调用，缺失使「正在启用网卡」失败）；`scripts/install.sh` 依赖清单加入 net-tools。
+- 验证：27 项 Rust 测试、clippy `-D warnings`、release 构建、shell 回归（安装/卸载 + bootstrap + ShellCheck）全绿；实机 {认证成功 + 中文欢迎横幅 + 断开后 NM 保持 + Wi-Fi 恢复} 全部验证通过。
+
+## Unreleased - 2026-08-16
+
+### 安装后清理原则（文档）
+
+- HANDOFF.md 新增「安装后清理原则」小节：明确安装脚本只自动删除可再生成的编译缓存（`target/`，`cargo clean`，`RJSUPPLICANT_KEEP_BUILD=1` 跳过），保留源码、官方客户端 ZIP、用户设置、程序本体与运行状态；附通用判据三问与可原样转述给其他项目的一段话。
+- scripts/install.sh 的 `cleanup_build_artifacts` 补充清理/保留边界注释；行为不变。
+
 ## Unreleased - 2026-08-03
 
 ### 交互反馈修复轮（同日跟进，用户反馈"鼠标放右边面板变手状但点击无效果"）

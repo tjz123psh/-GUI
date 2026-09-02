@@ -259,6 +259,13 @@ RUSTUP_HOME="${HOST_RUSTUP_HOME}" \
 PATH="${FAKE_BIN}:${PATH}" \
   "${ROOT_DIR}/scripts/install.sh" >/dev/null
 
+# 覆盖边界说明：下面 UNSAFE_ZIP / ROLLBACK / FAIL_HELPER_INSTALL 三个用例走的是
+# fake sudo —— install.sh 自己从不调用 unzip（解压发生在真实 root helper 内，
+# 且用绝对 /usr/bin/unzip）。所以它们验证的是"sudo 步骤失败时 install.sh 以非零
+# 退出且不继续删除文件"，并不验证 ZIP 条目净化与目录替换回滚；后两者的真实覆盖在
+# src/client_install.rs 的单元测试（rejects_unsafe_archive_entries、
+# rejects_zip_with_parent_directory_entry、rejects_symlinks_*、
+# restores_previous_client_when_wrapper_install_fails）。
 UNSAFE_HOME="${TMP_DIR}/unsafe-home"
 UNSAFE_DATA="${TMP_DIR}/unsafe-data"
 UNSAFE_SYSTEMD="${TMP_DIR}/unsafe-systemd"

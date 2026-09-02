@@ -76,11 +76,14 @@ validate_path_overrides() {
 }
 
 current_arch_name() {
-  if [[ "$(getconf LONG_BIT)" == "64" ]]; then
-    printf '%s\n' "x64"
-  else
-    printf '%s\n' "x86"
-  fi
+  # 官方客户端只提供 x86 的 x64/x86 两种目录；按指针宽度判定会让 aarch64 错误
+  # 指向 x64。无法识别的架构返回一个必然不存在的目录名，使"已安装"判定为假，
+  # 而不是去访问别人的目录（与 Rust 侧 client_arch_dir 同一策略）。
+  case "$(uname -m)" in
+    x86_64) printf '%s\n' "x64" ;;
+    i386 | i686) printf '%s\n' "x86" ;;
+    *) printf '%s\n' "unsupported-arch" ;;
+  esac
 }
 
 privileged_client_ready() {

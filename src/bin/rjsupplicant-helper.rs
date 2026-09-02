@@ -98,70 +98,86 @@ fn authenticate(options: &AuthOptions) -> Result<()> {
         .args(&args)
         .spawn()
         .with_context(|| "有线认证失败：无法启动客户端")?;
-    // 前 8 秒等待客户端完成启动与 NM 停止操作；期间若日志已报告失败
-    // （如网线未插）或已认证成功（如沿用已保存的租约），立即返回。
-    let restore_at = std::time::Instant::now() + std::time::Duration::from_secs(8);
-    loop {
-        if child
-            .try_wait()
-            .with_context(|| "有线认证失败：等待客户端退出失败")?
-            .is_some()
-        {
-            return Ok(());
-        }
-        if let Some(new_log) = new_log_tail(&log_path, log_offset) {
-            if let Some(reason) = auth_failure_reason(&new_log) {
-                return Err(anyhow::anyhow!("{reason}"));
-            }
-            if new_log.contains("认证成功") {
-                restore_network_services();
-                return Ok(());
-            }
-        }
-        if std::time::Instant::now() >= restore_at {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(200));
-    }
-    restore_network_services();
-    let result = wait_for_auth_result(&mut child, &log_path, log_offset);
-    restore_network_services();
-    result
+    // 客户端可能在任何一次判定之前就退出（网线未插、认证服务器不通、崩溃），
+    // 那时它已经停掉了 NetworkManager；用守卫兜住所有出口，避免无线被静默切断。
+    let _network_guard = NetworkRestorer;
+    await_auth_result(&mut child, &log_path, log_offset)
 }
+
+/// DHCP 注入时序节点：客户端在此期间完成启动并停掉 NetworkManager。
+const DHCP_RESTORE_DELAY: std::time::Duration = std::time::Duration::from_secs(8);
 
 /// 认证结果判定时长：失败路径约 45 秒（DHCP 超时）后客户端退出；
 /// 成功路径客户端保持前台会话运行，必须尽早返回，否则 GUI 的
 /// pkexec 等待会在 120 秒超时后杀掉整个已认证会话。
 const AUTH_RESULT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
-fn wait_for_auth_result(
+const AUTH_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// 轮询官方客户端日志直到得出结果；网络恢复由调用方的 `NetworkRestorer` 负责，
+/// 这里只在 8 秒节点显式提前恢复一次，使所有出口都不依赖分支写法。
+fn await_auth_result(
     child: &mut std::process::Child,
     log_path: &Path,
     log_offset: u64,
 ) -> Result<()> {
     // 客户端退出码不可靠（DHCP 失败也返回 0），成败以启动后新增的官方日志判定。
-    let deadline = std::time::Instant::now() + AUTH_RESULT_TIMEOUT;
+    let started = std::time::Instant::now();
+    let mut restored = false;
     loop {
-        if child
-            .try_wait()
-            .with_context(|| "有线认证失败：等待客户端退出失败")?
-            .is_some()
-        {
+        let outcome = classify_auth(
+            child
+                .try_wait()
+                .with_context(|| "有线认证失败：等待客户端退出失败")?
+                .is_some(),
+            new_log_tail(log_path, log_offset).as_deref(),
+        );
+        match outcome {
             // 客户端已退出（失败或崩溃）：返回后由 GUI 状态轮询呈现真实状态。
+            AuthOutcome::ClientExited | AuthOutcome::Succeeded => return Ok(()),
+            AuthOutcome::Failed(reason) => return Err(anyhow::anyhow!("{reason}")),
+            AuthOutcome::Pending => {}
+        }
+        // 8 秒节点必须在这里显式恢复：客户端要等 NM 注入路由才会写出「认证成功」，
+        // 只靠守卫在函数返回时恢复会让本轮认证一直等到超时。
+        if !restored && started.elapsed() >= DHCP_RESTORE_DELAY {
+            restore_network_services();
+            restored = true;
+        }
+        // 总预算保持为原两阶段的 8 秒 + 60 秒，避免改动已被实机验证过的
+        // 失败判定窗口（客户端 DHCP 超时约 45 秒）。
+        if started.elapsed() >= DHCP_RESTORE_DELAY + AUTH_RESULT_TIMEOUT {
             return Ok(());
         }
-        if let Some(new_log) = new_log_tail(log_path, log_offset) {
-            if new_log.contains("认证成功") {
-                return Ok(());
-            }
-            if let Some(reason) = auth_failure_reason(&new_log) {
-                return Err(anyhow::anyhow!("{reason}"));
-            }
-        }
-        if std::time::Instant::now() >= deadline {
-            return Ok(());
-        }
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        std::thread::sleep(AUTH_POLL_INTERVAL);
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum AuthOutcome {
+    Pending,
+    ClientExited,
+    Succeeded,
+    Failed(String),
+}
+
+/// 单轮判定优先级：进程已退出 > 认证成功 > 失败标记。
+/// 早退排最前，是为了不把客户端崩溃后残留的日志行当成本轮结果；
+/// 「认证成功」排在失败标记之前，是为了避免官方客户端粘贴的管理中心提示里
+/// 出现「认证失败」字样时，把一次真实成功翻成失败。
+fn classify_auth(client_exited: bool, new_log: Option<&str>) -> AuthOutcome {
+    if client_exited {
+        return AuthOutcome::ClientExited;
+    }
+    let Some(new_log) = new_log else {
+        return AuthOutcome::Pending;
+    };
+    if new_log.contains("认证成功") {
+        return AuthOutcome::Succeeded;
+    }
+    match auth_failure_reason(new_log) {
+        Some(reason) => AuthOutcome::Failed(reason),
+        None => AuthOutcome::Pending,
     }
 }
 
@@ -224,6 +240,18 @@ fn validate_password_input(input: Vec<u8>) -> Result<Option<String>> {
         anyhow::bail!("校园网密码包含不支持的空字符");
     }
     Ok((!password.is_empty()).then_some(password))
+}
+
+/// 离开作用域时恢复被官方客户端停掉的 NetworkManager。
+/// 与下面的 `TerminalEchoGuard` 同一模式：把清理绑到函数所有出口
+/// （含 `?` 提前返回），不再逐分支手工调用，避免漏掉某条路径。
+/// 幂等：NetworkManager 已在运行时 `systemctl start` 是空操作。
+struct NetworkRestorer;
+
+impl Drop for NetworkRestorer {
+    fn drop(&mut self) {
+        restore_network_services();
+    }
 }
 
 struct TerminalEchoGuard {
@@ -444,5 +472,35 @@ mod tests {
             None
         );
         assert_eq!(auth_failure_reason("").as_deref(), None);
+    }
+
+    #[test]
+    fn early_client_exit_is_not_confused_with_auth_success() {
+        // 客户端崩溃后残留的“认证成功”不能被当成本轮结果；这条路径同时
+        // 必须触发网络恢复，由 authenticate 里的 NetworkRestorer 守卫保证。
+        assert_eq!(
+            classify_auth(true, Some("认证成功")),
+            AuthOutcome::ClientExited
+        );
+        assert_eq!(classify_auth(true, None), AuthOutcome::ClientExited);
+    }
+
+    #[test]
+    fn classifies_running_client_by_new_log_only() {
+        assert_eq!(classify_auth(false, None), AuthOutcome::Pending);
+        assert_eq!(classify_auth(false, Some("")), AuthOutcome::Pending);
+        assert_eq!(
+            classify_auth(false, Some("网线没有连接上，请检查网卡连接")),
+            AuthOutcome::Failed("网线没有连接上".to_string())
+        );
+        assert_eq!(
+            classify_auth(false, Some("认证成功\n管理中心提示： 欢迎使用广外大网络！")),
+            AuthOutcome::Succeeded
+        );
+        // 官方提示里带“认证失败”字样时，一次真实成功不能被翻成失败。
+        assert_eq!(
+            classify_auth(false, Some("认证成功\n上次认证失败的原因已修复")),
+            AuthOutcome::Succeeded
+        );
     }
 }

@@ -53,6 +53,8 @@
 
 2026-09-02 并发与资源轮（用户对上一批清单确认后说"交由你来决定"，选择继续第二批）：修 3 项——①`refresh_status_polled` 给 10 秒轮询加在途判断（`load_status` 内所有外部命令均无超时，卡住时线程无限累积），但**只节流定时器路径**，手动刷新与动作后刷新仍强制走 `refresh_status`，避免"一次卡住 → 状态永久冻结"；②`new_log_tail` 推进 `log_offset`（旧实现每 200ms 重读全部新增，且 `size <= offset` 与非法 UTF-8 两条都会让成败判定永久返回 `None` 并退化成超时假成功），现在文件变短会重置偏移、坏字节段跳过；③判到失败（`AuthOutcome::Failed`，此路径必然意味着客户端还活着）时 `kill` + `wait` 回收，因为它已不会建立会话却仍持有 argv 里的明文口令。**超时路径明确不杀**（慢网络上"快成功"与"卡死"不可区分，误杀会打断真实认证），故 H1 的口令驻留与该路径假成功仍在。M12 单实例锁**有意推迟**：需先决定 `ExecStartPost` 的 `restore-network` 是否参与同一把锁，否则开机认证的 NM 恢复会被 GUI 动作阻塞。验证见 CHANGELOG 同轮。
 
+2026-09-03 状态可信度与渲染资源轮（第三批，用户"把问题都解决不要留下 bug…然后推送仓库"）：helper 判定不再把"客户端已退出"当成功（依据项目自己实机确认的前台持会话事实；退出码仍不参与判定）+ 加 `/run/rjsupplicant-helper.lock` 的 `flock` 互斥（`restore-network` 有意不加锁，否则开机认证的 NM 恢复会被界面动作挡住）；`scene.rs` 重写帧调度（去掉把控件克隆进自身回调的自引用环、`is_mapped()` 门控、Idle 30fps 预算、链路 Idle 直接退出帧时钟、`Scene` 与 `Link` 共用同一组纯函数结算动画终点）并修 `draw_mist` 的 `identity_matrix()` 矩阵污染（改 save/restore，此前会抹掉 HiDPI 变换使特效层错位）；`ui.rs` 批量收口状态可信度（失败大字按动作类型、busy 一并禁用横幅、账号/密码回车提交、服务 `activating` 第三态、网卡列表每轮重新探测并 `splice` 重建下拉框、选择器非本地路径明确提示、无 Display 不再 panic、胶囊初值不再先亮健康绿点、开机认证要求「保存密码」否则回弹并说明）；`config.rs` 布尔只认明确字面量 + 原子写 + 空 XDG 视为未设置；架构判定收拢到 `privileged::client_arch_dir()`（指针宽度在 aarch64 上会误指 `x64`），helper/GUI/安装器/`client_install` 四处共用；`service_content_uses_owned_paths` 补未知指令白名单（`User=`/`BindPaths=`/`RootDirectory=`/`StandardOutput=file=`/`OnFailure=` 此前一律判"安全"）；删除无引用死 CSS 并合并重复规则（逐属性等价）；给 `tests/install_uninstall.sh` 三个失败路径用例写清真实覆盖边界；README 新增「已知安全边界」。**过程事故（重要）**：把 `scene.rs` 交给 `swarm-worker` 后，主 Agent 在收到"completed"通知后仍继续编辑同一文件，导致两次互相穿插落盘、`frame_due` 签名冲突与重复常量，最终 `git checkout HEAD -- src/scene.rs` 回退重写；结论是"完成通知不代表写入已落盘"，同文件必须严格单一所有者、拿不到稳定 mtime 前不得接手。像素级截图与三档宽度评审本机不可用（`grim` 的图片输出路径被媒体读取护栏 `PreToolUse` 拒绝，按约定不绕过），CSS 改动改用规则集比对证实等价。仍未解决项与其理由见 CHANGELOG 同轮末条。
+
 详细审计记录见 [AUDIT.md](AUDIT.md)，面向使用者的安装说明见 [README.md](README.md)。
 
 ## 2. 产品目标与边界
@@ -519,6 +521,16 @@ timeout 3s target/release/rjsupplicant-gui
 - 已部署本机：`~/.local/bin/rjsupplicant-gui` 与 `/usr/lib/rjsupplicant-gui/rjsupplicant-helper`（gsudo），helper 哈希与构建产物一致（`3abf55ff0f87…`）。
 - 实机运行观察：启动后 niri 窗口标题 "锐捷有线认证" 存在；跨 38 秒（约 4 个 10 秒轮询周期）线程数 22→22→19→19（只降不升，无累积），子进程数恒为 0，stdout/stderr 合计 0 字节（无 GLib/CSS 告警、无 panic）；观察窗口已自行关闭，临时输出文件已删除。
 - 未验证：真实认证链路上的偏移前进与"失败即终止"（需重新发起认证，会打断本机当前活跃会话）；超时路径的孤儿进程问题按设计保留，未测。
+
+### 2026-09-03 状态可信度与渲染资源轮验收记录
+
+- 触发：用户要求"把问题都解决不要留下 bug，直到完全解决，然后推送仓库"。第三批（状态可信度、渲染资源、提权纵深）。
+- 改动文件：`src/ui.rs`、`src/scene.rs`、`src/config.rs`、`src/privileged.rs`、`src/client_install.rs`、`src/bin/rjsupplicant-helper.rs`、`scripts/install.sh`、`tests/install_uninstall.sh`、`README.md`、`CHANGELOG.md`、`HANDOFF.md`。
+- 门禁全绿：`cargo fmt --all --check`、`cargo test --locked`（15 + 22 + 7 = 44 项）、`cargo clippy --locked --all-targets -- -D warnings`、`cargo build --locked --release`、`bash -n` ×4、`shellcheck` ×4、`desktop-file-validate`、`xmllint`（policy）、`git diff --check`、`tests/bootstrap.sh`、`tests/install_uninstall.sh`。
+- 部署：GUI → `~/.local/bin/rjsupplicant-gui`（用户身份），helper → `/usr/lib/rjsupplicant-gui/rjsupplicant-helper`（`gsudo`），两者与 `target/release` 逐字节一致（`cmp`）。
+- 部署后实机测量（`/proc/<pid>/stat` utime+stime，12 秒窗口）：稳定态 CPU **23.7% 单核**；niri 窗口标题"锐捷有线认证"存在；线程 22、子进程 0；stderr **0 字节**（无 GLib/CSS 告警、无 panic）。该 23.7% 是签名动效（花瓣 + 1920x1080 cover 背景 + 多层渐变）在 30fps 预算下的固有代价，改造前未做 A/B 对照（旧产物已被覆盖），因此只报"当前值"，不宣称降幅。
+- 未做/不可用：像素截图与 640/960/1280 三档宽度评审（本机媒体读取护栏拒绝 `grim` 写出图片路径，按约定不绕过）；CSS 改动改用"逐属性规则集比对"证实等价（`.log-text` 2→0、`.row-badge` 1→0、`.console row .title/.subtitle` 各 2→1 且合并块属性一致）；真实认证链路（需口令与在场授权，且会打断当前会话）；`hidepid=2` 与客户端目录权限收紧属系统/产品决策，未代用户执行。
+- 已知遗留（非疏漏）：官方客户端 argv 携明文口令（闭源接口只有 `-p`）；root 客户端工作目录 0755 导致其自写配置世界可读（收紧到 0750 会让 GUI 读不到 `run.log`，需专用组 + 重登录才两全）；无判定超时路径仍返回成功且不杀客户端；`ForceDark` 与不套 `ScrolledWindow` 为既有冻结决策。
 
 ## 10. 高风险修改约束
 

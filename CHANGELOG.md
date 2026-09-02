@@ -4,6 +4,24 @@
 
 ## Unreleased - 2026-09-02
 
+## Unreleased - 2026-09-02
+
+### 状态可信度、渲染资源与提权纵深轮（第三批）
+
+- **认证结果不再把"客户端已退出"当成功**：helper 的判定优先级改为进程已退出 > 认证成功 > 失败标记后，早退分支返回 `Err("认证未完成：官方客户端进程已退出")`。依据是本项目自己已实机确认的事实——认证成功时客户端保持前台持会话（开机自启 unit 因此用 `Type=simple`），进程消失即会话不存在；退出码仍不参与判定（实测 DHCP 失败也返回 0）。
+- **helper 特权动作加锁**：`/run/rjsupplicant-helper.lock` 上的 `flock(LOCK_EX|LOCK_NB)`，拿不到立即报"另一个特权认证操作正在进行"。此前两个实例会并发跑两个 root 客户端抢同一网卡，并交叉读取同一份 `run.log` 做成败判定（把对方的结果当本轮）。`restore-network` 由 systemd 以 root 调用，**不参与加锁**，否则开机认证的 NM 恢复会被界面动作挡住。
+- **场景与链路不再无限重绘**：`Scene`/`Link` 的 tick 回调原先把控件克隆进自己被控件拥有的闭包（自引用环，控件永不释放）且无条件 `queue_draw`。改为只用回调自带引用、`is_mapped()` 门控、Idle 30fps 帧预算、链路 Idle 直接 `Break` 退出帧时钟；`Link` 与 `Scene` 现在都按同一组纯函数结算动画终点，成功后各自回落静态画面（原先 `Success` 的全画布粉层与链路光点会永久驻留）。
+- **薄雾层不再破坏绘制矩阵**：`draw_mist` 原先用 `cr.identity_matrix()` 收尾，抹掉 GTK 准备的控件变换（含 HiDPI/分数缩放），而它画在模式特效层之前，导致之后的光带/霞光/闪击按设备像素绘制错位；改为 `save()/restore()`。
+- **UI 状态可信度批量修复**：`run_backend` 的"连接失败"大字只对连接类动作生效（安装客户端失败不再伪装成认证失败）；忙碌期间一并禁用迁移横幅按钮（此前可点、选完文件被 busy 静默吞掉）；账号/密码框回车等同点「连接」；服务胶囊区分 `activating`（ExecStartPost 的 8 秒节点内不再误报"服务 异常"）；网卡列表每轮刷新重新探测并通过 `splice` 重建下拉框、尽量保留用户选择（此前是构建期快照，后接网卡选不到也看不到）；选择器拿到非本地路径时给出可操作提示而不是静默无反应；无 Display 时不再 `unwrap()` panic；胶囊初值不再先亮"健康"绿点。
+- **开机认证与保存密码的耦合显式化**：unit 里没有口令，`save_password=false` 时启用开机认证必然开机失败；现在开关会直接回弹并说明原因，而不是留下一个永不认证的 unit。
+- **配置读写更严格**：布尔项只认 `true/1/false/0`（旧写法 `!= "false"` 把 `0/no/off/空/拼错`一律读成 true），无法识别时保持默认；`save` 改为临时文件 + `sync_all` + `rename` 原子替换（旧 `create+truncate` 就地改写，中途被杀会留下半截配置并在下次加载时静默回落默认，等于账号丢失）；`XDG_CONFIG_HOME=""`/`XDG_DATA_HOME=""`/`HOME=""` 按未设置处理，不再拼出依赖当前目录的相对路径。
+- **架构判定收拢为单一来源**：`privileged::client_arch_dir()` 用 `env::consts::ARCH` 判定（指针宽度在 aarch64 上同为 64 位，会错误指向不存在的 `x64`），GUI 配置路径、helper、客户端安装三处共用；无法识别时返回必然不存在的目录名使"已安装"判为假，`client_install` 则明确报"官方客户端只提供 x86 版本"。`scripts/install.sh` 的 `getconf LONG_BIT` 同步换成 `uname -m` 分支。
+- **systemd 单元校验补白名单**：`service_content_uses_owned_paths` 过去只看 `Exec*`/`WorkingDirectory=`/`Environment*`，其余指令原样放行，`User=`/`BindPaths=`/`RootDirectory=`/`StandardOutput=file=`/`OnFailure=` 都会被判"安全"；现在未知指令一律拒绝，注释与 `[Section]` 行仍放行（各有回归测试）。
+- **清理与诚实标注**：删除已无引用的 `.log-text`/`.row-badge` CSS 与重复的 `.console row .title/.subtitle` 规则（合并后逐属性一致）；`tests/install_uninstall.sh` 里 `UNSAFE_ZIP`/`ROLLBACK`/`FAIL_HELPER_INSTALL` 三个用例补写它们真实的覆盖边界（只验证 install.sh 在 sudo 步骤失败时非零退出且不删文件，ZIP 净化与回滚的真实覆盖在 `client_install.rs` 单测）。
+- README 新增「已知安全边界」，如实写明两处无法在本仓库消除的暴露（官方客户端只接受命令行传口令；客户端把设置写在他用户可读的工作目录）以及多用户机器的 `hidepid=2` 处置建议；并修正"install.sh 会配置开机认证文件"的错误描述（unit 由应用内开关生成）。
+- 验证：44 项 Rust 测试（较上批 +3）、`clippy --all-targets -D warnings`、`fmt --check`、`cargo build --release`、`bash -n`、`shellcheck` ×4、`desktop-file-validate`、`xmllint`、`git diff --check`、`tests/bootstrap.sh`、`tests/install_uninstall.sh` 全绿；已部署本机（GUI/helper 哈希与构建产物一致），部署后实机启动测量稳定态 CPU、线程数与 stderr（见 HANDOFF 验收记录）。像素级截图与三档宽度评审在本机媒体护栏下不可用（`grim` 输出图片路径被 `PreToolUse` 拒绝，按约定不绕过），CSS 改动改用规则集逐属性比对证实等价。
+- 仍未解决（有明确理由，不是遗漏）：H1 口令进官方客户端 argv（闭源程序只有 `-p`，只能靠 `hidepid=2` 或文档告知）；H2 root 客户端目录 0755 与凭据落盘（收紧到 0750 会让 GUI 读不到 `run.log`，需引入专用组并重登录才两全，代价与收益需你定）；慢网络超时无判定路径仍返回成功且不杀客户端（区分不了"将成功"与"卡死"）；`ForceDark` 与"不套 ScrolledWindow"是既有冻结决策，未动。
+
 ### 并发与资源修复轮（第二批，紧接提权边界轮）
 
 - **轮询不再无上限开线程**：`refresh_status` 每 10 秒由定时器触发一次并 `std::thread::spawn` 一个工作线程执行 `load_status()`（内部串行跑 `systemctl is-enabled`/`is-active`、`nmcli radio`、`journalctl -n 60`、`ps`、多次 `ip`，全部无超时）。旧实现没有在途判断，一旦 systemd 总线或 journal 卡住，线程与子进程按 10 秒一条无限累积。新增 `refresh_status_polled` 作为定时器入口，在途则跳过本次；**手动刷新与动作完成后的刷新仍直接走 `refresh_status`**，所以即使某轮真的卡死，用户点刷新仍可恢复，状态不会被永久锁死。

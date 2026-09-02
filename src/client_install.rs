@@ -77,13 +77,14 @@ fn install_official_client_inner(
     if !extracted.is_dir() {
         anyhow::bail!("ZIP 内未找到 rjsupplicant 目录，请选择学校提供的 Linux 客户端安装包");
     }
-    let required_binary = extracted
-        .join(if cfg!(target_pointer_width = "64") {
-            "x64"
-        } else {
-            "x86"
-        })
-        .join("rjsupplicant");
+    // 架构目录与 helper/GUI 共用同一判定，不再各自按指针宽度猜。
+    let Some(arch_dir) = crate::privileged::client_arch_dir() else {
+        anyhow::bail!(
+            "官方客户端只提供 x86 版本（x64/x86），当前架构 {} 无法安装",
+            std::env::consts::ARCH
+        );
+    };
+    let required_binary = extracted.join(arch_dir).join("rjsupplicant");
     if !required_binary
         .symlink_metadata()
         .map(|metadata| metadata.file_type().is_file())

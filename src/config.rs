@@ -40,8 +40,10 @@ pub fn load() -> Settings {
         match key.trim() {
             "username" => settings.username = value.trim().to_string(),
             "nic" => settings.nic = value.trim().to_string(),
-            "dhcp" => settings.dhcp = value.trim() != "false",
-            "save_password" => settings.save_password = value.trim() != "false",
+            "dhcp" => settings.dhcp = parse_flag(value, settings.dhcp),
+            "save_password" => {
+                settings.save_password = parse_flag(value, settings.save_password);
+            }
             _ => {}
         }
     }
@@ -49,13 +51,25 @@ pub fn load() -> Settings {
     settings
 }
 
+/// 只认明确字面量。旧写法 `value != "false"` 会把 `0`/`no`/`off`/空值/拼错
+/// 全部读成 true，手改配置文件的人会得到与所见相反的行为。
+fn parse_flag(value: &str, fallback: bool) -> bool {
+    match value.trim() {
+        "true" | "1" => true,
+        "false" | "0" => false,
+        _ => fallback,
+    }
+}
+
 pub fn save(settings: &Settings) -> anyhow::Result<()> {
     validate(settings)?;
 
     let path = settings_path();
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
+    let parent = path
+        .parent()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    fs::create_dir_all(&parent)?;
 
     let content = format!(
         "username={}\nnic={}\ndhcp={}\nsave_password={}\n",
@@ -64,15 +78,27 @@ pub fn save(settings: &Settings) -> anyhow::Result<()> {
         settings.dhcp,
         settings.save_password
     );
-    let mut options = fs::OpenOptions::new();
-    options.create(true).write(true).truncate(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    use std::io::Write;
-    options.open(&path)?.write_all(content.as_bytes())?;
-    #[cfg(unix)]
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
-    Ok(())
+    // 先写临时文件再 rename：原来的 create+truncate 就地改写，进程在两步之间
+    // 被杀就留下半截配置，而下一次 load 会静默回落默认值（等于账号丢失）。
+    let temporary = parent.join(format!(".settings.conf.{}.tmp", std::process::id()));
+    let result = (|| -> anyhow::Result<()> {
+        use std::io::Write;
+        let mut options = fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(&temporary)?;
+        file.write_all(content.as_bytes())?;
+        file.sync_all()?;
+        #[cfg(unix)]
+        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))?;
+        fs::rename(&temporary, &path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 pub fn validate(settings: &Settings) -> anyhow::Result<()> {
@@ -103,7 +129,9 @@ pub fn validate(settings: &Settings) -> anyhow::Result<()> {
 }
 
 pub fn settings_path() -> PathBuf {
-    if let Some(config_home) = std::env::var_os("XDG_CONFIG_HOME") {
+    // 空字符串按“未设置”处理：否则 XDG_CONFIG_HOME="" 会拼出依赖当前目录的
+    // 相对路径，配置可能被写进任意目录。
+    if let Some(config_home) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
         return PathBuf::from(config_home).join("rjsupplicant-gui/settings.conf");
     }
 
@@ -135,7 +163,7 @@ fn bin_dir() -> PathBuf {
 }
 
 fn data_home() -> PathBuf {
-    if let Some(data_home) = std::env::var_os("XDG_DATA_HOME") {
+    if let Some(data_home) = std::env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
         return PathBuf::from(data_home);
     }
 
@@ -144,16 +172,18 @@ fn data_home() -> PathBuf {
 
 fn home_dir() -> PathBuf {
     std::env::var_os("HOME")
+        .filter(|v| !v.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-fn is_64_bit() -> bool {
-    std::mem::size_of::<usize>() == 8
-}
-
+/// 架构目录名以 `privileged::client_arch_dir` 为唯一来源；此前这里按指针宽度
+/// 判定，aarch64 会得到 64 位并错误指向不存在的 `x64`。
 fn arch_dir() -> &'static str {
-    if is_64_bit() { "x64" } else { "x86" }
+    match rjsupplicant_gui::privileged::client_arch_dir() {
+        Some(dir) => dir,
+        None => "unsupported-arch",
+    }
 }
 
 fn clean_value(value: &str) -> String {
@@ -176,6 +206,22 @@ mod tests {
             dhcp: true,
             save_password: true,
         }
+    }
+
+    #[test]
+    fn flags_only_accept_explicit_literals() {
+        // 旧写法 `value != "false"` 会把 0/no/off/空值/拼错一律读成 true。
+        for truthy in ["true", "1", " true "] {
+            assert!(parse_flag(truthy, false), "{truthy} 应解析为 true");
+        }
+        for falsy in ["false", "0", " false "] {
+            assert!(!parse_flag(falsy, true), "{falsy} 应解析为 false");
+        }
+        // 认不出的值保持各自默认，而不是悄悄统一成某个方向。
+        assert!(parse_flag("yes", true));
+        assert!(!parse_flag("no", false));
+        assert!(parse_flag("", true));
+        assert!(!parse_flag("", false));
     }
 
     #[test]

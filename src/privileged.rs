@@ -122,6 +122,29 @@ pub fn service_file(options: &AuthOptions) -> String {
     )
 }
 
+/// 本项目模板会写入的 unit 指令。校验器只接受这些键，其余（`User=`、
+/// `BindPaths=`、`RootDirectory=`、`StandardOutput=file=` 等）一律判为不安全：
+/// 旧实现只看 `Exec*`/`WorkingDirectory=`/`Environment*` 三类行，其它指令原样
+/// 放行，导致"服务文件安全"这个结论弱于它的字面含义。
+const SAFE_SERVICE_KEYS: &[&str] = &[
+    "Description",
+    "Documentation",
+    "After",
+    "Wants",
+    "StartLimitIntervalSec",
+    "StartLimitBurst",
+    "Type",
+    "ExecStart",
+    "ExecStop",
+    "ExecStartPost",
+    "Restart",
+    "RestartSec",
+    "TimeoutStartSec",
+    "TimeoutStopSec",
+    "WorkingDirectory",
+    "WantedBy",
+];
+
 pub fn service_content_uses_owned_paths(content: &str) -> bool {
     let expected_program = format!("ExecStart=\"{CLIENT_WRAPPER_PATH}\"");
     let expected_stop = format!("ExecStop=\"{CLIENT_WRAPPER_PATH}\" -q");
@@ -136,6 +159,10 @@ pub fn service_content_uses_owned_paths(content: &str) -> bool {
     let mut workdir_count = 0;
 
     for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with(['#', ';']) || trimmed.starts_with('[') {
+            continue;
+        }
         if line.starts_with("Exec") {
             if line.starts_with(&expected_program) && valid_service_start(line) {
                 start_count += 1;
@@ -153,6 +180,11 @@ pub fn service_content_uses_owned_paths(content: &str) -> bool {
             workdir_count += 1;
         } else if line.starts_with("Environment") {
             return false;
+        } else {
+            let key = trimmed.split('=').next().unwrap_or_default().trim();
+            if !SAFE_SERVICE_KEYS.contains(&key) {
+                return false;
+            }
         }
     }
 
@@ -261,11 +293,23 @@ fn validate_nic(nic: &str) -> Result<()> {
     Ok(())
 }
 
+/// 官方客户端只提供 x86 的 `x64`/`x86` 两种目录。用指针宽度判定会在 aarch64 上
+/// 得到 64 位并错误指向不存在的 `x64`，因此按实际编译架构判定；三处
+/// （helper、GUI 配置路径、客户端安装）必须共用这一个来源，避免各算各的。
+pub fn client_arch_dir() -> Option<&'static str> {
+    match std::env::consts::ARCH {
+        "x86_64" => Some("x64"),
+        "x86" => Some("x86"),
+        _ => None,
+    }
+}
+
+/// 无法识别架构时返回一个必然不存在的目录名，让"客户端已安装"之类的检查统一
+/// 判为假，而不是猜一个 x64 去访问别人的目录。
 fn current_arch_dir() -> &'static str {
-    if cfg!(target_pointer_width = "64") {
-        "x64"
-    } else {
-        "x86"
+    match client_arch_dir() {
+        Some(dir) => dir,
+        None => "unsupported-arch",
     }
 }
 
@@ -347,6 +391,35 @@ mod tests {
             "ExecStartPost=\"/usr/lib/rjsupplicant-gui/rjsupplicant-helper\" restore-network"
         ));
         assert!(!content.contains("/home/"));
+    }
+
+    #[test]
+    fn rejects_service_units_carrying_unexpected_directives() {
+        // 校验器过去只看 Exec* / WorkingDirectory= / Environment* 三类行，
+        // 其余指令原样放行，于是 User= 这类提权外指令会被判成"安全"。
+        let base = service_file(&options());
+        for injected in [
+            "Type=simple\nUser=nobody\n",
+            "Type=simple\nBindPaths=/home/student:/mnt\n",
+            "Type=simple\nRootDirectory=/home/student\n",
+            "Type=simple\nStandardOutput=file:/home/student/out\n",
+            "Type=simple\nOnFailure=evil.target\n",
+        ] {
+            let content = base.replace("Type=simple\n", injected);
+            assert!(content != base, "注入未生效，测试本身失效：{injected:?}");
+            assert!(
+                !service_content_uses_owned_paths(&content),
+                "未知 systemd 指令被当成安全：{injected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_service_comments_and_section_headers() {
+        // 白名单不能把注释与 [Section] 行误判成危险指令。
+        let content = service_file(&options())
+            .replace("[Service]\n", "# 维护说明\n; 第二行注释\n[Service]\n");
+        assert!(service_content_uses_owned_paths(&content));
     }
 
     #[test]

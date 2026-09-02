@@ -315,6 +315,8 @@ fi
 [[ ! -e "${TMP_DIR}/rollback-client/x64/rjsupplicant" ]]
 
 # 用户可写的旧版 wrapper 不得被 sudo 以 root 执行（提权边界）。
+# CI 容器以 root 运行，新建文件天然 root-owned，"属主非 root"这一半判据在 CI 里
+# 无法构造；因此这里用 0777（组/其他可写），两种身份下都必然触发同一句拒绝。
 LEGACY_HOME="${TMP_DIR}/legacy-home"
 LEGACY_DATA="${TMP_DIR}/legacy-data"
 LEGACY_SYSTEMD="${TMP_DIR}/legacy-systemd"
@@ -327,7 +329,7 @@ cat >"${LEGACY_HOME}/.local/bin/rjsupplicant" <<'EOF'
 printf '旧版 wrapper 被以 root 执行\n' >&2
 exit 1
 EOF
-chmod 755 "${LEGACY_HOME}/.local/bin/rjsupplicant"
+chmod 777 "${LEGACY_HOME}/.local/bin/rjsupplicant"
 touch "${LEGACY_DATA}/rjsupplicant/x64/rjsupplicant"
 chmod 755 "${LEGACY_DATA}/rjsupplicant/x64/rjsupplicant"
 

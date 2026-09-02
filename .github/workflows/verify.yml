@@ -29,6 +29,11 @@ jobs:
           git base-devel rust gtk4 libadwaita unzip
           desktop-file-utils libxml2 shellcheck
 
+      # 容器内步骤以 root 运行，而工作区文件属于宿主机 uid；不显式信任的话，
+      # git 会拒绝把检出目录当成仓库（本仓库的这一步从未真正成功过）。
+      - name: Trust the checked-out workspace
+        run: git config --global --add safe.directory "${GITHUB_WORKSPACE}"
+
       - name: Check out repository
         uses: actions/checkout@v4
         with:
@@ -64,8 +69,17 @@ jobs:
 
       - name: Check whitespace errors
         run: |
+          # 直接扫描检出内容而不是 git diff --check：前者不依赖 .git 是否可用，
+          # 且覆盖所有文本文件（当前仓库干净，因此这条不会因历史遗留而失败）。
+          matches="$(grep -rlE \
+            --include='*.rs' --include='*.sh' --include='*.md' --include='*.toml' \
+            --include='*.yml' --include='*.policy' --include='*.desktop' --include='.gitignore' \
+            --exclude-dir=target --exclude-dir=.git \
+            '[[:space:]]+$' . || true)"
+          if [ -n "${matches}" ]; then
+            printf '以下文件存在行尾空白：\n%s\n' "${matches}"
+            exit 1
+          fi
           if git rev-parse -q --verify 'HEAD^' >/dev/null 2>&1; then
             git diff --check HEAD^ HEAD
-          else
-            git diff --check
           fi

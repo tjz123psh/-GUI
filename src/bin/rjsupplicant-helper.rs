@@ -14,6 +14,8 @@ use std::process::{Command, ExitCode};
 const SYSTEMCTL: &str = "/usr/bin/systemctl";
 const SERVICE_NAME: &str = "rjsupplicant.service";
 const MAX_PASSWORD_BYTES: usize = 4096;
+/// 特权动作互斥锁文件；只由 root helper 创建，锁的生命周期就是进程本身。
+const ACTION_LOCK_PATH: &str = "/run/rjsupplicant-helper.lock";
 
 fn main() -> ExitCode {
     match run() {
@@ -28,7 +30,16 @@ fn main() -> ExitCode {
 fn run() -> Result<()> {
     ensure_root()?;
     let args = std::env::args().skip(1).collect::<Vec<_>>();
-    match HelperRequest::parse(&args)? {
+    let request = HelperRequest::parse(&args)?;
+    // 串行化所有会改动认证状态的动作：两个实例并发时会交叉读取同一份 run.log
+    // 做成败判定（把对方的结果当本轮），写服务单元与 systemctl 交错也会留下
+    // 半配置状态。`restore-network` 由 systemd 以 root 调用，绝不能被界面动作
+    // 挡住，所以不参与加锁。
+    let _action_lock = match &request {
+        HelperRequest::RestoreNetwork => None,
+        _ => Some(acquire_action_lock()?),
+    };
+    match request {
         HelperRequest::InstallClient(zip_path) => client_install::install_official_client(
             &zip_path,
             Path::new(CLIENT_DIR),
@@ -84,6 +95,29 @@ fn ensure_root() -> Result<()> {
     Ok(())
 }
 
+/// 非阻塞独占获取动作锁，返回的文件句柄一旦 drop（进程结束）即释放锁。
+/// 拿不到锁时立即失败并给出可读原因，避免两个实例互相污染对方的成败判定。
+fn acquire_action_lock() -> Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.create(true).write(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let file = options
+        .open(ACTION_LOCK_PATH)
+        .with_context(|| format!("无法创建动作锁 {ACTION_LOCK_PATH}"))?;
+    // SAFETY: fd 来自上面成功打开的文件；LOCK_EX|LOCK_NB 不会阻塞，失败时
+    // errno 有效。返回的 File 存活期间持有该 fd，drop 时由 std 关闭并释放锁。
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            anyhow::bail!("另一个特权认证操作正在进行，请等待其结束后重试");
+        }
+        return Err(err).context("无法获取认证动作锁");
+    }
+    Ok(file)
+}
+
 fn authenticate(options: &AuthOptions) -> Result<()> {
     ensure_client_installed()?;
     let args = client_arguments(options, true);
@@ -133,8 +167,14 @@ fn await_auth_result(
             new_log_tail(log_path, log_offset).as_deref(),
         );
         match outcome {
-            // 客户端已退出（失败或崩溃）：返回后由 GUI 状态轮询呈现真实状态。
-            AuthOutcome::ClientExited | AuthOutcome::Succeeded => return Ok(()),
+            AuthOutcome::Succeeded => return Ok(()),
+            AuthOutcome::ClientExited => {
+                // 认证成功的前提是客户端保持前台运行并持有会话（与开机自启 unit
+                // 的 Type=simple 同一判据），进程不在了就说明本轮没有建立会话。
+                // 旧实现在这里返回 Ok，GUI 会放成功霞光并记一次“成功”。
+                // 退出码不参与判定：实测客户端 DHCP 失败也返回 0。
+                return Err(anyhow::anyhow!("认证未完成：官方客户端进程已退出"));
+            }
             AuthOutcome::Failed(reason) => {
                 // 判到失败但客户端还活着：它已带 `-p` 明文口令且不会建立会话，
                 // 留在系统里只是一个持有口令的 root 孤儿进程。

@@ -35,7 +35,9 @@ const CONSOLE_WIDTH: i32 = 420;
 struct LastAuth {
     ok: bool,
     summary: String,
-    at: std::time::SystemTime,
+    /// 用单调钟：SystemTime 会被用户改系统时间或 NTP 步进影响，回拨时
+    /// "X 分钟前"会退回"刚刚"甚至错误。
+    at: std::time::Instant,
 }
 
 /// 窗口内需要被多个回调共享的最小状态集。
@@ -67,7 +69,6 @@ struct Ui {
     last_auth: Arc<std::sync::Mutex<Option<LastAuth>>>,
     nic: gtk::DropDown,
     nic_model: gtk::StringList,
-    nics: Arc<Vec<String>>,
     username: gtk::Entry,
     password: gtk::Entry,
     connect: gtk::Button,
@@ -111,6 +112,26 @@ impl Ui {
             dhcp: self.dhcp.is_active(),
             save_password: self.save_password.is_active(),
         }
+    }
+
+    /// 用最新探测到的网卡列表重建下拉框，并尽量保留用户当前选择。
+    /// 旧实现只在构建窗口时探测一次并存成快照：后接的网卡（USB 网卡、驱动
+    /// 重载、拔插）既选不到也看不到状态，只能重启应用。
+    fn sync_interfaces(&self, names: &[String]) {
+        let selected = self.selected_nic();
+        let known: Vec<String> = (0..self.nic_model.n_items())
+            .filter_map(|index| self.nic_model.string(index).map(|s| s.to_string()))
+            .collect();
+        if known.as_slice() == names {
+            return;
+        }
+        // 一次 splice 完成替换：StringList 没有 remove_all，且分步增删会让
+        // 下拉框在中间态显示为空。
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        self.nic_model.splice(0, self.nic_model.n_items(), &refs);
+        // 网卡还在列表里就保留用户的选择，否则回到第一项。
+        let keep = names.iter().position(|name| *name == selected);
+        self.nic.set_selected(keep.unwrap_or(0) as u32);
     }
 
     /// 同步大状态字（舞台 + 窄屏状态条）与场景/链路模式。
@@ -233,7 +254,8 @@ fn make_pill(label: &str) -> (gtk::Box, gtk::Box, gtk::Label) {
     dot.set_size_request(8, 8);
     dot.set_valign(gtk::Align::Center);
     dot.add_css_class("pill-dot");
-    dot.add_css_class("dot-ok");
+    // 初值是"加载中"，不能先用表示健康的绿点（窄屏状态条同样用 dot-warn）。
+    dot.add_css_class("dot-warn");
     let value = gtk::Label::builder().label(label).build();
     let pill = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
@@ -285,6 +307,9 @@ pub fn activate(app: &adw::Application) {
 
 fn build_window(app: &adw::Application) -> Ui {
     load_theme_css();
+    // 一次读盘供四个初值共用：以前每处各调一次 config::load()，既重复 IO
+    // 也可能在两次读取之间拿到不一致的值。
+    let settings = config::load();
 
     // 强制深色主题，避免原生控件亮色皮肤破坏樱花氛围
     adw::StyleManager::default().set_color_scheme(adw::ColorScheme::ForceDark);
@@ -328,7 +353,7 @@ fn build_window(app: &adw::Application) -> Ui {
         .description("变更即时保存，下次连接生效")
         .build();
     let dhcp = gtk::Switch::builder()
-        .active(config::load().dhcp)
+        .active(settings.dhcp)
         .valign(gtk::Align::Center)
         .build();
     let dhcp_row = adw::ActionRow::builder()
@@ -338,7 +363,7 @@ fn build_window(app: &adw::Application) -> Ui {
     dhcp_row.add_suffix(&dhcp);
     settings_group.add(&dhcp_row);
     let save_password = gtk::Switch::builder()
-        .active(config::load().save_password)
+        .active(settings.save_password)
         .valign(gtk::Align::Center)
         .build();
     let save_row = adw::ActionRow::builder()
@@ -482,7 +507,7 @@ fn build_window(app: &adw::Application) -> Ui {
     let nic_model = gtk::StringList::new(&list);
     let nic = gtk::DropDown::builder().model(&nic_model).build();
     set_pointer_cursor(&nic);
-    let default_nic = config::load().nic;
+    let default_nic = settings.nic.clone();
     let index = names
         .iter()
         .position(|name| name == &default_nic)
@@ -491,7 +516,7 @@ fn build_window(app: &adw::Application) -> Ui {
 
     let username_entry = gtk::Entry::builder()
         .placeholder_text("校园网账号")
-        .text(&config::load().username)
+        .text(&settings.username)
         .build();
     let password_entry = gtk::Entry::builder()
         .placeholder_text("密码（仅本次连接）")
@@ -655,7 +680,6 @@ fn build_window(app: &adw::Application) -> Ui {
         console,
         nic,
         nic_model,
-        nics: Arc::new(names),
         username: username_entry,
         password: password_entry,
         connect,
@@ -924,18 +948,20 @@ fn load_theme_css() {
     }
 
     /* ---- 控制台内 ActionRow 文字：玻璃上必须用深紫 ---- */
-    .console row .title {
-        color: #2E1C26;
-        font-weight: 600;
-    }
-    .console row .subtitle {
-        color: #7A5A70;
-    }
 
     /* 控制台行压缩：全部行在 820px 高度内完整放下（固定布局，无滚动） */
     .console row {
         min-height: 26px;
         padding: 1px 8px;
+    }
+    .console row .title {
+        color: #2E1C26;
+        font-weight: 600;
+        font-size: 9.5pt;
+    }
+    .console row .subtitle {
+        color: #7A5A70;
+        font-size: 8pt;
     }
     /* 最近日志预览：等宽小字，玻璃托底，随状态实时刷新 */
     .log-preview {
@@ -945,12 +971,6 @@ fn load_theme_css() {
         background-color: alpha(#ffffff, 0.55);
         border-radius: 10px;
         padding: 8px 12px;
-    }
-    .console row .title {
-        font-size: 9.5pt;
-    }
-    .console row .subtitle {
-        font-size: 8pt;
     }
 
     /* ---- 主按钮：暖粉渐变 + 浮起/按压反馈 ---- */
@@ -1122,15 +1142,6 @@ fn load_theme_css() {
         border: 1px solid alpha(#b98fb0, 0.45);
     }
 
-    /* 行前缀小圆底（日志等）：与状态胶囊同一视觉语言 */
-    .row-badge {
-        background-image: linear-gradient(160deg, alpha(#ffd3e2, 0.9), alpha(#ffb3cd, 0.7));
-        border-radius: 999px;
-        padding: 6px;
-        box-shadow:
-            inset 0 1px 0 alpha(#ffffff, 0.8),
-            0 2px 8px alpha(#c14d7c, 0.15);
-    }
 
     /* ---- 滚动容器透明化，保持樱花场景透出 ---- */
     scrolledwindow {
@@ -1140,23 +1151,18 @@ fn load_theme_css() {
         background-color: transparent;
     }
 
-    /* 完整日志：等宽深紫小字，可读性优先 */
-    .log-text {
-        font-family: "monospace";
-        font-size: 9pt;
-        color: #4A3048;
-        background-color: alpha(#ffffff, 0.60);
-        padding: 8px 10px;
-        border-radius: 12px;
-    }
-    .log-text text {
-        color: #4A3048;
-    }
     "#;
+    let Some(display) = gtk::gdk::Display::default() else {
+        eprintln!("ui: 没有可用的 GDK Display，跳过主题加载");
+        return;
+    };
     let provider = gtk::CssProvider::new();
+    // gtk4-rs 0.11 没有暴露会返回解析错误的 CSS 构造入口，解析失败只会以 GLib
+    // 告警写到 stderr。这里不静默处理：启动冒烟要求 stderr 为空，任何 CSS 语法
+    // 错误都会以 `Gtk-WARNING ... parser error` 立刻暴露出来。
     provider.load_from_string(css);
     gtk::style_context_add_provider_for_display(
-        &gtk::gdk::Display::default().unwrap(),
+        &display,
         &provider,
         gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
     );
@@ -1172,6 +1178,7 @@ fn set_busy(ui: &Ui, busy: bool) {
     ui.refresh.set_sensitive(!busy);
     ui.autostart.set_sensitive(!busy);
     ui.more.set_sensitive(!busy);
+    ui.banner.set_sensitive(!busy);
     ui.nic.set_sensitive(!busy);
     ui.username.set_sensitive(!busy);
     ui.password.set_sensitive(!busy);
@@ -1223,7 +1230,9 @@ where
             Some(err) => {
                 ui_done.scene.set_mode(scene::Mode::Failed);
                 ui_done.link.set_mode(scene::Mode::Failed);
-                ui_done.set_stage("连接失败", false);
+                if ok_message.is_some() {
+                    ui_done.set_stage("连接失败", false);
+                }
                 toast(&ui_done, &err);
             }
             None => {
@@ -1236,7 +1245,7 @@ where
                         *guard = Some(LastAuth {
                             ok: true,
                             summary: String::new(),
-                            at: std::time::SystemTime::now(),
+                            at: std::time::Instant::now(),
                         });
                     }
                 } else {
@@ -1414,7 +1423,7 @@ fn last_auth_text(last: &Option<LastAuth>) -> (String, &'static str) {
     let Some(record) = last else {
         return ("暂无记录".to_string(), "#6E5568");
     };
-    let elapsed = record.at.elapsed().unwrap_or_default();
+    let elapsed = record.at.elapsed();
     let ago = if elapsed < Duration::from_secs(60) {
         "刚刚".to_string()
     } else if elapsed < Duration::from_secs(3600) {
@@ -1438,50 +1447,64 @@ fn open_install_dialog(ui: &Ui) {
     let future = dialog.open_future(Some(&ui.window));
     let ui2 = ui.clone();
     glib::spawn_future_local(async move {
-        if let Ok(file) = future.await
-            && let Some(path) = file.path()
-        {
-            run_backend(&ui2, "正在安装客户端…", None, move || {
-                system::install_official_client(&path)
-            });
-        }
+        let Ok(file) = future.await else {
+            return; // 用户取消选择
+        };
+        let Some(path) = file.path() else {
+            toast(&ui2, "安装包不在本地磁盘上，请先把它下载到本机再选择");
+            return;
+        };
+        run_backend(&ui2, "正在安装客户端…", None, move || {
+            system::install_official_client(&path)
+        });
     });
+}
+
+/// 发起一次认证：按钮与账号/密码输入框的回车共用同一入口。
+fn do_connect(ui: &Ui) {
+    let settings_ui = ui.clone();
+    let password = settings_ui.password.text().to_string();
+    let settings = settings_ui.settings();
+    if let Err(err) = config::validate(&settings) {
+        toast(&settings_ui, &err.to_string());
+        return;
+    }
+    if password.is_empty() {
+        // 允许空密码：后端不传 -p，由官方客户端复用已保存密码（save_password=1 时）。
+        toast(&settings_ui, "密码留空，将尝试复用已保存的密码");
+    }
+    let _ = config::save(&settings);
+    let last_auth = settings_ui.last_auth.clone();
+    run_backend(
+        &settings_ui,
+        "正在连接…",
+        Some("已连接"),
+        move || {
+            let result = system::authenticate(&settings, &password);
+            // 失败时记录最近认证结果（连接详情区显示）
+            if let (Err(err), Ok(mut guard)) = (&result, last_auth.lock()) {
+                *guard = Some(LastAuth {
+                    ok: false,
+                    summary: err.to_string(),
+                    at: std::time::Instant::now(),
+                });
+            }
+            result
+        },
+    );
 }
 
 fn wire_events(ui: &Ui) {
     let connect = ui.clone();
-    ui.connect.connect_clicked(move |_| {
-        let settings_ui = connect.clone();
-        let password = settings_ui.password.text().to_string();
-        let settings = settings_ui.settings();
-        if let Err(err) = config::validate(&settings) {
-            toast(&settings_ui, &err.to_string());
-            return;
-        }
-        if password.is_empty() {
-            // 允许空密码：后端不传 -p，由官方客户端复用已保存密码（save_password=1 时）。
-            toast(&settings_ui, "密码留空，将尝试复用已保存的密码");
-        }
-        let _ = config::save(&settings);
-        let last_auth = settings_ui.last_auth.clone();
-        run_backend(
-            &settings_ui,
-            "正在连接…",
-            Some("已连接"),
-            move || {
-                let result = system::authenticate(&settings, &password);
-                // 失败时记录最近认证结果（连接详情区显示）
-                if let (Err(err), Ok(mut guard)) = (&result, last_auth.lock()) {
-                    *guard = Some(LastAuth {
-                        ok: false,
-                        summary: err.to_string(),
-                        at: std::time::SystemTime::now(),
-                    });
-                }
-                result
-            },
-        );
-    });
+    ui.connect.connect_clicked(move |_| do_connect(&connect));
+
+    // 键盘优先：在账号或密码框里按回车等同于点「连接校园网」。
+    let password_enter = ui.clone();
+    ui.password
+        .connect_activate(move |_| do_connect(&password_enter));
+    let username_enter = ui.clone();
+    ui.username
+        .connect_activate(move |_| do_connect(&username_enter));
 
     let disconnect = ui.clone();
     ui.disconnect.connect_clicked(move |_| {
@@ -1506,6 +1529,14 @@ fn wire_events(ui: &Ui) {
         }
         let settings = ui.settings();
         if on {
+            if !settings.save_password {
+                switch.set_active(false);
+                toast(
+                    &ui,
+                    "开机自动认证需要保存密码：unit 里没有口令，请先打开「保存密码」",
+                );
+                return;
+            }
             match config::validate(&settings) {
                 Ok(()) => run_service_toggle(&ui, true, settings),
                 Err(err) => {
@@ -1600,7 +1631,6 @@ fn refresh_status_polled(ui: &Ui) {
 /// 状态胶囊、日志预览与自启开关。
 fn refresh_status(ui: &Ui) {
     let ui_done = ui.clone();
-    let nics = ui.nics.clone();
     ui.refreshing.store(true, Ordering::Relaxed);
     // 状态读取（journalctl/systemctl/ps/IP 命令）也是阻塞 I/O：放到工作线程，
     // 避免 10 秒轮询在主循环上造成界面卡顿；结果经 futures-channel 异步送回。
@@ -1608,6 +1638,9 @@ fn refresh_status(ui: &Ui) {
         let (tx, mut rx) = mpsc::unbounded();
         std::thread::spawn(move || {
             let status = system::load_status();
+            // 每轮重新探测：网卡可能后接/消失（USB 网卡、驱动重载），旧实现把
+            // 构建期的快照存进 Ui 后永不更新，新网卡既选不到也看不到状态。
+            let nics = system::wired_interfaces();
 
             let client = if status.client_installed {
                 ("客户端 已安装".to_string(), "dot-ok")
@@ -1624,6 +1657,10 @@ fn refresh_status(ui: &Ui) {
             let service = if status.service_enabled == "enabled" {
                 if status.service_active == "active" {
                     ("服务 已启用".to_string(), "dot-ok")
+                } else if status.service_active == "activating" {
+                    // ExecStartPost 里的 NM 恢复要睡 8 秒，这期间单元是
+                    // activating；只看 active 会把它误报成"服务 异常"。
+                    ("服务 启动中".to_string(), "dot-warn")
                 } else {
                     ("服务 异常".to_string(), "dot-warn")
                 }
@@ -1731,6 +1768,9 @@ fn refresh_status(ui: &Ui) {
                 banner_title,
                 banner_action,
                 wifi_radio_enabled,
+                // Option：工作线程异常时必须是 None，不能把"没探到网卡"
+                // 当成真实结果去清空用户的下拉框。
+                Some(nics),
             );
             let _ = tx.unbounded_send(computed);
         });
@@ -1752,6 +1792,7 @@ fn refresh_status(ui: &Ui) {
                 String::new(),
                 String::new(),
                 true,
+                None,
             )
         });
         let (
@@ -1766,6 +1807,7 @@ fn refresh_status(ui: &Ui) {
             banner_title,
             banner_action,
             wifi_radio_enabled,
+            interfaces,
         ) = computed;
 
         // 状态胶囊：圆点 + 值
@@ -1829,6 +1871,9 @@ fn refresh_status(ui: &Ui) {
         ui_done.banner.set_revealed(banner_show);
         if !ui_done.busy.load(Ordering::Relaxed) {
             ui_done.autostart.set_active(autostart);
+        }
+        if let Some(names) = interfaces {
+            ui_done.sync_interfaces(&names);
         }
         ui_done.refreshing.store(false, Ordering::Relaxed);
     });

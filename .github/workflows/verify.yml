@@ -26,11 +26,14 @@ jobs:
       - name: Install build and validation dependencies
         run: >-
           pacman -Syu --noconfirm --needed
-          base-devel rust gtk4 libadwaita unzip
+          git base-devel rust gtk4 libadwaita unzip
           desktop-file-utils libxml2 shellcheck
 
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          # 让最后一步能看到被推送提交与其父提交的差异，否则工作树永远"干净"。
+          fetch-depth: 2
 
       - name: Check Rust formatting
         run: cargo fmt --check
@@ -60,4 +63,9 @@ jobs:
           xmllint --noout data/io.github.pang.RjSupplicantGui.policy
 
       - name: Check whitespace errors
-        run: git diff --check
+        run: |
+          if git rev-parse -q --verify 'HEAD^' >/dev/null 2>&1; then
+            git diff --check HEAD^ HEAD
+          else
+            git diff --check
+          fi

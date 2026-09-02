@@ -277,7 +277,7 @@ pub fn activate(app: &adw::Application) {
     let timer_ui = ui.clone();
     glib::timeout_add_seconds_local(10, move || {
         if !timer_ui.busy.load(Ordering::Relaxed) {
-            refresh_status(&timer_ui);
+            refresh_status_polled(&timer_ui);
         }
         glib::ControlFlow::Continue
     });
@@ -1583,6 +1583,17 @@ fn wire_events(ui: &Ui) {
             ui.more_popover.popdown();
         });
     }
+}
+
+/// 定时轮询专用入口：上一轮还没回来就跳过本次，避免 `journalctl`/`systemctl`
+/// 偶发卡住时 10 秒一次无限累积工作线程与子进程。
+/// 手动刷新和动作完成后的刷新仍直接走 `refresh_status`——那是用户明确意图，
+/// 不能被在途标记吞掉；万一某轮真的卡死，点刷新按钮仍能恢复。
+fn refresh_status_polled(ui: &Ui) {
+    if ui.refreshing.load(Ordering::Relaxed) {
+        return;
+    }
+    refresh_status(ui);
 }
 
 /// 刷新状态：后台读 system 状态，完成后回主线程更新舞台大状态字、

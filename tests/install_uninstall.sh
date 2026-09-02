@@ -6,7 +6,16 @@ HOST_HOME="${HOME}"
 HOST_CARGO_HOME="${CARGO_HOME:-${HOST_HOME}/.cargo}"
 HOST_RUSTUP_HOME="${RUSTUP_HOME:-${HOST_HOME}/.rustup}"
 TMP_DIR="$(mktemp -d)"
-trap 'rm -rf "${TMP_DIR}"' EXIT
+FAKE_CLIENT_PID=""
+# 同时覆盖 TERM/INT/HUP：被 CI 超时或人工打断时，仅靠 EXIT  trap 要等前台
+# cargo build 结束才执行，进程随即被 SIGKILL，会在 /tmp 留下数百 MB 临时树。
+cleanup() {
+  if [[ -n "${FAKE_CLIENT_PID}" ]]; then
+    kill "${FAKE_CLIENT_PID}" 2>/dev/null || true
+  fi
+  rm -rf "${TMP_DIR}"
+}
+trap cleanup EXIT HUP INT TERM
 
 HOME_DIR="${TMP_DIR}/home"
 DATA_HOME="${TMP_DIR}/data"
@@ -19,6 +28,10 @@ PRIVILEGED_DIR="${TMP_DIR}/lib/rjsupplicant-gui"
 ROOT_CLIENT_DIR="${TMP_DIR}/lib/rjsupplicant"
 POLICY_DIR="${TMP_DIR}/polkit-actions"
 export RJSUPPLICANT_TEST_MODE=1
+# 构建隔离：私有 target 目录 + 不触发 cargo clean，避免回归测试删掉
+# 开发者（或并行 Agent）工作树里的 target/；TMP_DIR 由 trap 统一清理。
+export CARGO_TARGET_DIR="${TMP_DIR}/cargo-target"
+export RJSUPPLICANT_KEEP_BUILD=1
 
 mkdir -p \
   "${HOME_DIR}/.local/bin" \
@@ -293,6 +306,54 @@ if HOME="${ROLLBACK_HOME}" \
 fi
 [[ -f "${TMP_DIR}/rollback-client/old-marker" ]]
 [[ ! -e "${TMP_DIR}/rollback-client/x64/rjsupplicant" ]]
+
+# 用户可写的旧版 wrapper 不得被 sudo 以 root 执行（提权边界）。
+LEGACY_HOME="${TMP_DIR}/legacy-home"
+LEGACY_DATA="${TMP_DIR}/legacy-data"
+LEGACY_SYSTEMD="${TMP_DIR}/legacy-systemd"
+LEGACY_LIBEXEC="${TMP_DIR}/legacy-libexec"
+LEGACY_CLIENT="${TMP_DIR}/legacy-client"
+LEGACY_POLICY="${TMP_DIR}/legacy-policy"
+mkdir -p "${LEGACY_HOME}/.local/bin" "${LEGACY_DATA}/rjsupplicant/x64" "${LEGACY_SYSTEMD}"
+cat >"${LEGACY_HOME}/.local/bin/rjsupplicant" <<'EOF'
+#!/usr/bin/env bash
+printf '旧版 wrapper 被以 root 执行\n' >&2
+exit 1
+EOF
+chmod 755 "${LEGACY_HOME}/.local/bin/rjsupplicant"
+touch "${LEGACY_DATA}/rjsupplicant/x64/rjsupplicant"
+chmod 755 "${LEGACY_DATA}/rjsupplicant/x64/rjsupplicant"
+
+# 让 pgrep -x rjsupplicant 稳定命中，不依赖宿主机是否恰好在认证。
+cp "$(command -v sleep)" "${TMP_DIR}/rjsupplicant"
+"${TMP_DIR}/rjsupplicant" 600 &
+FAKE_CLIENT_PID=$!
+
+LEGACY_OUTPUT="${TMP_DIR}/legacy-output"
+if HOME="${LEGACY_HOME}" \
+  XDG_DATA_HOME="${LEGACY_DATA}" \
+  RJSUPPLICANT_SYSTEMD_DIR="${LEGACY_SYSTEMD}" \
+  RJSUPPLICANT_LIBEXEC_DIR="${LEGACY_LIBEXEC}" \
+  RJSUPPLICANT_PRIVILEGED_CLIENT_DIR="${LEGACY_CLIENT}" \
+  RJSUPPLICANT_POLICY_DIR="${LEGACY_POLICY}" \
+  SUDO_LOG="${SUDO_LOG}" \
+  PATH="${FAKE_BIN}:${PATH}" \
+  "${ROOT_DIR}/scripts/install.sh" --uninstall >"${LEGACY_OUTPUT}" 2>&1; then
+  printf '用户可写的旧版 wrapper 被接受为 root 执行目标\n' >&2
+  cat "${LEGACY_OUTPUT}" >&2
+  exit 1
+fi
+if grep -Fq "sudo ${LEGACY_HOME}/.local/bin/rjsupplicant" "${SUDO_LOG}"; then
+  printf '安装脚本把用户可写路径交给 sudo 执行\n' >&2
+  exit 1
+fi
+grep -Fq '不以 root 执行' "${LEGACY_OUTPUT}" || {
+  printf '拒绝执行用户可写 wrapper 时未给出可操作说明\n' >&2
+  cat "${LEGACY_OUTPUT}" >&2
+  exit 1
+}
+kill "${FAKE_CLIENT_PID}" 2>/dev/null || true
+wait "${FAKE_CLIENT_PID}" 2>/dev/null || true
 
 if env -u RJSUPPLICANT_TEST_MODE \
   HOME="${HOME_DIR}" \

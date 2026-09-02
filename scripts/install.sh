@@ -23,6 +23,8 @@ ROOT_CLIENT_DIR="${RJSUPPLICANT_PRIVILEGED_CLIENT_DIR:-/usr/lib/rjsupplicant}"
 ROOT_WRAPPER_FILE="${LIBEXEC_DIR}/rjsupplicant"
 POLICY_DIR="${RJSUPPLICANT_POLICY_DIR:-/usr/share/polkit-1/actions}"
 POLICY_FILE="${POLICY_DIR}/${APP_ID}.policy"
+# 允许回归测试用私有 target 目录，避免构建与清理动作碰到开发者工作树。
+BUILD_DIR="${CARGO_TARGET_DIR:-${ROOT_DIR}/target}"
 
 log() {
   printf '[rjsupplicant-gui] %s\n' "$*"
@@ -93,6 +95,24 @@ legacy_client_ready() {
   [[ -x "${BIN_DIR}/rjsupplicant" && -x "${APP_DIR}/${arch}/rjsupplicant" ]]
 }
 
+# 提权边界：只有 root-owned 且组/其他不可写的程序才允许交给 sudo 运行。
+# 用户可写的 $HOME 下的文件一旦以 root 执行，等价于把「谁能跑 root 代码」
+# 交给任何能写家目录的进程（恶意包、cron、误点脚本）。
+is_root_owned_executable() {
+  local path="$1" owner mode
+  [[ -f "${path}" ]] || return 1
+  owner="$(stat -c '%u' -- "${path}" 2>/dev/null)" || return 1
+  mode="$(stat -c '%a' -- "${path}" 2>/dev/null)" || return 1
+  [[ "${owner}" == "0" ]] || return 1
+  [[ $((8#"${mode}" & 8#022)) -eq 0 ]] || return 1
+  [[ -x "${path}" ]]
+}
+
+preflight_privileges() {
+  need_cmd sudo ||
+    die "缺少 sudo：安装与卸载都要靠它写入系统目录。请先安装 sudo（或 polkit 提供的 pkexec），不要以其他方式绕过。"
+}
+
 install_system_deps() {
   if [[ "${SKIP_SYSTEM_DEPS:-0}" == "1" ]]; then
     log "跳过系统依赖安装。"
@@ -136,8 +156,8 @@ find_official_zip() {
 build_binaries() {
   log "构建 GUI 和特权 helper。"
   rm -f \
-    "${ROOT_DIR}/target/release/rjsupplicant-gui" \
-    "${ROOT_DIR}/target/release/rjsupplicant-helper"
+    "${BUILD_DIR}/release/rjsupplicant-gui" \
+    "${BUILD_DIR}/release/rjsupplicant-helper"
   cargo build --locked --release --manifest-path "${ROOT_DIR}/Cargo.toml"
 }
 
@@ -146,7 +166,7 @@ cleanup_build_artifacts() {
     log "已设置 RJSUPPLICANT_KEEP_BUILD=1，保留编译中间产物。"
     return
   fi
-  if [[ -d "${ROOT_DIR}/target" ]]; then
+  if [[ -d "${BUILD_DIR}" ]]; then
     # 清理原则：只删"运行中能再生成"的编译缓存（由锁文件可完整重建）；
     # 源码目录、用户设置、已安装程序与官方客户端 ZIP 一律保留。
     log "清理编译中间产物（重装时会自动重新构建）。"
@@ -156,7 +176,7 @@ cleanup_build_artifacts() {
 
 install_privileged_helper() {
   log "安装 root-owned helper 和 polkit policy。"
-  sudo install -D -m 755 "${ROOT_DIR}/target/release/rjsupplicant-helper" "${HELPER_FILE}"
+  sudo install -D -m 755 "${BUILD_DIR}/release/rjsupplicant-helper" "${HELPER_FILE}"
   sudo install -D -m 644 "${ROOT_DIR}/data/${APP_ID}.policy" "${POLICY_FILE}"
 }
 
@@ -185,7 +205,7 @@ install_official_client() {
 
 install_gui() {
   mkdir -p "${BIN_DIR}" "${DESKTOP_DIR}" "${ICON_DIR}"
-  install -m 755 "${ROOT_DIR}/target/release/rjsupplicant-gui" "${BIN_DIR}/rjsupplicant-gui"
+  install -m 755 "${BUILD_DIR}/release/rjsupplicant-gui" "${BIN_DIR}/rjsupplicant-gui"
   install -m 644 "${ROOT_DIR}/data/${APP_ID}.svg" "${ICON_FILE}"
 
   sed "s#^Exec=.*#Exec=${BIN_DIR}/rjsupplicant-gui#" \
@@ -230,6 +250,9 @@ disconnect_running_client() {
   if [[ ! -x "${BIN_DIR}/rjsupplicant" ]]; then
     log "检测到认证进程仍在运行，但 wrapper 不可用；请手动停止该进程。"
     return
+  fi
+  if ! is_root_owned_executable "${BIN_DIR}/rjsupplicant"; then
+    die "检测到仍在运行的认证进程，但 ${BIN_DIR}/rjsupplicant 不是 root-owned 且他人不可写的程序，为防本地提权不以 root 执行它。请先手动停止该认证进程（例如 sudo kill <该进程 PID>），或先重新安装 root-owned 客户端完成迁移后再卸载。"
   fi
 
   log "断开仍在运行的手动认证进程。"
@@ -286,6 +309,7 @@ main() {
       ;;
     --uninstall)
       [[ "$#" -eq 1 ]] || die "--uninstall 不接受其他参数。"
+      preflight_privileges
       uninstall
       return
       ;;
@@ -299,6 +323,7 @@ main() {
       ;;
   esac
 
+  preflight_privileges
   install_system_deps
   build_binaries
   install_privileged_helper

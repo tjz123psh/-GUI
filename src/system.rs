@@ -16,9 +16,10 @@ const PKEXEC_PATH: &str = "/usr/bin/pkexec";
 const SUDO_PATH: &str = "/usr/bin/sudo";
 const SYSTEMCTL_PATH: &str = "/usr/bin/systemctl";
 const IP_BIN: &str = "/usr/bin/ip";
-/// pkexec 授权弹窗等待上限：用户一直不响应时终止等待并报错，
-/// 避免 GUI 停留在"忙"状态、所有点击被吞掉却无法取消（旧实现无超时）。
-const PKEXEC_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+/// 提权等待上限：pkexec 授权弹窗与终端 `sudo` 两条路径共用同一个上界。
+/// 用户一直不响应授权/密码提示时终止等待并报错，避免 GUI 停留在"忙"状态、
+/// 所有点击被吞掉却无法取消（旧实现无超时；终端回退改成"等待结果"后一度无上界）。
+const ELEVATION_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommandSpec {
@@ -263,19 +264,61 @@ pub fn open_live_log() -> Result<()> {
     )
 }
 
-fn run_elevated(action: Action, program: &str, args: &[String]) -> Result<()> {
-    if command_exists(PKEXEC_PATH) {
-        Command::new(PKEXEC_PATH)
-            .arg(program)
-            .args(args)
-            .spawn()
-            .with_context(|| format!("无法启动系统授权：{}", action_label(&action)))?;
+/// 提权边界：任何交给 pkexec/`sudo` 执行的程序都必须 root-owned 且组/其他不可写。
+/// 与 helper 侧 `is_secure_root_executable`、`install.sh` 的同名检查保持一致：
+/// 否则一个能写 `$HOME` 的进程只要替换掉 legacy wrapper，就能借用户的一次授权拿到 root。
+fn ensure_root_owned_program(program: &str) -> Result<()> {
+    let metadata = fs::symlink_metadata(program)
+        .with_context(|| format!("无法检查待提权执行的程序：{program}"))?;
+    if !metadata.file_type().is_file() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+        anyhow::bail!(
+            "拒绝提权执行非 root-owned 或他人可写的程序：{program}；请用 scripts/install.sh 安装 root-owned helper 后重试"
+        );
+    }
+    Ok(())
+}
+
+/// 终端回退：kitty/foot/alacritty/xterm 在被执行命令退出后才关闭，因此等待终端
+/// 进程即可拿到真实结果。旧实现在 `spawn()` 后直接返回成功，会把失败伪装成完成；
+/// 等待同样受 `ELEVATION_WAIT_TIMEOUT` 上界约束，避免密码提示挂起时 GUI 永久忙碌。
+fn run_terminal_elevated(title: &str, program: &str, args: &[String]) -> Result<()> {
+    let mut command_args = vec![SUDO_PATH.to_string(), program.to_string()];
+    command_args.extend(args.iter().cloned());
+    let mut child = spawn_terminal(title, &command_args)?;
+    let Some(status) = wait_for_child(&mut child, ELEVATION_WAIT_TIMEOUT, "终端中的管理员命令")?
+    else {
+        anyhow::bail!("{title} 在终端中等待超时，请确认该终端窗口（可能仍在等待密码）后重试");
+    };
+    if status.success() {
         return Ok(());
     }
+    anyhow::bail!("终端中的 sudo 执行失败：{status}")
+}
 
-    let mut terminal_args = vec![SUDO_PATH.to_string(), program.to_string()];
-    terminal_args.extend(args.iter().cloned());
-    run_terminal(action_label(&action), &terminal_args)
+/// 有界等待提权子进程：正常结束返回其状态；超时则终止并回收直接子进程后返回
+/// `None`，由调用方给出可操作的报错。两条提权路径共用，避免任何一条让 GUI 无限忙碌。
+/// 注意：`kill` 只作用于直接子进程（pkexec 或终端模拟器），由它派生的
+/// root 侧进程不会被回收——这一限制在两条路径上相同。
+fn wait_for_child(
+    child: &mut std::process::Child,
+    timeout: std::time::Duration,
+    label: &str,
+) -> Result<Option<std::process::ExitStatus>> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .with_context(|| format!("无法等待{label}结束"))?
+        {
+            return Ok(Some(status));
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(None);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 }
 
 fn run_elevated_wait(action: Action, program: &str, args: &[String]) -> Result<()> {
@@ -288,6 +331,7 @@ fn run_elevated_wait_with_input(
     args: &[String],
     input: Option<&[u8]>,
 ) -> Result<()> {
+    ensure_root_owned_program(program)?;
     if command_exists(PKEXEC_PATH) {
         let mut command = Command::new(PKEXEC_PATH);
         command.arg(program).args(args);
@@ -309,19 +353,11 @@ fn run_elevated_wait_with_input(
                 return Err(err).context("无法写入 helper 密码输入通道");
             }
         }
-        // 等待授权结果，但带超时：用户不响应 polkit 弹窗时，
-        // 120 秒后终止并报错，而不是让 GUI 无限停留在忙碌状态。
-        let deadline = std::time::Instant::now() + PKEXEC_WAIT_TIMEOUT;
-        let status = loop {
-            if let Some(status) = child.try_wait().context("无法等待系统授权")? {
-                break status;
-            }
-            if std::time::Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                anyhow::bail!("{} 授权等待超时，请重试", action_label(&action));
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
+        // 等待授权结果，但带上界：用户不响应 polkit 弹窗时 120 秒后终止并报错，
+        // 而不是让 GUI 无限停留在忙碌状态。
+        let Some(status) = wait_for_child(&mut child, ELEVATION_WAIT_TIMEOUT, "系统授权")?
+        else {
+            anyhow::bail!("{} 授权等待超时，请重试", action_label(&action));
         };
 
         if status.success() {
@@ -331,7 +367,7 @@ fn run_elevated_wait_with_input(
         anyhow::bail!("{} 执行失败：{}", action_label(&action), status);
     }
 
-    run_elevated(action, program, args)
+    run_terminal_elevated(action_label(&action), program, args)
 }
 
 #[cfg(test)]
@@ -474,44 +510,46 @@ pub fn stop_service_command() -> CommandSpec {
     }
 }
 
-fn run_terminal(title: &str, args: &[String]) -> Result<()> {
+/// 在可用终端里启动一条命令，返回子进程句柄供调用方决定是等待还是丢弃。
+fn spawn_terminal(title: &str, args: &[String]) -> Result<std::process::Child> {
     if command_exists("kitty") {
-        Command::new("kitty")
+        return Command::new("kitty")
             .args(["--title", title, "-e"])
             .args(args)
             .spawn()
-            .context("无法打开 kitty")?;
-        return Ok(());
+            .context("无法打开 kitty");
     }
 
     if command_exists("foot") {
-        Command::new("foot")
+        return Command::new("foot")
             .args(["--title", title])
             .args(args)
             .spawn()
-            .context("无法打开 foot")?;
-        return Ok(());
+            .context("无法打开 foot");
     }
 
     if command_exists("alacritty") {
-        Command::new("alacritty")
+        return Command::new("alacritty")
             .args(["--title", title, "-e"])
             .args(args)
             .spawn()
-            .context("无法打开 alacritty")?;
-        return Ok(());
+            .context("无法打开 alacritty");
     }
 
     if command_exists("xterm") {
-        Command::new("xterm")
+        return Command::new("xterm")
             .args(["-T", title, "-e"])
             .args(args)
             .spawn()
-            .context("无法打开 xterm")?;
-        return Ok(());
+            .context("无法打开 xterm");
     }
 
-    anyhow::bail!("找不到 pkexec 或可用终端，无法执行需要管理员权限的命令");
+    anyhow::bail!("找不到可用终端（kitty/foot/alacritty/xterm），无法执行需要终端的命令")
+}
+
+/// 启动后即不关注的终端用法（例如 `journalctl -f` 会一直跟随）。
+fn run_terminal(title: &str, args: &[String]) -> Result<()> {
+    spawn_terminal(title, args).map(|_| ())
 }
 
 fn recent_log() -> String {
@@ -588,7 +626,9 @@ fn command_text(program: &str, args: &[&str]) -> Option<String> {
 
 fn command_exists(program: &str) -> bool {
     if program.contains('/') {
-        return Path::new(program).exists();
+        // 与 PATH 查找分支保持同一判据：目录或无执行位的文件都不算可用命令，
+        // 否则 pkexec 缺失会被误判为“可用”，绕过上面那条显式失败。
+        return is_executable_file(PathBuf::from(program));
     }
 
     let Some(paths) = std::env::var_os("PATH") else {
@@ -808,5 +848,83 @@ mod tests {
     #[test]
     fn escapes_systemd_specifiers_and_quotes() {
         assert_eq!(systemd_quote("a%\\\"b"), "\"a%%\\\\\\\"b\"");
+    }
+
+    #[test]
+    fn refuses_to_escalate_a_program_that_others_can_replace() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // 用 0777 而不是“属主非 root”构造用例，使断言与运行测试的用户无关。
+        let path =
+            std::env::temp_dir().join(format!("rjsupplicant-gui-elevation-{}", std::process::id()));
+        fs::write(&path, "#!/bin/sh\nexit 0\n").expect("写入临时程序");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o777)).expect("放开写权限");
+        let message = ensure_root_owned_program(&config::path_string(&path))
+            .expect_err("他人可写的程序不应被接受为提权目标");
+        let detail = message.to_string();
+        fs::remove_file(&path).expect("清理临时程序");
+
+        assert!(
+            detail.contains("拒绝提权执行"),
+            "错误未说明拒绝原因：{detail}"
+        );
+        assert!(
+            ensure_root_owned_program("/definitely/not/installed/rjsupplicant-helper").is_err(),
+            "不存在的程序不应被当成可信提权目标"
+        );
+    }
+
+    #[test]
+    fn absolute_command_path_requires_executable_bit() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = std::env::temp_dir().join(format!(
+            "rjsupplicant-gui-command-exists-{}",
+            std::process::id()
+        ));
+        fs::write(&path, "#!/bin/sh\n").expect("写入临时可执行文件");
+        let bare = config::path_string(&path);
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("去掉执行位");
+        let without_exec_bit = command_exists(&bare);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("加上执行位");
+        let with_exec_bit = command_exists(&bare);
+        fs::remove_file(&path).expect("清理临时可执行文件");
+
+        assert!(
+            !without_exec_bit,
+            "无执行位的文件不应被当成可用命令：{bare}"
+        );
+        assert!(with_exec_bit, "可执行文件应被识别为可用命令：{bare}");
+        assert!(
+            !command_exists("/etc"),
+            "目录不应被当成可用命令（pkexec 缺失时的误判入口）"
+        );
+    }
+
+    #[test]
+    fn elevation_wait_bounds_a_stuck_child_and_reaps_it() {
+        // 终端里的 sudo 提示挂起时不能有“无上界等待”：超时必须终止并回收直接子进程。
+        let mut stuck = Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("启动 sleep 模拟挂起的提权子进程");
+        let outcome = wait_for_child(&mut stuck, std::time::Duration::from_millis(200), "测试")
+            .expect("有界等待本身不应失败");
+        assert!(outcome.is_none(), "挂起的子进程应在超时后返回 None");
+        assert!(
+            stuck.try_wait().expect("复查子进程状态").is_some(),
+            "超时后子进程必须已被回收，不能留在系统里挂起"
+        );
+
+        let mut finished = Command::new("/bin/true")
+            .spawn()
+            .expect("启动 /bin/true 模拟正常结束的提权子进程");
+        let outcome = wait_for_child(&mut finished, std::time::Duration::from_secs(5), "测试")
+            .expect("有界等待本身不应失败");
+        assert!(
+            outcome.expect("正常结束应返回退出状态").success(),
+            "正常结束的子进程不应被判为失败"
+        );
     }
 }

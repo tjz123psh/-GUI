@@ -36,6 +36,9 @@ pub struct ClientStatus {
     pub service_enabled: String,
     pub service_active: String,
     pub last_log: String,
+    /// NetworkManager 无线射频是否启用。射频状态由 NM 持久化，
+    /// 用户手动关 Wi-Fi 后重启仍保持关闭（实测事故源头之一）。
+    pub wifi_radio_enabled: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -56,6 +59,10 @@ pub fn load_status() -> ClientStatus {
         .unwrap_or_else(|| "unknown".to_string());
     let service_active = command_text(SYSTEMCTL_PATH, &["is-active", SERVICE])
         .unwrap_or_else(|| "unknown".to_string());
+    // 未知时按"已启用"处理（不误报）；nmcli 随 NetworkManager 安装。
+    let wifi_radio_enabled = command_text("/usr/bin/nmcli", &["-t", "-f", "WIFI", "radio"])
+        .map(|value| value.trim() == "enabled")
+        .unwrap_or(true);
     ClientStatus {
         client_installed: privileged_ready || legacy_ready,
         client_requires_migration: helper_installed() && !privileged_ready && legacy_ready,
@@ -65,6 +72,7 @@ pub fn load_status() -> ClientStatus {
         service_enabled,
         service_active,
         last_log: recent_log(),
+        wifi_radio_enabled,
     }
 }
 
@@ -347,8 +355,7 @@ pub fn service_file(settings: &Settings) -> String {
          Wants=network-online.target\n\
          \n\
          [Service]\n\
-         Type=forking\n\
-         GuessMainPID=yes\n\
+         Type=simple\n\
          ExecStart={} -a 1 -d {} -n {} -u {} -S {}\n\
          ExecStop={} -q\n\
          Restart=on-failure\n\
@@ -791,7 +798,7 @@ mod tests {
     fn builds_service_file_from_current_settings() {
         let content = service_file(&settings());
 
-        assert!(content.contains("Type=forking"));
+        assert!(content.contains("Type=simple"));
         assert!(content.contains("ExecStart="));
         assert!(content.contains("-a 1 -d 1 -n \"enp4s0\" -u \"20260001\" -S 1"));
         assert!(content.contains("ExecStop="));

@@ -107,8 +107,7 @@ pub fn service_file(options: &AuthOptions) -> String {
          StartLimitBurst=3\n\
          \n\
          [Service]\n\
-         Type=forking\n\
-         GuessMainPID=yes\n\
+         Type=simple\n\
          ExecStart={client} -a 1 -d {dhcp} -n {nic} -u {username} -S {save}\n\
          ExecStop={client} -q\n\
          ExecStartPost=\"{HELPER_PATH}\" restore-network\n\
@@ -341,7 +340,7 @@ mod tests {
     fn root_service_uses_only_fixed_client_paths() {
         let content = service_file(&options());
         assert!(service_content_uses_owned_paths(&content));
-        assert!(content.contains("Type=forking"));
+        assert!(content.contains("Type=simple"));
         assert!(content.contains(CLIENT_WRAPPER_PATH));
         assert!(content.contains("-n \"enp4s0.20\" -u \"20260001@gdufs\""));
         assert!(content.contains(
@@ -378,8 +377,8 @@ mod tests {
         assert!(!service_content_uses_owned_paths(&legacy));
 
         let injected = content.replace(
-            "Type=forking",
-            "Type=forking\nEnvironment=LD_PRELOAD=/home/student/lib.so",
+            "Type=simple",
+            "Type=simple\nEnvironment=LD_PRELOAD=/home/student/lib.so",
         );
         assert!(!service_content_uses_owned_paths(&injected));
     }

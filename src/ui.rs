@@ -1657,6 +1657,7 @@ fn refresh_status(ui: &Ui) {
 
             // 连接状态 / 副行（网卡 · 时长）
             let conn = status.client_running;
+            let wifi_radio_enabled = status.wifi_radio_enabled;
             let active_nic = nics
                 .iter()
                 .find(|name| system::interface_has_carrier(name))
@@ -1718,6 +1719,7 @@ fn refresh_status(ui: &Ui) {
                 banner_show,
                 banner_title,
                 banner_action,
+                wifi_radio_enabled,
             );
             let _ = tx.unbounded_send(computed);
         });
@@ -1738,6 +1740,7 @@ fn refresh_status(ui: &Ui) {
                 false,
                 String::new(),
                 String::new(),
+                true,
             )
         });
         let (
@@ -1751,6 +1754,7 @@ fn refresh_status(ui: &Ui) {
             banner_show,
             banner_title,
             banner_action,
+            wifi_radio_enabled,
         ) = computed;
 
         // 状态胶囊：圆点 + 值
@@ -1765,11 +1769,14 @@ fn refresh_status(ui: &Ui) {
         // 大状态字（舞台 + 窄屏状态条）
         ui_done.set_stage(if conn { "已连接" } else { "未连接" }, conn);
         // 副行：网卡 · 详情
-        let sub = if active_nic.is_empty() {
+        let mut sub = if active_nic.is_empty() {
             detail.clone()
         } else {
             format!("{active_nic} · {detail}")
         };
+        if !wifi_radio_enabled {
+            sub.push_str(" · Wi-Fi 已禁用");
+        }
         ui_done.stage_sub.set_label(&sub);
         ui_done.compact_sub.set_label(&sub);
         ui_done.log_preview.set_label(&preview);

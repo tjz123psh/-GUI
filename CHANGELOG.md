@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased - 2026-09-02
+
+### 重启失联事故修复轮（快照恢复前取证，三个子代理并行深度审计）
+
+- **开机自启 service 单元 Type 修复（真实隐患）**：实测官方客户端认证时保持前台运行（多轮实机实证 PPID 不脱离），原 unit 的 `Type=forking + GuessMainPID=yes` 一旦真正启用必在 `TimeoutStartSec=30` 超时失败、`ExecStartPost`（恢复 NM）永不执行，重启后必然断网。改为 `Type=simple`：客户端即服务主进程、持有会话；`ExecStop` 的 `-q` 正常断连；崩溃时 `Restart=on-failure` 拉起；验证器与测试同步。
+- **GUI 增加「Wi-Fi 已禁用」提示**：`load_status` 新增 `wifi_radio_enabled`（`nmcli -t -f WIFI radio`），副行在射频关闭时追加「· Wi-Fi 已禁用」，让用户第一时间理解连不上 Wi-Fi 的真实原因。
+- **事故归因（全部实证，子代理三路交叉核验）**：
+  - 开机自启 unit **从未被创建**：全 journal 无 `enable-service/disable-service` 的 pkexec 记录；「估计自启有问题」的直觉正确——启用即会踩中上方 Type 缺陷，已一并修复。
+  - 「重启后一直连接失败」无客户端日志支持：重启后唯一一次 09:41 认证即成功；NM 停止 → 8 秒恢复为 helper 既定时序（09:41:02 stop → 09:41:10 start，NM unit 为 `Type=dbus + Restart=on-failure`，显式 stop 不触发自动重启）。
+  - 「Wi-Fi 连不上 / 网络设置直接不见」：用户 09-01 18:27 手动关闭 Wi-Fi，systemd-rfkill 跨重启恢复软阻塞（wlan/bluetooth 归档值 0），DMS 设置前端在射频关闭时按设计隐藏全部 Wi-Fi 内容（`NetworkWifiTab.qml`）；**四个连接档案全部完好**（`/etc/NetworkManager/system-connections`），`NetworkManager.state` 的 `WirelessEnabled=true`；射频已恢复（`nmcli radio wifi on`）。
+- 验证：27 项测试、clippy `-D warnings`、release 全绿。
+
 ## Unreleased - 2026-09-01
 
 ### 实机联调修复轮（校园有线网实测，用户在场配合授权）

@@ -1,10 +1,10 @@
 # rjsupplicant-gui 项目交接文档
 
-- 最后更新：2026-09-01
-- 当前版本：0.3.0（实机联调修复轮：主线程卡死、Wi-Fi 连带断连、DHCP 无 IP 三个问题已修复并有实机证据，见 3.2 节）
-- 项目状态：后端与提权链功能冻结；前端皮肤完成；**2026-09-01 校园有线网实机联调**：手动认证已实测成功（认证成功 + 中文欢迎横幅 + eno1 获 IP），点击连接卡死、连接后热点 Wi-Fi 断连、认证成功但拿不到 IP（2014 客户端内置 DHCP 不发包）已定位并修复；等待用户在 GUI 内最终手动确认真实认证、错误密码、polkit 交互与开机自启路径
+- 最后更新：2026-09-02
+- 当前版本：0.3.0（实机联调修复轮已完成；2026-09-02 重启失联事故修复轮：service 单元 Type=forking 缺陷修复 + Wi-Fi 射频状态透出，见 3.3 节）
+- 项目状态：后端与提权链功能冻结；前端皮肤完成；**2026-09-01 校园有线网实机联调**与 **2026-09-02 重启事故修复轮**已完成；手动认证实测成功；等待用户最终手动确认错误密码、polkit 交互与开机自启（含修复后的 Type=simple 单元）
 - 最终验收代码基线：`9ff5645`
-- 当前代码基线：`73314ff` + 未提交的实机联调修复轮改动（src/ui.rs、src/privileged.rs、src/bin/rjsupplicant-helper.rs、Cargo.toml/lock、scripts/install.sh、HANDOFF/CHANGELOG；不要 reset/stash 覆盖）
+- 当前代码基线：`73314ff` + 实机修复轮与事故修复轮提交（勿覆盖历史提交）
 - 主分支：`main`
 - 远端：`git@github.com:tjz123psh/-GUI.git`
 
@@ -153,6 +153,17 @@
 5. **net-tools 依赖**：客户端调用 `ifconfig`（strace 见 7 处），缺失使「正在启用网卡」失败；`scripts/install.sh` 依赖清单加入 net-tools。
 
 已验证链路：GUI→pkexec→helper→wrapper→官方客户端 全程真实跑通；断开路径（helper disconnect → 客户端退出 → NM 保持）。待用户最终手动验证：GUI 内输入密码连接全程 UX、错误密码反馈、polkit 授权对话框交互、开机自启（service 路径，含 ExecStartPost 时序）。
+
+## 3.3 重启失联事故修复轮（2026-09-02，三个子代理并行深度审计）
+
+用户重启后报告：连不上网络、Wi-Fi 连不上、网络设置"不见了"、开机自启疑似有问题。三个只读子代理（unit 缺失 / NM 重启时序 / 网络设置消失）交叉取证结论，全部有实证：
+
+1. **开机自启 unit 从未被创建**（全 journal 无 enable-service/disable-service 的 pkexec 记录，apply 时按需生成）；「自启有问题」的直觉指向真实缺陷：unit 模板 `Type=forking + GuessMainPID=yes` 与官方客户端"前台运行不 daemon 化"的实际行为矛盾——一旦启用必在 30 秒超时失败、ExecStartPost（NM 恢复）永不执行。已改为 **`Type=simple`**（客户端即主进程持会话；ExecStop `-q` 断连；崩溃 Restart 拉起），security 验证器与测试同步。**启用自启的新 unit 用此模板，无需迁移**。
+2. **NM 停止→8 秒自动恢复 = helper 既定时序**（09:41:02 stop → 09:41:10 start，实测多次；NM unit `Type=dbus`+`Restart=on-failure`，显式 stop 不触发 systemd 自动重启，且无 D-Bus activation 兜底文件）。设计正确。
+3. **「Wi-Fi 连不上 / 网络设置不见」= 跨重启射频持久关闭 + 设置前端按设计隐藏**：用户 09-01 18:27 手动关闭 Wi-Fi → systemd-rfkill 在关机时存档软阻塞（`/var/lib/systemd/rfkill/…:wlan=0`，bluetooth 同为 0）→ 开机恢复 → DMS（Dank Material Shell 设置）在 `wifiEnabled=false` 时隐藏全部 Wi-Fi 网络与已保存列表（`NetworkWifiTab.qml`）。**四个连接档案（iQOO Z10 Turbo/966903-5G/CMCC-966903/有线连接 1）完好**，`NetworkManager.state` 的 `WirelessEnabled=true`。射频已恢复；GUI 副行新增「Wi-Fi 已禁用」提示（`wifi_radio_enabled`）防再次困惑。
+4. **「重启后一直连接失败」无日志支持**：重启后唯一一次 09:41 认证即成功（欢迎横幅）；此前失败窗口与射频关闭、NM 8 秒恢复窗口的感知混淆有关。
+
+未发现任何连接档案丢失、任何客户端对 rfkill 的操作、任何维护脚本对 systemd unit 的操作。维护脚本（~/scripts/maintenance）与项目完全无关（0 命中 rjsupplicant）。
 
 ## 4. 技术栈与仓库结构
 

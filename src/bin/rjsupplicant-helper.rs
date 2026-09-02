@@ -88,7 +88,7 @@ fn authenticate(options: &AuthOptions) -> Result<()> {
     ensure_client_installed()?;
     let args = client_arguments(options, true);
     let log_path = client_log_path();
-    let log_offset = fs::metadata(&log_path).map(|meta| meta.len()).unwrap_or(0);
+    let mut log_offset = fs::metadata(&log_path).map(|meta| meta.len()).unwrap_or(0);
 
     // 官方客户端启动时会主动 `systemctl stop NetworkManager`（strace 实测），
     // 且其内置 DHCP（2014 二进制）在现代内核上不发出任何报文（pcap 实测）。
@@ -101,7 +101,7 @@ fn authenticate(options: &AuthOptions) -> Result<()> {
     // 客户端可能在任何一次判定之前就退出（网线未插、认证服务器不通、崩溃），
     // 那时它已经停掉了 NetworkManager；用守卫兜住所有出口，避免无线被静默切断。
     let _network_guard = NetworkRestorer;
-    await_auth_result(&mut child, &log_path, log_offset)
+    await_auth_result(&mut child, &log_path, &mut log_offset)
 }
 
 /// DHCP 注入时序节点：客户端在此期间完成启动并停掉 NetworkManager。
@@ -119,7 +119,7 @@ const AUTH_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis
 fn await_auth_result(
     child: &mut std::process::Child,
     log_path: &Path,
-    log_offset: u64,
+    log_offset: &mut u64,
 ) -> Result<()> {
     // 客户端退出码不可靠（DHCP 失败也返回 0），成败以启动后新增的官方日志判定。
     let started = std::time::Instant::now();
@@ -135,7 +135,12 @@ fn await_auth_result(
         match outcome {
             // 客户端已退出（失败或崩溃）：返回后由 GUI 状态轮询呈现真实状态。
             AuthOutcome::ClientExited | AuthOutcome::Succeeded => return Ok(()),
-            AuthOutcome::Failed(reason) => return Err(anyhow::anyhow!("{reason}")),
+            AuthOutcome::Failed(reason) => {
+                // 判到失败但客户端还活着：它已带 `-p` 明文口令且不会建立会话，
+                // 留在系统里只是一个持有口令的 root 孤儿进程。
+                terminate_client(child);
+                return Err(anyhow::anyhow!("{reason}"));
+            }
             AuthOutcome::Pending => {}
         }
         // 8 秒节点必须在这里显式恢复：客户端要等 NM 注入路由才会写出「认证成功」，
@@ -146,11 +151,19 @@ fn await_auth_result(
         }
         // 总预算保持为原两阶段的 8 秒 + 60 秒，避免改动已被实机验证过的
         // 失败判定窗口（客户端 DHCP 超时约 45 秒）。
+        // 超时说明本轮判不出结果，此时**不**杀客户端：慢网络上"再等一会就成功"
+        // 与"卡死"无法区分，误杀会真把一次能成的认证打断。
         if started.elapsed() >= DHCP_RESTORE_DELAY + AUTH_RESULT_TIMEOUT {
             return Ok(());
         }
         std::thread::sleep(AUTH_POLL_INTERVAL);
     }
+}
+
+/// 终止并回收官方客户端。只用于"已判定失败但进程仍在"这一种状态。
+fn terminate_client(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -181,16 +194,28 @@ fn classify_auth(client_exited: bool, new_log: Option<&str>) -> AuthOutcome {
     }
 }
 
-fn new_log_tail(path: &Path, offset: u64) -> Option<String> {
+/// 读取 `offset` 之后的新增日志，并把 `offset` 推进到本次消费到的位置。
+/// 推进是必须的：不推进时每次 200ms 轮询都重读全部历史，日志越长读放大越严重。
+fn new_log_tail(path: &Path, offset: &mut u64) -> Option<String> {
     use std::io::{Read, Seek, SeekFrom};
     let mut file = fs::File::open(path).ok()?;
     let size = file.metadata().ok()?.len();
-    if size <= offset {
+    if size < *offset {
+        // 日志被清空或轮转：旧偏移已无意义，从头读，否则此后永远判不到新内容。
+        *offset = 0;
+    }
+    if size == *offset {
         return None;
     }
-    file.seek(SeekFrom::Start(offset)).ok()?;
+    file.seek(SeekFrom::Start(*offset)).ok()?;
     let mut text = String::new();
-    file.read_to_string(&mut text).ok()?;
+    if file.read_to_string(&mut text).is_err() {
+        // 含非法 UTF-8 字节：这段永远解析不出来，同样跳过它，避免每次轮询
+        // 都在同一处失败并返回 None（旧行为会让成败判定永久失效）。
+        *offset = size;
+        return None;
+    }
+    *offset = size;
     Some(text)
 }
 
@@ -472,6 +497,63 @@ mod tests {
             None
         );
         assert_eq!(auth_failure_reason("").as_deref(), None);
+    }
+
+    #[test]
+    fn new_log_tail_advances_offset_and_survives_truncation() {
+        use std::io::Write;
+
+        let path = std::env::temp_dir().join(format!(
+            "rjsupplicant-helper-log-tail-{}",
+            std::process::id()
+        ));
+
+        fs::write(&path, "第一轮\n").expect("写入初始日志");
+        let mut offset = fs::metadata(&path).expect("读取日志长度").len();
+        assert_eq!(new_log_tail(&path, &mut offset), None, "起点之后没有新内容");
+
+        // 追加后只返回新增部分，且偏移必须前进，否则每 200ms 都在重读历史。
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("打开日志追加")
+            .write_all("认证成功\n".as_bytes())
+            .expect("追加认证成功");
+        assert_eq!(
+            new_log_tail(&path, &mut offset).as_deref(),
+            Some("认证成功\n")
+        );
+        assert_eq!(
+            offset,
+            fs::metadata(&path).expect("读取日志长度").len(),
+            "读取后偏移应推进到文件末尾"
+        );
+        assert_eq!(
+            new_log_tail(&path, &mut offset),
+            None,
+            "偏移未前进会重复读到旧的认证成功行"
+        );
+
+        // 日志被清空/轮转（长度变短）后必须能重新判定，而不是永久返回 None。
+        fs::write(&path, "x\n").expect("重写为更短的日志");
+        assert_eq!(new_log_tail(&path, &mut offset).as_deref(), Some("x\n"));
+
+        // 非法 UTF-8 段应被跳过（并把偏移推过它），其后的正常内容仍可判定。
+        fs::write(&path, [0xff_u8; 8]).expect("写入非法字节");
+        assert_eq!(new_log_tail(&path, &mut offset), None, "坏字节段无法解析");
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("打开日志追加")
+            .write_all("认证成功\n".as_bytes())
+            .expect("追加认证成功");
+        assert_eq!(
+            new_log_tail(&path, &mut offset).as_deref(),
+            Some("认证成功\n"),
+            "跳过坏字节后应能继续判定"
+        );
+
+        fs::remove_file(&path).expect("清理临时日志");
     }
 
     #[test]

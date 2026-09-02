@@ -2,7 +2,7 @@
 
 - 最后更新：2026-09-02
 - 当前版本：0.3.0（实机联调修复轮已完成；2026-09-02 重启失联事故修复轮：service 单元 Type=forking 缺陷修复 + Wi-Fi 射频状态透出，见 3.3 节）
-- 项目状态：后端与提权链功能冻结；前端皮肤完成；**2026-09-01 校园有线网实机联调**与 **2026-09-02 重启事故修复轮**已完成；手动认证实测成功；等待用户最终手动确认错误密码、polkit 交互与开机自启（含修复后的 Type=simple 单元）
+- 项目状态：后端与提权链功能冻结；前端皮肤完成；**2026-09-01 校园有线网实机联调**与 **2026-09-02 重启事故修复轮**已完成；手动认证实测成功；**2026-09-02 提权边界修复轮已完成并全绿，但尚未提交（工作树含 5 个文件改动）**；等待用户最终手动确认错误密码、polkit 交互与开机自启（含修复后的 Type=simple 单元）
 - 最终验收代码基线：`9ff5645`
 - 当前代码基线：`73314ff` + 实机修复轮与事故修复轮提交（勿覆盖历史提交）
 - 主分支：`main`
@@ -49,6 +49,8 @@
 
 2026-08-04 收尾轮（用户「更新交接文档、清理残余文件、收尾」）：**curl 一键安装本机完整检验通过**——用户跑 `bootstrap.sh` 后逐项核验：官方 ZIP SHA-256=`d211d9a6…` 与脚本内 `CLIENT_SHA256` 一致；helper `ff7d1b6e`、GUI `6e45cbf1` 与本地 `target/release` 构建哈希一致（GitHub 最新源码 `cargo build --release`）；helper/wrapper/客户端均 root:root 755、policy root:root 644；`strings helper` 确认 `WorkingDirectory=` 无引号（unit 修复已进入安装产物）；wrapper 的 getconf LONG_BIT 选 x64/x86 正确；policy 6 动作（install-client/authenticate/disconnect/enable-service/disable-service/restart-service）齐全；desktop 入口与图标就位；`pkexec /bin/true` exit=0；`systemctl is-enabled` 为 not-found 属正常（unit 由 GUI 开自启时生成，安装不创建）。**仓库整理**：删除误入的 `.ruff_cache/`、4 个无引用的 Tabler 图标（activity/server-cog）并按需补 `.gitignore`（提交 ffe7479）。**日志终端行为说明（用户曾困惑）**：`journalctl -u rjsupplicant.service -n 120 -f` 无条件回放最近 120 行历史后进入跟随模式；journal 是系统级日志库，卸载/重装/重开终端均不清空历史，服务无新日志时终端停留在历史尾部——这是预期行为，不是刷新问题。**最终状态**：前端、后端、提权链、安装链全部就绪并入库（main 与 origin/main 同步），唯一待办为校园有线网实机验证（第 13 节清单 5 项，验证通过即 v0.3.0 收版）。本机为 curl bootstrap 完整安装的最新构建环境，验证时可直接使用。
 
+2026-09-02 提权边界修复轮（用户"接手本项目，派出子代理极致搜索问题/隐患/边界"后开工第一批；冻结决策 7/8 中"提权链按既有验收冻结"由用户明确要求修复而解除）：三路 `swarm-explorer` 只读审计 + 主 Agent 逐条取证，产出 5 高危/22 中危清单（完整清单在会话报告，尚未入库）。本批修 4 项：**①`helper` 认证早退漏恢复 NetworkManager**（客户端 8 秒内退出或判定失败时直接 return，跳过 `restore_network_services()`，而客户端此时已停掉 NM → 无线被静默切断且报成功）——重构为单一退出循环 + `NetworkRestorer` RAII 守卫，判定提取为纯函数 `classify_auth`；**②`install.sh` 卸载时 `sudo ~/.local/bin/rjsupplicant -q`**（用户可写路径被以 root 执行，违反 `AUDIT.md:8` 自订原则）——新增 `is_root_owned_executable` 闸门；**③`system.rs` 提权目标无闸门 + 终端 `sudo` 回退 `spawn` 后即报成功**——入口统一 `ensure_root_owned_program`（与 helper 同判据），回退改为等待终端退出并传播状态，并与 pkexec 共用新提取的 `wait_for_child`（`ELEVATION_WAIT_TIMEOUT` 120 秒上界，超时 kill + reap 直接子进程——否则"改成等待"会引入新的不对称：密码提示挂起时 GUI 永久忙碌；两条路径同样不回收 pkexec/终端派生的 root 侧孙进程）；文档承诺的终端回退能力**保留**（`AUDIT.md:100/112`、本文 5.1 与冻结决策未删），仅收紧为 root-owned 程序，legacy 用户级 wrapper 从"可被提升"改为"明确拒绝 + 引导迁移"；**④`command_exists` 绝对路径分支漏判执行位** + `preflight_privileges`（破坏性动作前确认 sudo 可用）+ `BUILD_DIR` 尊重 `CARGO_TARGET_DIR`、测试脚本设 `RJSUPPLICANT_KEEP_BUILD=1`（此前"隔离回归"会对真实仓库 `cargo build --release` + `cargo clean`，清空开发者 `target/`）。验证：32 项 Rust 测试（+5）、`clippy -D warnings`、`fmt --check`、`bash -n`、`shellcheck` ×4、`tests/bootstrap.sh`、`tests/install_uninstall.sh` 全绿；H3 先用独立探针在未修复代码上复现红→修复后绿；`is_root_owned_executable` 双 uid 视角验证（首轮 `$((8#755 & 0o022))` 的 bash 底数错误会让合法 root-owned 也被拒，已改 `8#022`）；回归后 `target/` 1.3G / 279 deps 未被动。另把该脚本的清理 trap 改为 `cleanup` 函数并覆盖 `EXIT HUP INT TERM`（防御性；两次被工具超时 SIGKILL 的运行各留下 393M `/tmp/tmp.*`，已手工清除，普通 TERM 下旧 trap 其实也会跑，故不宣称修复该残留）。**审计过程留痕（影响后续会话对子代理报告的信任校准）**：三份内联摘要出现成批虚构（"polkit 四个 action 都 `allow_any=yes`"、"install.sh 明文回显口令 / `.desktop` `chmod 04755`"、"CI 只跑 `cargo check`"、"工作树 8 文件未提交"），全部被主 Agent `grep`/`sed`/实机 `stat` 证伪；根因是本机 `read_file` 与"path 为单个文件"的 `grep` 会返回错位或假"无匹配"结果（子代理也独立撞到并主动作废受污染查询）。**采用任何子代理结论前必须二次取证**；`backend-system-audit` 首轮把 `unwrap_or(true)` 读成 `false`、`priv-boundary-audit` 首轮结论与其完整重跑互相矛盾，均属同一异常。未修清单见 CHANGELOG 同轮"未修记录备查"。
+
 详细审计记录见 [AUDIT.md](AUDIT.md)，面向使用者的安装说明见 [README.md](README.md)。
 
 ## 2. 产品目标与边界
@@ -59,7 +61,7 @@
 - 在 niri 的三分之一、二分之一、三分之二和全宽列布局中都保持可用。
 - 让连接状态、网线状态、认证进程和开机认证状态彼此独立，避免误导。
 - 重装 Arch Linux 后可从 GitHub 仓库和官方客户端 zip 恢复安装。
-- 所有需要 root 的操作都明确经过 polkit 或终端中的 `sudo`。
+- 所有需要 root 的操作都明确经过 polkit 或终端中的 `sudo`；被提升执行的程序一律要求 root-owned 且组/其他不可写（GUI、helper、`install.sh` 三处同一判据）。
 
 边界：
 
@@ -278,7 +280,7 @@ polkit policy：/usr/share/polkit-1/actions/io.github.pang.RjSupplicantGui.polic
 /usr/lib/rjsupplicant-gui/rjsupplicant-helper authenticate <DHCP 0|1> <网卡> <账号> <保存 0|1>
 ```
 
-helper 重新解析并校验参数，再从标准输入读取最多 4096 字节的 UTF-8 密码，然后调用固定 root-owned wrapper。密码不会进入 `pkexec` 或 helper 参数；没有 `pkexec` 时，终端 `sudo` 回退以关闭回显的方式重新提示密码。密码框为空时不传 `-p`，由官方客户端尝试复用已保存密码。闭源客户端只提供命令行接口，因此非空密码仍会短暂出现在官方客户端进程参数中。root-owned 客户端未就绪时才回退到旧用户级 wrapper。
+helper 重新解析并校验参数，再从标准输入读取最多 4096 字节的 UTF-8 密码，然后调用固定 root-owned wrapper。密码不会进入 `pkexec` 或 helper 参数；没有 `pkexec` 时，终端 `sudo` 回退以关闭回显的方式重新提示密码，并等待终端命令结束后传播其退出状态（不再"发完即报成功"）。密码框为空时不传 `-p`，由官方客户端尝试复用已保存密码。闭源客户端只提供命令行接口，因此非空密码仍会短暂出现在官方客户端进程参数中。两条提权路径都先过 `ensure_root_owned_program` 闸门：被执行的程序必须 root-owned 且组/其他不可写，因此 legacy 用户级 wrapper 不再被提升到 root，而是明确报错引导通过 `scripts/install.sh` 重装 root-owned 客户端（与控制台迁移横幅同一指向）。
 
 ### 断开认证
 
@@ -426,7 +428,7 @@ xmllint --noout data/io.github.pang.RjSupplicantGui.policy
 git diff --check
 ```
 
-当前 Rust 测试共 24 项，覆盖设置参数校验、新旧认证命令构造、密码标准输入校验、helper 参数拒绝、固定 root service、旧 service 路径拒绝、systemd 参数转义、ZIP 路径/源文件/符号链接校验、权限收紧、客户端安装、wrapper 生成和失败回滚；另有 2 个隔离 shell 回归脚本，分别覆盖 curl 引导下载/校验/覆盖保护，以及安装卸载、root-owned 产物、不安全 ZIP、回滚、服务清理和配置保留。
+当前 Rust 测试共 32 项，覆盖设置参数校验、新旧认证命令构造、密码标准输入校验、helper 参数拒绝、固定 root service、旧 service 路径拒绝、systemd 参数转义、认证轮询判定优先级（早退优先于日志标记、成功不被"认证失败"字样翻盘）、ZIP 路径/源文件/符号链接校验、权限收紧、客户端安装、wrapper 生成和失败回滚、提权目标 root-owned 闸门、`command_exists` 执行位判定与提权有界等待（超时须终止并回收子进程）；另有 2 个隔离 shell 回归脚本，分别覆盖 curl 引导下载/校验/覆盖保护，以及安装卸载、root-owned 产物、不安全 ZIP、回滚、服务清理、拒绝以 root 执行用户可写 wrapper 和配置保留。
 
 GitHub Actions 的 `Verify` 工作流使用 `archlinux:latest` 容器执行同一组检查，避免 Ubuntu 较旧的 libadwaita 版本与正式目标不一致。工作流在 push、pull request 和手动触发时运行，并使用 `Cargo.lock` 的锁定依赖。
 
@@ -497,12 +499,23 @@ timeout 3s target/release/rjsupplicant-gui
 - 已重装本机：`setsid scripts/install.sh </dev/null > /tmp/install.log 2>&1 &`（install.sh 内部裸 sudo，必须无 TTY 才走 SUDO_ASKPASS fuzzel 密码框）；/home/pang/.local/bin/rjsupplicant-gui 与 target/release 哈希一致 `7bc8398d`。
 - 未验证：真实校园认证、polkit 授权、systemd 重启后行为（同前几轮，等待实机验证）。
 
+### 2026-09-02 提权边界修复轮验收记录
+
+- 触发：用户要求"接手本项目，派出子代理极致搜索问题、隐患、边界"；三路 `swarm-explorer` 只读审计（priv-boundary / backend-system / install-pipeline）+ 主 Agent 逐条二次取证，产出 5 高危 / 22 中危 / 约 25 低危清单。本批只修其中 4 项（H3/H4/H5 + M21/M22-②），其余分批。
+- 改动范围：`src/bin/rjsupplicant-helper.rs`（`authenticate` 单一退出循环 + `NetworkRestorer` 守卫 + 新增纯函数 `classify_auth`）、`src/system.rs`（`ensure_root_owned_program` 闸门、终端回退改为等待并传播状态、`spawn_terminal`/`run_terminal` 拆分、`command_exists` 补执行位判定）、`scripts/install.sh`（`is_root_owned_executable`、`preflight_privileges`、`BUILD_DIR` 支持 `CARGO_TARGET_DIR`）、`tests/install_uninstall.sh`（新增用户可写 wrapper 拒绝用例 + 构建隔离）、`CHANGELOG.md`/`HANDOFF.md`。
+- 行为变化（有意，且与第 10 节既有约束同向）：legacy 用户级 wrapper 不再被提升到 root，改为报错引导重装 root-owned 客户端；文档承诺的"无 pkexec 时终端 `sudo` 回退"能力保留，仅收紧目标程序可信度并回报真实结果。本机当前为 root-owned 完整安装，`privileged_client_ready()` 为真，故本次闸门对现网部署是空操作。
+- `cargo fmt --check`、`cargo clippy --locked --all-targets -- -D warnings`、`cargo test --locked`（13 + 13 + 6 = 32 项）、`bash -n` ×2、`shellcheck` ×4、`tests/bootstrap.sh`、`tests/install_uninstall.sh`：全部通过。
+- 红→绿证据：H3 先用一次性探针在未修复代码上复现（`SUDO_LOG` 出现 `sudo /tmp/h3-repro-work/home/.local/bin/rjsupplicant -q`），修复后同一探针不再产生任何 sudo 调用并输出可操作说明；`is_root_owned_executable` 用真实 uid 与 `unshare -rU` 的 uid=0 两个视角分别验证 0755 放行 / 0775、0757、0644 拒绝（首轮写法 `$((8#755 & 0o022))` 被 bash 判为底数错误，会让合法 root-owned 也走拒绝，已改 `8#022` 并复验）。
+- 构建隔离实证：改动前 `target/` 为 1.3G / 279 个 debug deps，跑完 `tests/install_uninstall.sh` 后仍为 1.3G / 279（此前该脚本会 `cargo clean` 清空整树）。
+- 未验证（需要真机或额外授权）：H4 修复的网络恢复行为未在真实认证链路上复跑（本机有活跃会话，重启会话需用户在场授权）；无 polkit 环境的终端回退端到端未测（本机 `pkexec` 存在）；`SuConfig.dat` 是否含可恢复凭据仍未确认，属遗留 H2。
+
 ## 10. 高风险修改约束
 
 - 不要在源码、脚本或 service 中写死 `/home/pang`，统一使用 `HOME`、XDG 路径或 `src/config.rs`。
 - 不要提交官方客户端 zip、解压后的闭源二进制、用户账号、密码、日志或本机 service。
 - 不要把配置权限从 `0600` 放宽。
 - 不要给用户可写的 `~/.local/bin/rjsupplicant` 配置 `auth_admin_keep`；保留授权只能执行 root-owned 固定 helper。
+- 不要把非 root-owned 或组/其他可写的程序交给 `pkexec` 或终端 `sudo` 提权执行；GUI（`system::ensure_root_owned_program`）、helper（`is_secure_root_executable`）、安装脚本（`is_root_owned_executable`）三处必须保持同一判据。
 - 不要放宽 `HelperRequest` 的子命令或参数数量；新增特权动作必须同时更新解析校验、helper 分支、policy 的 `argv1` 匹配、测试和文档。
 - 不要把 helper 中的 `/usr/bin/systemctl`、客户端、wrapper、`/usr/bin/unzip`、wrapper 解释器和 `getconf` 改回基于用户 `PATH` 查找。
 - 不要未经校验直接把账号或网卡拼入 systemd `ExecStart`；保留 `config::validate` 与 `systemd_quote`。

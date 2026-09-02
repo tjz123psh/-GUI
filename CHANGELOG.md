@@ -2,6 +2,18 @@
 
 ## Unreleased - 2026-09-02
 
+### 提权边界与认证清理修复轮（三路并行深度审计后开工）
+
+- **认证早退漏恢复网络（真实隐患）**：`rjsupplicant-helper` 的 `authenticate` 原先在客户端 8 秒内退出（网线未插、认证服务器不通、崩溃）或判定失败时直接 `return`，**跳过 `restore_network_services()`**，而客户端此时已按自身设计停掉了 NetworkManager——用户会同时收到"成功/已报告"的反馈和本机无线被静默切断的后果。重构为单一退出循环 + `NetworkRestorer` RAII 守卫（与既有 `TerminalEchoGuard` 同模式），8 秒 DHCP 注入节点保留显式恢复；判定逻辑提取为纯函数 `classify_auth`（优先级：进程已退出 > 认证成功 > 失败标记，后者避免官方提示里的"认证失败"字样把真实成功翻成失败）。
+- **卸载不再以 root 执行用户可写文件**：`scripts/install.sh` 的 `disconnect_running_client` 原先在无 root-owned 客户端时直接 `sudo ~/.local/bin/rjsupplicant -q`——该路径归普通用户所有，任何能写家目录的进程替换它即可借一次卸载拿到 root，与 `AUDIT.md` 自订的"不把提权授权授予用户可写 wrapper"原则矛盾。新增 `is_root_owned_executable` 闸门：非 root-owned 或组/其他可写即拒绝并给出可操作说明。
+- **提权目标统一闸门**：`system::run_elevated_wait_with_input` 入口新增 `ensure_root_owned_program`，pkexec 与终端 `sudo` 两条路径都只接受 root-owned 且他人不可写的程序（与 helper 侧 `is_secure_root_executable` 同一判据）。行为变化：legacy 用户级 wrapper 不再被提升到 root，改为明确报错引导重装 root-owned 客户端（迁移横幅早已指向同一动作）。
+- **终端回退不再谎报成功（行为兼容性修复）**：无 polkit 时的 `sudo` 终端回退原先 `spawn()` 后即返回 `Ok(())`，拿不到退出码与 stderr，任何失败都显示为完成。改为等待终端进程结束（kitty/foot/alacritty/xterm 均在被指挥命令退出后才关闭）并传播非零状态；`run_terminal` 拆为 `spawn_terminal` + `run_terminal`，`journalctl -f` 等不等待用法行为不变。等待与 pkexec 共用新提取的 `wait_for_child`（同一 `ELEVATION_WAIT_TIMEOUT` = 120 秒上界，超时 kill + reap 直接子进程并报错）——否则"改为等待"会引入新的不对称：密码提示挂起时 GUI 永久忙碌。已知限制（两条路径相同）：`kill` 只作用于 pkexec/终端模拟器本身，其派生的 root 侧进程不被回收。
+- **`command_exists` 绝对路径分支补执行位判定**：原先只 `Path::exists()`，目录或无 x 位的 `/usr/bin/pkexec` 会被当成"可用"，绕过上面的显式失败。现与 PATH 查找分支共用 `is_executable_file`。
+- **安装脚本前置权限检查与构建隔离**：`preflight_privileges` 在任何破坏性动作（`rm -f target/release/*`、`cargo build`）之前确认 `sudo` 可用；生成物路径改为尊重 `CARGO_TARGET_DIR`（`BUILD_DIR`），`tests/install_uninstall.sh` 据此在临时目录内构建并设 `RJSUPPLICANT_KEEP_BUILD=1`——此前该"隔离回归"测试会对真实仓库执行 `cargo build --release` + `cargo clean`，清空开发者或并行 Agent 的 `target/`。
+- **回归测试清理 trap 加固（防御性）**：`tests/install_uninstall.sh` 的 `trap 'rm -rf "${TMP_DIR}"' EXIT` 改为统一 `cleanup` 函数并覆盖 `EXIT HUP INT TERM`。诚实限定：观察到两次被工具超时终止的运行在 `/tmp` 各留下 393M 临时树，但最小复现表明普通 SIGTERM 下旧的 EXIT trap 也会执行，真实成因是宽限期后的 SIGKILL（任何 trap 都拦不住）；本改动只对"只收到 TERM/INT 的父进程"这一类场景有效，不宣称修复已观察到的残留。已手工清掉那 786M。
+- 验证：32 项 Rust 测试（新增 `classify_auth` 两条、提权闸门两条、`command_exists` 执行位一条、提权有界等待一条）、`clippy --all-targets -D warnings`、`cargo fmt --check`、`bash -n`、`shellcheck`（四个脚本）、`tests/bootstrap.sh`、`tests/install_uninstall.sh` 全绿。H3 缺陷先用独立探针在**未修复代码**上复现（`sudo /tmp/.../home/.local/bin/rjsupplicant -q` 确被派发）后再修复复验；`is_root_owned_executable` 在真实 uid 与 `unshare -r` 的 uid=0 两个视角下分别验证拒绝/放行用例（首轮发现的 `$((8#755 & 0o022))` bash 底数错误已修正为 `8#022`，该 bug 会让合法 root-owned wrapper 也被拒绝）。回归后确认仓库 `target/`（1.3G / 279 个 debug deps）未被清空。
+- 未修记录备查（本批未开工）：helper 超时/失败不 kill 不 reap、`log_offset` 不前进与 `run.log` 永不轮转、无单实例锁、`ClientExited`/超时仍返回 `Ok(())`（假成功）、root 客户端目录 0755 与运行时凭据落盘、UI 状态与渲染批次。
+
 ### 重启失联事故修复轮（快照恢复前取证，三个子代理并行深度审计）
 
 - **开机自启 service 单元 Type 修复（真实隐患）**：实测官方客户端认证时保持前台运行（多轮实机实证 PPID 不脱离），原 unit 的 `Type=forking + GuessMainPID=yes` 一旦真正启用必在 `TimeoutStartSec=30` 超时失败、`ExecStartPost`（恢复 NM）永不执行，重启后必然断网。改为 `Type=simple`：客户端即服务主进程、持有会话；`ExecStop` 的 `-q` 正常断连；崩溃时 `Restart=on-failure` 拉起；验证器与测试同步。

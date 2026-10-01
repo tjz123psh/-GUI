@@ -4,7 +4,7 @@
 - 当前版本：0.3.0（实机联调修复轮、重启失联事故修复轮、**2026-10-01 会话保持识别与开机认证跳过轮**均已完成）
 - 项目状态：后端与提权链功能冻结（提权边界与状态可信度三轮修复已解除其中被用户明确要求修改的条目）；前端皮肤完成；**2026-09-01 校园有线网实机联调**与 **2026-09-02 重启事故修复轮**已完成；手动认证实测成功；**提权边界轮 / 并发与资源轮 / 状态可信度与渲染资源轮 + 两轮 CI 修复已完成、已提交推送本机已部署，GitHub Actions 全绿**；等待用户最终手动确认错误密码、polkit 交互与开机自启（含修复后的 Type=simple 单元），以及 README「已知安全边界」两项是否进一步处置
 - 最终验收代码基线：`9ff5645`
-- 当前代码基线：`36d1dac`（上一次推送基线，GitHub Actions 全绿）；2026-10-01 会话保持识别与开机认证跳过轮的改动见 3.4 节，本地提交待推送。
+- 当前代码基线：`36d1dac`（上一次推送基线，GitHub Actions 全绿）；2026-10-01 会话保持识别与开机认证跳过轮的改动见 3.4 节，同日探测环境一致性轮见 3.5 节，本地提交待推送。
 - 主分支：`main`，本地领先 `origin/main`（本轮改动已提交、未推送）
 - 远端：`git@github.com:tjz123psh/-GUI.git`
 
@@ -183,6 +183,15 @@
 4. **认证入口**：GUI 与 helper 在认证前检查 `carrier`（明确无网线时直接报错，实测 3 次崩溃发生在该状态）；helper 在客户端退出后用同一探测判定——有线路径确实可用时按成功返回（旧的"客户端退出=失败"会把 16:52 这类真·已联网判成失败）。
 
 实机验证：helper 重装后 `should-authenticate eno1` 在会话保持时输出"已可访问外网（认证会话保持），跳过开机认证"并 exit 1；`enable-service` 迁移 → restart → journal `Skipped due to 'exec-condition'`、单元 `enabled + inactive`、NetworkManager 全程未被停、无新 coredump；GUI 已用新二进制重启（窗口正常、stderr 空）。**未验证**：冷启动（真重启）时的跳过与认证路径、无网线时的拦截提示，属 §13 清单。
+
+## 3.5 探测环境一致性轮（2026-10-01 同日，蜂群并行）
+
+用户要求把「正常情况、系统代理、TUN 模型与其它环境」全部考虑进去，用户体验一致。两个并行子代理（netcheck-hardening、ui-log-clarity）+ 主代理整合与实机验证：
+
+1. **netcheck 加固**（`src/netcheck.rs`，API 不变）：curl 首参 `--disable` 防 `~/.curlrc` 劫持、六种代理变量清除 + `NO_PROXY=*` 钉死、只从绝对目录找工具、curl/ping 都缺失时 libc `SO_BINDTODEVICE` TCP 兜底（EPERM → `None`）、网卡名白名单校验。真机冒烟入口：`cargo test --lib -- --ignored --nocapture probe`（`RJ_NETCHECK_NIC` 覆盖网卡）。
+2. **日志预览去噪**（`src/ui.rs`）：客户端日志优先（≤4 行）；客户端为空才回退清洗后的 journal 摘要，界面不再出现 `systemd[1]:` 字样。
+3. **单窗口**：`activate` 只 `present()` 既有窗口，不再叠出第二窗口/第二条轮询。
+4. **实机证据**：默认 / 伪造代理 / 恶意 curlrc 三环境探测均 `Some(true)`（同环境裸 curl exit 7 对照）；FlClash 停止（TUN 设备消失）后三路探测仍全 `true`，恢复后原状复原；GUI OCR 文字层确认「已连接 + 会话保持 + 客户端日志预览」；新 GUI 哈希 `39a11a23`。新版 helper 已重装（哈希 `2b23e78e`）：干净与伪造代理两种 root 环境下 `should-authenticate eno1` 均 exit 1（跳过），`systemctl start` → `Result=exec-condition`、NM 未被停、无新 coredump。
 
 ## 4. 技术栈与仓库结构
 

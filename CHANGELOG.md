@@ -13,6 +13,16 @@
 - 判定标记收拢到 `privileged::{AUTH_SUCCESS_MARKER, AUTH_FAILURE_MARKERS, AUTH_HISTORY_FAILURE_MARKERS}`，helper 轮询与 GUI 历史解析同源。
 - 验证：51 项 Rust 测试（+7）、`clippy --all-targets -D warnings`、`fmt --check`、`cargo build --release`、`systemd-analyze verify` 全绿；已部署本机（GUI/helper 哈希与构建产物一致）。**实机验证**：本机 `enable-service`（迁移）→ restart → 17:11:12 日志 `eno1 已可访问外网（认证会话保持），跳过开机认证` + `Skipped due to 'exec-condition'`，单元 `enabled + inactive`（非 failed），NetworkManager 全程未被停、无新 coredump；`should-authenticate eno1` 在会话保持时退出码 1。未验证（需真机重启或断网条件）：冷启动时的跳过/认证路径、无网线时的拦截提示。
 
+### 探测环境一致性加固与界面收尾轮（蜂群并行：两个子代理 + 主代理整合）
+
+用户要求「无论是正常情况、系统代理、TUN 模型，亦或是其他东西都考虑进去，用户体验不会有区别」。上一轮探测在 FlClash TUN 下已可用，但"环境不可信"的输入面未系统加固：
+
+- **探测加固**（`src/netcheck.rs`，GUI/helper 共用，公开 API 与语义不变）：① `curl` 首参 `--disable`——实机对照：`~/.curlrc` 里 `proxy = "http://127.0.0.1:1"` 能把裸 curl 劫持成 exit 7，加固后同环境探测不受影响；② 子进程清除 `http_proxy/https_proxy/all_proxy` 大小写两套并钉死 `NO_PROXY=no_proxy=*`（`--noproxy '*'` 之外的纵深）；③ 探测工具只从 `/usr/bin`、`/bin`、`/usr/local/bin` 绝对候选查找，不信任 PATH；④ curl、ping 都缺失时新增 libc 兜底（`SO_BINDTODEVICE` + 非阻塞 `connect` + `poll` 2s + `SO_ERROR`；无权限绑设备返回 `None` 保留"无法判断"语义，fd 由 RAII 关闭）；⑤ 网卡名白名单校验（拒 `/`、`..`、NUL、≥IFNAMSIZ），封死 `/sys/class/net/../..` 一类拼接逃逸；⑥ 新增 6 个单测与 1 个 `#[ignore]` 真机冒烟（`RJ_NETCHECK_NIC` 可换网卡，CI 不跑）。
+- **日志预览去噪**（`src/ui.rs`）：预览优先官方客户端日志最近 ≤4 行；客户端日志为空才回退清洗后的 journal 摘要（剥 `[pid]:` 行首样板、只认纯数字 PID 以免误伤 `[ERR]:`、正文残留兜底删除）；两段都空显示「暂无日志」。新增 10 个纯函数单测，覆盖四种分段形态与行数上限。
+- **单窗口修复**（`src/ui.rs::activate`）：应用已运行时再次启动会经会话总线重发 activate，原先每次都会 `build_window` 叠出第二个窗口和第二条 10s 轮询；现在只 `present()` 既有窗口。实测：重启后二次启动 = 进程 1、窗口 1。
+- **验证（实机复核）**：默认 / 伪造代理变量（指向死端口）/ 伪造代理 + 恶意 `~/.curlrc` 三种环境下 `wired_path_reachable("eno1") = Some(true)`，同环境裸 curl 对照 exit 7；短暂停止 FlClash（TUN 设备消失）后 curl/ICMP/libc 三路探测全部 `true`，恢复后 TUN 与原状复原；GUI 界面 OCR 文字层确认大状态「已连接」+ 副行含「会话保持」+ 日志预览为客户端时间戳行。门禁：67 项测试 + 1 ignored 真机冒烟、`clippy --all-targets -D warnings`、`fmt --check`、release 构建、`git diff --check` 全绿；GUI 部署哈希 `39a11a23`（与构建产物一致）。
+- **helper 重装与特权侧复核**：新版 helper（哈希 `2b23e78e`，含加固探测）已重装；干净 root 环境与伪造代理变量环境（`HTTP_PROXY/HTTPS_PROXY/ALL_PROXY=http://127.0.0.1:1`）下 `should-authenticate eno1` 均输出"已可访问外网（认证会话保持），跳过开机认证"并 exit 1；`systemctl start rjsupplicant.service` → `Result=exec-condition`、单元 inactive、NetworkManager 未被停、无新 coredump。未验证（仍属 §13 清单）：冷启动跳过、无网线拦截。
+
 ## Unreleased - 2026-09-02
 
 ## Unreleased - 2026-09-02

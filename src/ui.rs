@@ -301,6 +301,17 @@ fn form_line(png: &[u8], label: &str, child: &impl IsA<gtk::Widget>) -> gtk::Box
 }
 
 pub fn activate(app: &adw::Application) {
+    // 应用已在运行时再次启动（点击图标、从终端拉起）会让 GApplication 重发
+    // activate；若无条件 build_window，同一进程会叠出第二个窗口和第二条轮询
+    // 定时器。这里只呈现既有窗口，保持单窗口语义。
+    if let Some(existing) = app
+        .windows()
+        .into_iter()
+        .find_map(|window| window.downcast::<adw::ApplicationWindow>().ok())
+    {
+        existing.present();
+        return;
+    }
     let ui = build_window(app);
     refresh_status(&ui);
     ui.window.present();
@@ -1475,6 +1486,98 @@ fn log_auth_text(record: Option<&(String, bool, String)>) -> (String, &'static s
     }
 }
 
+/// 「日志」预览最多显示的行数。
+const LOG_PREVIEW_LINES: usize = 4;
+/// `system.rs` 拼接日志用的分段标题（拼接格式是契约，这里只解析，不改动）。
+const LOG_CLIENT_HEADER: &str = "官方客户端日志";
+const LOG_JOURNAL_HEADER: &str = "systemd 日志";
+
+fn non_empty_trimmed(text: &str) -> Option<&str> {
+    let trimmed = text.trim();
+    (!trimmed.is_empty()).then_some(trimmed)
+}
+
+/// 按 `system.rs` 的拼接格式切出（客户端段, journal 段）。
+/// 两段都有时带标题；只有单一来源时不带标题，此时整段当作客户端段返回，
+/// 逐行清洗对两种来源都安全。
+fn split_log_sections(text: &str) -> (Option<&str>, Option<&str>) {
+    if let Some(pos) = text.find(LOG_CLIENT_HEADER) {
+        let rest = &text[pos + LOG_CLIENT_HEADER.len()..];
+        match rest.find(LOG_JOURNAL_HEADER) {
+            Some(jpos) => (
+                non_empty_trimmed(&rest[..jpos]),
+                non_empty_trimmed(&rest[jpos + LOG_JOURNAL_HEADER.len()..]),
+            ),
+            None => (non_empty_trimmed(rest), None),
+        }
+    } else if let Some(pos) = text.find(LOG_JOURNAL_HEADER) {
+        // 防御性分支：当前 system.rs 不会只拼 journal 标题。
+        (
+            None,
+            non_empty_trimmed(&text[pos + LOG_JOURNAL_HEADER.len()..]),
+        )
+    } else {
+        (non_empty_trimmed(text), None)
+    }
+}
+
+/// 清洗一行日志：剥掉 journalctl short 格式的行首样板
+/// （`10月 01 16:49:46 主机 systemd[1]: `），只留消息正文。
+/// 前缀要求 `[` 与 `]:` 之间是纯数字 PID，避免误伤客户端日志里的 `[ERR]:`
+/// 之类标记；空白行丢弃。
+fn clean_log_line(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let body = match trimmed.find("]:") {
+        Some(idx) => match trimmed[..idx].rfind('[') {
+            Some(open)
+                if !trimmed[open + 1..idx].is_empty()
+                    && trimmed[open + 1..idx].bytes().all(|b| b.is_ascii_digit()) =>
+            {
+                trimmed[idx + 2..].trim_start_matches([' ', ':'])
+            }
+            // 不是 journal 前缀：客户端日志自带的时间戳不算样板，原样保留。
+            _ => trimmed,
+        },
+        None => trimmed,
+    };
+    // 兜底：消息正文里若还嵌着 `systemd[1]:`，预览里也绝不能出现。
+    let body = body.replace("systemd[1]:", "");
+    let body = body.trim();
+    if body.is_empty() {
+        None
+    } else {
+        Some(body.to_string())
+    }
+}
+
+/// 清洗后取最近 `max` 行；一行都不剩返回 `None`。
+fn cleaned_log_tail(text: &str, max: usize) -> Option<String> {
+    let lines = text.lines().filter_map(clean_log_line).collect::<Vec<_>>();
+    if lines.is_empty() {
+        return None;
+    }
+    Some(lines[lines.len().saturating_sub(max)..].join("\n"))
+}
+
+/// 「日志」区块预览：优先官方客户端日志最近几行（信息密度高）；客户端日志
+/// 为空时退回清洗掉 journal 样板的摘要；两段都空显示「暂无日志」。
+/// 输出保证不超过 `LOG_PREVIEW_LINES` 行、不含 `systemd[1]:` 字样。
+fn log_preview(text: &str) -> String {
+    // system.rs 在两段都空时给的是「暂无日志。」，与本函数自己的占位统一。
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed == "暂无日志" || trimmed == "暂无日志。" {
+        return "暂无日志".to_string();
+    }
+    let (client, journal) = split_log_sections(trimmed);
+    client
+        .and_then(|section| cleaned_log_tail(section, LOG_PREVIEW_LINES))
+        .or_else(|| journal.and_then(|section| cleaned_log_tail(section, LOG_PREVIEW_LINES)))
+        .unwrap_or_else(|| "暂无日志".to_string())
+}
+
 /// 打开官方客户端安装包选择器并执行安装（安装按钮与迁移横幅共用）。
 fn open_install_dialog(ui: &Ui) {
     let dialog = gtk::FileDialog::builder()
@@ -1805,22 +1908,8 @@ fn refresh_status(ui: &Ui) {
                 ("网卡 无网线".to_string(), "dot-warn")
             };
 
-            // 预览区：最多显示最近 4 行日志
-            let preview = if status.last_log.is_empty() {
-                "暂无日志".to_string()
-            } else {
-                status
-                    .last_log
-                    .trim()
-                    .lines()
-                    .rev()
-                    .take(4)
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .rev()
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            };
+            // 预览区：优先客户端日志、回退清洗后的 journal 摘要；最多 4 行
+            let preview = log_preview(&status.last_log);
 
             // 连接状态 / 副行（网卡 · 时长）
             let wifi_radio_enabled = status.wifi_radio_enabled;
@@ -1983,4 +2072,136 @@ fn refresh_status(ui: &Ui) {
         }
         ui_done.refreshing.store(false, Ordering::Relaxed);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 官方客户端日志：`YYYY-MM-DD HH:MM:SS 正文`，最多取最近 4 行。
+    const CLIENT_LOG: &str = "2026-10-01 14:00:00 开始认证\n\
+        2026-10-01 14:00:01 发现接入设备\n\
+        2026-10-01 14:00:02 认证成功\n\
+        2026-10-01 14:00:03 获取到 IP 10.20.30.40\n\
+        2026-10-01 14:00:10 心跳正常";
+    /// journalctl -u 的真实 short 格式（无 TTY 时不带颜色）。
+    const JOURNAL_LOG: &str = "10月 01 16:49:46 archlinux systemd[1]: Starting RJSchoolClient...\n\
+        10月 01 16:49:46 archlinux systemd[1]: Started RJSchoolClient.\n\
+        10月 01 16:49:47 archlinux rjsupplicant-helper[151664]: eno1 已可访问外网（认证会话保持），跳过开机认证";
+
+    #[test]
+    fn preview_prefers_client_section_over_journal() {
+        let text = format!("官方客户端日志\n{CLIENT_LOG}\n\nsystemd 日志\n{JOURNAL_LOG}");
+
+        let preview = log_preview(&text);
+
+        assert_eq!(
+            preview,
+            "2026-10-01 14:00:01 发现接入设备\n\
+             2026-10-01 14:00:02 认证成功\n\
+             2026-10-01 14:00:03 获取到 IP 10.20.30.40\n\
+             2026-10-01 14:00:10 心跳正常"
+        );
+        assert!(!preview.contains("systemd[1]:"));
+        assert!(preview.lines().count() <= 4);
+    }
+
+    #[test]
+    fn preview_cleans_journal_when_client_log_missing() {
+        // 客户端日志为空时 system.rs 直接返回 journal 原文（无标题）。
+        let preview = log_preview(JOURNAL_LOG);
+
+        assert_eq!(
+            preview,
+            "Starting RJSchoolClient...\n\
+             Started RJSchoolClient.\n\
+             eno1 已可访问外网（认证会话保持），跳过开机认证"
+        );
+        assert!(!preview.contains("systemd[1]:"));
+        assert!(preview.lines().count() <= 4);
+    }
+
+    #[test]
+    fn preview_falls_back_to_journal_when_client_section_is_blank() {
+        let text = format!("官方客户端日志\n \n\nsystemd 日志\n{JOURNAL_LOG}");
+
+        let preview = log_preview(&text);
+
+        assert!(!preview.contains("systemd[1]:"));
+        assert!(preview.contains("eno1 已可访问外网"));
+    }
+
+    #[test]
+    fn preview_does_not_pad_short_client_section_with_journal() {
+        let client = "2026-10-01 14:00:02 认证成功\n2026-10-01 14:00:10 心跳正常";
+        let text = format!("官方客户端日志\n{client}\n\nsystemd 日志\n{JOURNAL_LOG}");
+
+        assert_eq!(log_preview(&text), client);
+    }
+
+    #[test]
+    fn preview_handles_journal_section_with_header() {
+        let text = format!("systemd 日志\n{JOURNAL_LOG}");
+
+        let preview = log_preview(&text);
+
+        assert!(!preview.contains("systemd[1]:"));
+        assert!(preview.contains("eno1 已可访问外网"));
+    }
+
+    #[test]
+    fn preview_keeps_recent_client_lines_when_only_client_log_exists() {
+        let preview = log_preview(CLIENT_LOG);
+
+        assert_eq!(
+            preview,
+            "2026-10-01 14:00:01 发现接入设备\n\
+             2026-10-01 14:00:02 认证成功\n\
+             2026-10-01 14:00:03 获取到 IP 10.20.30.40\n\
+             2026-10-01 14:00:10 心跳正常"
+        );
+        assert!(preview.lines().count() <= 4);
+    }
+
+    #[test]
+    fn preview_keeps_client_level_tags_intact() {
+        // `[ERR]` 不是 PID，不能被当成 journal 前缀剥掉。
+        let text = "2026-10-01 14:00:00 [ERR]: 认证失败";
+
+        assert_eq!(log_preview(text), text);
+    }
+
+    #[test]
+    fn preview_falls_back_to_placeholder_when_logs_empty() {
+        for text in [
+            "",
+            "   \n",
+            "暂无日志。",
+            "官方客户端日志\n\n\nsystemd 日志\n",
+        ] {
+            assert_eq!(log_preview(text), "暂无日志", "输入: {text:?}");
+        }
+    }
+
+    #[test]
+    fn preview_keeps_at_most_four_cleaned_lines() {
+        let journal = (1..=6)
+            .map(|i| format!("10月 01 16:49:4{i} archlinux rjsupplicant-helper[15{i}]: 第 {i} 条"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let preview = log_preview(&journal);
+
+        assert_eq!(preview, "第 3 条\n第 4 条\n第 5 条\n第 6 条");
+    }
+
+    #[test]
+    fn preview_never_exposes_embedded_unit_boilerplate() {
+        let text = "10月 01 16:49:46 archlinux systemd[1]: 见 systemd[1]: Failed to start 客户端";
+
+        let preview = log_preview(text);
+
+        assert!(!preview.contains("systemd[1]:"));
+        assert!(preview.contains("Failed to start 客户端"));
+    }
 }

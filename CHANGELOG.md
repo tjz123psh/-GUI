@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased - 2026-10-01
+
+### 会话保持识别与开机认证跳过轮（实机事故：显示「未连接」但网络可用）
+
+- **事故与实证**：客户端在认证已成功、网关会话仍保持时也会 SIGSEGV（崩溃点 `get_nics_info`，约启动后 3 秒的控制线程节拍与接口表变动竞争；当天 12 次崩溃中 9 次 eno1 持有有效地址且 NM 正在运行，另有 3 次发生在无网线窗口）。这次 boot 的三次 systemd 启动全部发生在网络已经可用之后（16:48:58.64 DHCP 成功、16:48:58.79 建立默认路由、16:49:02 NM 判定 `CONNECTED_GLOBAL`；16:49:10 / 16:49:28 两次重启晚 11.7s / 29.7s），最终 `start-limit-hit`。GUI 只按"客户端进程是否在运行"判断，于是把会话保持显示成「未连接 / 服务 异常」。
+- **新增共用探测 `src/netcheck.rs`**：绑定指定网卡（SO_BINDTODEVICE）、`--noproxy`、字面 IPv4（223.5.5.5，先 HTTP 后 ICMP 兜底）回答"这条有线路径现在能不能用"。必须这样做是本机实测结论：FlClash（TUN + fake-IP DNS）会把任何域名解析到 198.18.0.0/15 并接管，不绑定网卡、不用字面 IP 就测不出有线路径本身；`carrier` 明确为 0 时直接判不可用、不发探测。
+- **GUI 状态可信度**：`未连接` 只在"客户端没运行且探测不可达"时出现；探测确认可用时显示「已连接」，副行与连接状态标注「会话保持」。服务胶囊由三态改四态（运行中 / 启动中 / 已停止重试 / 待命 / 未启用），`inactive`（含 ExecCondition 跳过）不再误报为"服务 异常"。`最近认证` 在会话内无记录时回退解析 `run.log` 的最近一条**终局判定**（行首匹配；`网线没有连接上` 是重试提示不算结果——实测 10 次出现全部随后继续认证；`无法获取动态IP地址` 是终局失败，保留）。
+- **开机认证跳过（unit 模板迁移）**：unit 新增 `ExecCondition="<helper>" should-authenticate "<网卡>"`——已联网（会话保持）或网线未连接时以退出码 1 跳过本次启动，systemd 视为成功、不触发 Restart（语义经 systemd 262 `systemd.service(5)` 确认，并用 `systemd-analyze verify` 验过）。重试上限同时放宽为 5 次 / 300 秒、`RestartSec=15`，避免开机阶段 40 秒内就把单元打进 failed。旧模板仍通过安全校验（保持可禁用/可重启，避免"想迁移却关不掉"的死锁），GUI 用单独横幅提示重新开启一次完成迁移。
+- **认证前网线检查**：GUI 与 helper 在发起认证前读 `/sys/class/net/<网卡>/carrier`，明确无网线时直接报错（实测 3 次崩溃发生在该状态），不再白跑一次提权与客户端。
+- **helper 认证收尾用探测判定**：客户端已退出时不再一律报失败——有线路径探测确认可用（认证已生效、客户端崩溃前没来得及写日志；16:52:31 的用户连接即此情形）时按成功返回；探测不可达仍报"认证未完成"，不制造假成功。
+- 判定标记收拢到 `privileged::{AUTH_SUCCESS_MARKER, AUTH_FAILURE_MARKERS, AUTH_HISTORY_FAILURE_MARKERS}`，helper 轮询与 GUI 历史解析同源。
+- 验证：51 项 Rust 测试（+7）、`clippy --all-targets -D warnings`、`fmt --check`、`cargo build --release`、`systemd-analyze verify` 全绿；已部署本机（GUI/helper 哈希与构建产物一致）。**实机验证**：本机 `enable-service`（迁移）→ restart → 17:11:12 日志 `eno1 已可访问外网（认证会话保持），跳过开机认证` + `Skipped due to 'exec-condition'`，单元 `enabled + inactive`（非 failed），NetworkManager 全程未被停、无新 coredump；`should-authenticate eno1` 在会话保持时退出码 1。未验证（需真机重启或断网条件）：冷启动时的跳过/认证路径、无网线时的拦截提示。
+
 ## Unreleased - 2026-09-02
 
 ## Unreleased - 2026-09-02

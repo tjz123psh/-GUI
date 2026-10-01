@@ -18,6 +18,7 @@ use futures_util::StreamExt;
 use gtk4 as gtk;
 use gtk4::glib;
 use libadwaita as adw;
+use rjsupplicant_gui::netcheck;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -38,6 +39,15 @@ struct LastAuth {
     /// 用单调钟：SystemTime 会被用户改系统时间或 NTP 步进影响，回拨时
     /// "X 分钟前"会退回"刚刚"甚至错误。
     at: std::time::Instant,
+}
+
+/// 迁移/失败横幅的按钮动作：点击时按当前状态分派，避免把不同状态
+/// 都接到安装对话框上。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BannerAction {
+    None,
+    InstallClient,
+    RestartService,
 }
 
 /// 窗口内需要被多个回调共享的最小状态集。
@@ -67,6 +77,8 @@ struct Ui {
     detail_last: gtk::Label,
     /// 会话内最近一次认证结果（连接成功/失败时更新）。
     last_auth: Arc<std::sync::Mutex<Option<LastAuth>>>,
+    /// 横幅按钮当前应执行的动作（安装迁移 / 重新尝试服务）。
+    banner_action: Arc<std::sync::Mutex<BannerAction>>,
     nic: gtk::DropDown,
     nic_model: gtk::StringList,
     username: gtk::Entry,
@@ -698,6 +710,7 @@ fn build_window(app: &adw::Application) -> Ui {
         detail_state,
         detail_last,
         last_auth: Arc::new(std::sync::Mutex::new(None)),
+        banner_action: Arc::new(std::sync::Mutex::new(BannerAction::None)),
         banner,
         busy: Arc::new(AtomicBool::new(false)),
         refreshing: Arc::new(AtomicBool::new(false)),
@@ -1418,7 +1431,7 @@ where
 }
 
 /// 把会话内最近认证记录格式化为（文本, 语义色）：成功绿 / 失败红 / 无记录中性色。
-fn last_auth_text(last: &Option<LastAuth>) -> (String, &'static str) {
+fn last_auth_text(last: Option<&LastAuth>) -> (String, &'static str) {
     use std::time::Duration;
     let Some(record) = last else {
         return ("暂无记录".to_string(), "#6E5568");
@@ -1436,6 +1449,29 @@ fn last_auth_text(last: &Option<LastAuth>) -> (String, &'static str) {
     } else {
         let summary: String = record.summary.chars().take(40).collect();
         (format!("失败：{summary}（{ago}）"), "#C63F38")
+    }
+}
+
+/// 会话内没有记录（应用刚重启）时，用官方日志里的最近一次判定。
+/// 日志格式：`2026-10-01 09:03:50 认证成功` / `... 认证失败您的账户已欠费`。
+fn log_auth_text(record: Option<&(String, bool, String)>) -> (String, &'static str) {
+    let Some((time, ok, detail)) = record else {
+        return ("暂无记录".to_string(), "#6E5568");
+    };
+    let prefix = if time.is_empty() {
+        String::new()
+    } else {
+        format!("{time} ")
+    };
+    if *ok {
+        (format!("{prefix}认证成功"), "#2E8B57")
+    } else {
+        let detail: String = if detail.is_empty() {
+            "认证失败".to_string()
+        } else {
+            detail.chars().take(30).collect()
+        };
+        (format!("{prefix}{detail}"), "#C63F38")
     }
 }
 
@@ -1515,10 +1551,25 @@ fn wire_events(ui: &Ui) {
     ui.install
         .connect_clicked(move |_| open_install_dialog(&install_ui));
 
-    // 迁移横幅按钮：与安装按钮走同一选择器流程
+    // 迁移/失败横幅按钮：按当前横幅状态分派（客户端迁移 → 安装选择器；
+    // 服务停止重试 → 重启服务；纯提示 → 无按钮）。
     let banner_ui = ui.clone();
-    ui.banner
-        .connect_button_clicked(move |_| open_install_dialog(&banner_ui));
+    ui.banner.connect_button_clicked(move |_| {
+        let action = *banner_ui
+            .banner_action
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        match action {
+            BannerAction::InstallClient => open_install_dialog(&banner_ui),
+            BannerAction::RestartService => run_diag(
+                &banner_ui,
+                "正在重新尝试开机认证…",
+                "已重新尝试开机认证",
+                system::restart_service,
+            ),
+            BannerAction::None => {}
+        }
+    });
 
     let autostart_ui = ui.clone();
     ui.autostart.connect_active_notify(move |switch| {
@@ -1616,6 +1667,60 @@ fn wire_events(ui: &Ui) {
     }
 }
 
+/// 一轮状态刷新在工作线程里算出的全部展示数据。
+/// 用具名字段而不是 14 元组：刷新链路长，位置参数一旦错位很难发现。
+struct StatusView {
+    pills: Vec<(String, &'static str)>,
+    preview: String,
+    net_text: String,
+    autostart_enabled: bool,
+    /// 认证客户端进程是否在运行。
+    client_running: bool,
+    /// 有线路径探测结果：`Some(true)` = 会话保持、网络可用。
+    online: Option<bool>,
+    /// 副行与连接状态用的详情文本（时长 / 会话保持 / 未连接）。
+    detail: String,
+    active_nic: String,
+    banner_show: bool,
+    banner_title: String,
+    banner_action: BannerAction,
+    wifi_radio_enabled: bool,
+    interfaces: Option<Vec<String>>,
+    /// run.log 里的最近一次判定（会话内记录为空时回退展示）。
+    last_auth_log: Option<(String, bool, String)>,
+}
+
+impl StatusView {
+    fn loading() -> Self {
+        Self {
+            pills: vec![
+                ("客户端 加载中…".to_string(), "dot-warn"),
+                ("进程 加载中…".to_string(), "dot-warn"),
+                ("服务 加载中…".to_string(), "dot-warn"),
+                ("网卡 加载中…".to_string(), "dot-warn"),
+            ],
+            preview: "暂无日志".to_string(),
+            net_text: "未获取到 IP".to_string(),
+            autostart_enabled: false,
+            client_running: false,
+            online: None,
+            detail: "未连接".to_string(),
+            active_nic: String::new(),
+            banner_show: false,
+            banner_title: String::new(),
+            banner_action: BannerAction::None,
+            wifi_radio_enabled: true,
+            interfaces: None,
+            last_auth_log: None,
+        }
+    }
+
+    /// 网络是否可用：客户端在运行，或探测确认有线路径可用（会话保持）。
+    fn connected(&self) -> bool {
+        self.client_running || self.online == Some(true)
+    }
+}
+
 /// 定时轮询专用入口：上一轮还没回来就跳过本次，避免 `journalctl`/`systemctl`
 /// 偶发卡住时 10 秒一次无限累积工作线程与子进程。
 /// 手动刷新和动作完成后的刷新仍直接走 `refresh_status`——那是用户明确意图，
@@ -1641,28 +1746,42 @@ fn refresh_status(ui: &Ui) {
             // 每轮重新探测：网卡可能后接/消失（USB 网卡、驱动重载），旧实现把
             // 构建期的快照存进 Ui 后永不更新，新网卡既选不到也看不到状态。
             let nics = system::wired_interfaces();
+            let active_nic = nics
+                .iter()
+                .find(|name| system::interface_has_carrier(name))
+                .cloned()
+                .unwrap_or_else(|| nics.first().cloned().unwrap_or_default());
+            // 有线路径探测（客户端不在运行时才有意义；绑定网卡、绕代理、无 DNS）。
+            // 这是"客户端没在运行但网络其实可用"的唯一可靠信号：官方客户端在
+            // 会话建立后仍可能 SIGSEGV，进程状态说明不了会话是否还在。
+            let client_running = status.client_running;
+            let online = if client_running {
+                None
+            } else {
+                netcheck::wired_path_reachable(&active_nic)
+            };
 
             let client = if status.client_installed {
                 ("客户端 已安装".to_string(), "dot-ok")
             } else {
                 ("客户端 未安装".to_string(), "dot-warn")
             };
-            let proc = if status.client_running {
+            let proc = if client_running {
                 ("进程 运行中".to_string(), "dot-ok")
             } else {
                 ("进程 未运行".to_string(), "dot-warn")
             };
-            // 服务 pill 区分"已启用且正常运行 / 已启用但异常 / 未启用"：
-            // 官方客户端 root 下崩溃时服务会 failed，只看 enabled 会误报健康。
+            // 服务 pill：按 systemd 实际状态分四态。inactive 是"已启用但当前没在
+            // 运行"（ExecCondition 跳过、或已跑完退出），与 failed（停止重试）不同；
+            // 旧实现把两者都写成"服务 异常"，在"网络其实可用"时严重误导。
             let service = if status.service_enabled == "enabled" {
-                if status.service_active == "active" {
-                    ("服务 已启用".to_string(), "dot-ok")
-                } else if status.service_active == "activating" {
-                    // ExecStartPost 里的 NM 恢复要睡 8 秒，这期间单元是
-                    // activating；只看 active 会把它误报成"服务 异常"。
-                    ("服务 启动中".to_string(), "dot-warn")
-                } else {
-                    ("服务 异常".to_string(), "dot-warn")
+                match status.service_active.as_str() {
+                    "active" => ("服务 运行中".to_string(), "dot-ok"),
+                    // ExecStartPost 里的 NM 恢复要睡 8 秒，这期间单元是 activating。
+                    "activating" => ("服务 启动中".to_string(), "dot-warn"),
+                    "failed" => ("服务 已停止重试".to_string(), "dot-warn"),
+                    "inactive" => ("服务 待命".to_string(), "dot-ok"),
+                    other => (format!("服务 {other}"), "dot-warn"),
                 }
             } else {
                 ("服务 未启用".to_string(), "dot-warn")
@@ -1704,13 +1823,7 @@ fn refresh_status(ui: &Ui) {
             };
 
             // 连接状态 / 副行（网卡 · 时长）
-            let conn = status.client_running;
             let wifi_radio_enabled = status.wifi_radio_enabled;
-            let active_nic = nics
-                .iter()
-                .find(|name| system::interface_has_carrier(name))
-                .cloned()
-                .unwrap_or_else(|| nics.first().cloned().unwrap_or_default());
             // 网络详情：当前网卡的 IP 与网关（认证成功后"拿到 IP 没"最直观）
             let net_text = if active_nic.is_empty() {
                 "未获取到 IP".to_string()
@@ -1732,36 +1845,53 @@ fn refresh_status(ui: &Ui) {
                 } else {
                     format!("已连接 {} 小时 {} 分", secs / 3600, (secs % 3600) / 60)
                 }
-            } else if conn {
+            } else if client_running {
                 "已连接".to_string()
+            } else if online == Some(true) {
+                // 客户端不在运行、但会话仍保持：说清楚"网络可用"而不是"未连接"。
+                "会话保持".to_string()
             } else {
                 "未连接".to_string()
             };
 
-            // 迁移提示：旧版客户端或旧版服务模板（不安全）时需要用户处理。
-            // 客户端迁移可点横幅按钮直接重装；服务迁移只需操作自启开关，不给按钮。
+            // 横幅优先级：客户端迁移 > 服务不安全 > 服务模板过旧 > 服务停止重试。
+            // 只有"客户端迁移/服务停止重试"给按钮；模板迁移按提示开关一次自启即可。
             let (banner_show, banner_title, banner_action) = if status.client_requires_migration {
                 (
                     true,
                     "检测到旧版客户端，请重新安装官方客户端完成安全迁移".to_string(),
-                    "现在处理".to_string(),
+                    BannerAction::InstallClient,
                 )
             } else if status.service_requires_migration {
                 (
                     true,
                     "开机认证服务配置不安全，请关闭后重新开启开机认证完成迁移".to_string(),
-                    String::new(),
+                    BannerAction::None,
+                )
+            } else if status.service_template_outdated {
+                (
+                    true,
+                    "开机认证服务模板已更新（新增「已联网时自动跳过」），请关闭后重新开启完成迁移"
+                        .to_string(),
+                    BannerAction::None,
+                )
+            } else if status.service_enabled == "enabled" && status.service_active == "failed" {
+                (
+                    true,
+                    "开机认证服务已停止重试；可点击按钮重新尝试，或检查网线后手动连接".to_string(),
+                    BannerAction::RestartService,
                 )
             } else {
-                (false, String::new(), String::new())
+                (false, String::new(), BannerAction::None)
             };
 
-            let computed = (
-                vec![client, proc, service, nic_pill],
+            let view = StatusView {
+                pills: vec![client, proc, service, nic_pill],
                 preview,
                 net_text,
-                status.service_enabled == "enabled",
-                conn,
+                autostart_enabled: status.service_enabled == "enabled",
+                client_running,
+                online,
                 detail,
                 active_nic,
                 banner_show,
@@ -1770,78 +1900,48 @@ fn refresh_status(ui: &Ui) {
                 wifi_radio_enabled,
                 // Option：工作线程异常时必须是 None，不能把"没探到网卡"
                 // 当成真实结果去清空用户的下拉框。
-                Some(nics),
-            );
-            let _ = tx.unbounded_send(computed);
+                interfaces: Some(nics),
+                last_auth_log: system::last_auth_from_log(),
+            };
+            let _ = tx.unbounded_send(view);
         });
-        let computed = rx.next().await.unwrap_or_else(|| {
-            (
-                vec![
-                    ("客户端 加载中…".to_string(), "dot-warn"),
-                    ("进程 加载中…".to_string(), "dot-warn"),
-                    ("服务 加载中…".to_string(), "dot-warn"),
-                    ("网卡 加载中…".to_string(), "dot-warn"),
-                ],
-                "暂无日志".to_string(),
-                "未获取到 IP".to_string(),
-                false,
-                false,
-                "未连接".to_string(),
-                String::new(),
-                false,
-                String::new(),
-                String::new(),
-                true,
-                None,
-            )
-        });
-        let (
-            pills,
-            preview,
-            net_text,
-            autostart,
-            conn,
-            detail,
-            active_nic,
-            banner_show,
-            banner_title,
-            banner_action,
-            wifi_radio_enabled,
-            interfaces,
-        ) = computed;
+        let view = rx.next().await.unwrap_or_else(StatusView::loading);
 
         // 状态胶囊：圆点 + 值
         let dot_classes = ["dot-ok", "dot-warn"];
-        for ((dot, value), (text, cls)) in ui_done.pills.iter().zip(pills.iter()) {
+        for ((dot, value), (text, cls)) in ui_done.pills.iter().zip(view.pills.iter()) {
             value.set_label(text);
             for c in dot_classes {
                 dot.remove_css_class(c);
             }
             dot.add_css_class(cls);
         }
-        // 大状态字（舞台 + 窄屏状态条）
-        ui_done.set_stage(if conn { "已连接" } else { "未连接" }, conn);
+        // 大状态字（舞台 + 窄屏状态条）：客户端在运行或探测确认网络可用都算已连接
+        let connected = view.connected();
+        ui_done.set_stage(if connected { "已连接" } else { "未连接" }, connected);
         // 副行：网卡 · 详情
-        let mut sub = if active_nic.is_empty() {
-            detail.clone()
+        let mut sub = if view.active_nic.is_empty() {
+            view.detail.clone()
         } else {
-            format!("{active_nic} · {detail}")
+            format!("{} · {}", view.active_nic, view.detail)
         };
-        if !wifi_radio_enabled {
+        if !view.wifi_radio_enabled {
             sub.push_str(" · Wi-Fi 已禁用");
         }
         ui_done.stage_sub.set_label(&sub);
         ui_done.compact_sub.set_label(&sub);
-        ui_done.log_preview.set_label(&preview);
-        ui_done.net_info.set_label(&net_text);
+        ui_done.log_preview.set_label(&view.preview);
+        ui_done.net_info.set_label(&view.net_text);
         // 连接详情区：账号 / 状态 / 最近认证结果（标签浅色、值深色，状态语义着色）
         let account = ui_done.username.text();
         ui_done.detail_account.set_markup(&format!(
             "<span color='#6E5568'>认证账号</span> <span color='#3E2B3A'>{}</span>",
             glib::markup_escape_text(&account)
         ));
-        let (state_text, state_color) = if conn {
-            (detail.clone(), "#C14D7C")
+        let (state_text, state_color) = if view.client_running {
+            (view.detail.clone(), "#C14D7C")
+        } else if view.online == Some(true) {
+            ("已连接（会话保持）".to_string(), "#C14D7C")
         } else {
             ("未连接".to_string(), "#3E2B3A")
         };
@@ -1849,30 +1949,36 @@ fn refresh_status(ui: &Ui) {
             "<span color='#6E5568'>连接状态</span> <span color='{state_color}'><b>{}</b></span>",
             glib::markup_escape_text(&state_text)
         ));
-        let guard = ui_done
+        let session = ui_done
             .last_auth
             .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let (last_text, last_color) = last_auth_text(&guard);
-        drop(guard);
+            .map(|guard| (*guard).clone())
+            .unwrap_or_else(|poison| poison.into_inner().clone());
+        let (last_text, last_color) = match session.as_ref() {
+            Some(record) => last_auth_text(Some(record)),
+            // 会话内没有记录（应用重启过）时回退到官方日志里的最近一次判定。
+            None => log_auth_text(view.last_auth_log.as_ref()),
+        };
         ui_done.detail_last.set_markup(&format!(
             "<span color='#6E5568'>最近认证</span> <span color='{last_color}'><b>{}</b></span>",
             glib::markup_escape_text(&last_text)
         ));
-        // 迁移横幅：仅旧版客户端 / 不安全服务模板时显示
-        ui_done.banner.set_title(&banner_title);
-        ui_done
-            .banner
-            .set_button_label(if banner_action.is_empty() {
-                None
-            } else {
-                Some(banner_action.as_str())
-            });
-        ui_done.banner.set_revealed(banner_show);
+        // 横幅：迁移提示 / 服务失败恢复；按钮动作按当前状态分派
+        *ui_done
+            .banner_action
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = view.banner_action;
+        ui_done.banner.set_title(&view.banner_title);
+        ui_done.banner.set_button_label(match view.banner_action {
+            BannerAction::InstallClient => Some("现在处理"),
+            BannerAction::RestartService => Some("重新尝试"),
+            BannerAction::None => None,
+        });
+        ui_done.banner.set_revealed(view.banner_show);
         if !ui_done.busy.load(Ordering::Relaxed) {
-            ui_done.autostart.set_active(autostart);
+            ui_done.autostart.set_active(view.autostart_enabled);
         }
-        if let Some(names) = interfaces {
+        if let Some(names) = view.interfaces {
             ui_done.sync_interfaces(&names);
         }
         ui_done.refreshing.store(false, Ordering::Relaxed);

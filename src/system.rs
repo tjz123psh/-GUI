@@ -5,7 +5,10 @@
 
 use crate::config::{self, SERVICE, Settings};
 use anyhow::{Context, Result};
-use rjsupplicant_gui::privileged::{self, AuthOptions, CLIENT_DIR, HELPER_PATH, HelperRequest};
+use rjsupplicant_gui::privileged::{
+    self, AUTH_HISTORY_FAILURE_MARKERS, AUTH_SUCCESS_MARKER, AuthOptions, CLIENT_DIR, HELPER_PATH,
+    HelperRequest,
+};
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::MetadataExt;
@@ -32,6 +35,9 @@ pub struct ClientStatus {
     pub client_installed: bool,
     pub client_requires_migration: bool,
     pub service_requires_migration: bool,
+    /// 服务内容安全但模板过旧（缺少「已联网跳过」的 ExecCondition）：
+    /// 只需重新开启一次开机认证完成迁移，与"不安全"区分展示。
+    pub service_template_outdated: bool,
     pub client_running: bool,
     pub client_uptime_seconds: Option<u64>,
     pub service_enabled: String,
@@ -68,6 +74,7 @@ pub fn load_status() -> ClientStatus {
         client_installed: privileged_ready || legacy_ready,
         client_requires_migration: helper_installed() && !privileged_ready && legacy_ready,
         service_requires_migration: privileged_ready && installed_service_is_unsafe(),
+        service_template_outdated: privileged_ready && installed_service_is_outdated(),
         client_running,
         client_uptime_seconds,
         service_enabled,
@@ -106,10 +113,16 @@ pub fn wired_interfaces() -> Vec<String> {
     names
 }
 
-pub fn interface_has_carrier(name: &str) -> bool {
+/// 网卡物理链路是否已连接；读不到 carrier（网卡不存在等）返回 `None`，
+/// 与"明确无网线"（`Some(false)`）区分：只有后者才值得提前拦截认证。
+pub fn interface_carrier(name: &str) -> Option<bool> {
     fs::read_to_string(Path::new("/sys/class/net").join(name).join("carrier"))
+        .ok()
         .map(|value| value.trim() == "1")
-        .unwrap_or(false)
+}
+
+pub fn interface_has_carrier(name: &str) -> bool {
+    interface_carrier(name) == Some(true)
 }
 
 /// 读取网卡当前 IPv4 地址（如 "192.168.1.5"）。无地址/无网卡时返回 None。
@@ -169,6 +182,14 @@ pub fn install_official_client(zip_path: &Path) -> Result<()> {
 pub fn authenticate(settings: &Settings, password: &str) -> Result<()> {
     config::validate(settings)?;
     ensure_client_installed()?;
+    // 网线未连接时不发起认证（也避免无意义的 polkit 弹窗）：官方客户端在该
+    // 状态下可能直接 SIGSEGV（实测 12 次崩溃中有 3 次发生在无网线窗口）。
+    if interface_carrier(settings.nic.trim()) == Some(false) {
+        anyhow::bail!(
+            "{} 没有检测到网线连接，请检查网线后重试",
+            settings.nic.trim()
+        );
+    }
     let use_helper = privileged_client_ready();
     let spec = authenticate_command_for(settings, password, use_helper);
     if use_helper {
@@ -575,6 +596,67 @@ fn tail_lines(text: &str, count: usize) -> String {
     lines[lines.len().saturating_sub(count)..].join("\n")
 }
 
+/// 官方日志中最近一次明确判定：`(时间, 是否成功, 详情)`。
+/// 供「连接详情」在应用重启后仍显示历史（会话内记录为空时回退到这里）。
+pub fn last_auth_from_log() -> Option<(String, bool, String)> {
+    let text = fs::read_to_string(client_log_path()).ok()?;
+    parse_last_auth(&text)
+}
+
+/// 只看末尾 200 行，从后往前找第一条"以终局标记开头"的行。
+/// 用"行首"而不是"包含"：官方成功横幅里的"上次认证失败的原因已修复"也含
+/// 标记词，但它出现在 `认证成功` 之后，不是判定行本身。
+fn parse_last_auth(text: &str) -> Option<(String, bool, String)> {
+    text.lines().rev().take(200).find_map(|line| {
+        let (time, body) = split_log_timestamp(line.trim());
+        if body.is_empty() {
+            return None;
+        }
+        if body.starts_with(AUTH_SUCCESS_MARKER) {
+            return Some((time, true, body.chars().take(32).collect()));
+        }
+        if AUTH_HISTORY_FAILURE_MARKERS
+            .iter()
+            .any(|marker| body.starts_with(marker))
+        {
+            return Some((time, false, body.chars().take(32).collect()));
+        }
+        None
+    })
+}
+
+/// 切出日志行前缀 "YYYY-MM-DD HH:MM:SS"，返回 ("MM-DD HH:MM", 其余内容)。
+/// 少数状态行（`网线没有连接上`、`无法获取动态IP地址`）带两个时间戳——官方
+/// 客户端用另一条通道打印——这里把第二层也剥掉，详情里才不会重复显示时间。
+/// 前缀格式不符时返回 ("", 原行)。
+fn split_log_timestamp(line: &str) -> (String, String) {
+    let Some((time, rest)) = strip_timestamp_prefix(line) else {
+        return (String::new(), line.to_string());
+    };
+    let body = strip_timestamp_prefix(&rest)
+        .map(|(_, inner)| inner)
+        .unwrap_or(rest);
+    (time, body)
+}
+
+fn strip_timestamp_prefix(line: &str) -> Option<(String, String)> {
+    let mut parts = line.splitn(3, ' ');
+    let (date, clock, rest) = (parts.next()?, parts.next()?, parts.next()?);
+    if date.len() == 10
+        && clock.len() == 8
+        && date.is_ascii()
+        && clock.is_ascii()
+        && date.chars().all(|ch| ch.is_ascii_digit() || ch == '-')
+        && clock.chars().all(|ch| ch.is_ascii_digit() || ch == ':')
+    {
+        return Some((
+            format!("{} {}", &date[5..], &clock[..5]),
+            rest.trim().to_string(),
+        ));
+    }
+    None
+}
+
 fn client_process_info() -> (bool, Option<u64>) {
     let pid = fs::read_dir("/proc")
         .ok()
@@ -716,6 +798,17 @@ fn installed_service_is_unsafe() -> bool {
     fs::read_to_string(path)
         .map(|content| !privileged::service_content_uses_owned_paths(&content))
         .unwrap_or(true)
+}
+
+/// 服务内容安全、但缺少「已联网跳过」的 ExecCondition（旧模板）。
+/// 只提示迁移、不当作不安全：旧模板仍可被安全地禁用/重启，否则用户
+/// 无法关闭一个等待迁移的服务（disable/restart 走同一安全校验）。
+fn installed_service_is_outdated() -> bool {
+    let Ok(content) = fs::read_to_string(privileged::SERVICE_PATH) else {
+        return false;
+    };
+    privileged::service_content_uses_owned_paths(&content)
+        && !privileged::service_is_current_template(&content)
 }
 
 #[cfg(test)]
@@ -926,5 +1019,45 @@ mod tests {
             outcome.expect("正常结束应返回退出状态").success(),
             "正常结束的子进程不应被判为失败"
         );
+    }
+
+    #[test]
+    fn parses_last_auth_from_log_tail() {
+        // 取最后一条终局判定：失败在前、成功在后 → 报成功。
+        let log = "2026-09-07 10:00:10 认证失败您的账户已欠费\n\
+                   2026-10-01 09:03:50 认证成功\n";
+        assert_eq!(
+            parse_last_auth(log),
+            Some(("10-01 09:03".to_string(), true, "认证成功".to_string()))
+        );
+
+        // 无关行不参与判定（不能把"正在停止系统服务"之类当结果）。
+        let unrelated = "2026-10-01 16:48:50 正在停止系统(NetworkManager)服务\n\
+                         2026-10-01 16:49:13 认证方式    有线认证\n";
+        assert_eq!(parse_last_auth(unrelated), None);
+
+        // "网线没有连接上"是重试提示（带双时间戳），不是终局结果：即使它是
+        // 最后一条标记行，也必须向前找到真正的判定。
+        let transient = "2026-10-01 09:03:50 认证成功\n\
+                         2026-10-01 16:48:51 2026-10-01 16:48:51 网线没有连接上，请检查网卡连接\n";
+        assert_eq!(
+            parse_last_auth(transient),
+            Some(("10-01 09:03".to_string(), true, "认证成功".to_string()))
+        );
+
+        // DHCP 超时是终局失败，且详情里不带重复的时间戳。
+        let failure = "2026-09-01 17:35:10 2026-09-01 17:35:10 无法获取动态IP地址\n";
+        let (time, ok, detail) = parse_last_auth(failure).expect("应解析出失败记录");
+        assert_eq!(time, "09-01 17:35");
+        assert!(!ok);
+        assert_eq!(detail, "无法获取动态IP地址");
+
+        // 成功横幅里的说明文字不是判定行。
+        assert_eq!(parse_last_auth("上次认证失败的原因已修复\n"), None);
+
+        // 没有时间前缀的判定行仍然参与判定，只是不显示时间。
+        let (time, ok, _) = parse_last_auth("认证失败\n").expect("无时间前缀也能解析");
+        assert!(time.is_empty());
+        assert!(!ok);
     }
 }

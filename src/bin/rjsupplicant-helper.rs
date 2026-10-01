@@ -1,8 +1,10 @@
 use anyhow::{Context, Result};
 use rjsupplicant_gui::client_install;
+use rjsupplicant_gui::netcheck;
 use rjsupplicant_gui::privileged::{
-    AuthOptions, CLIENT_DIR, CLIENT_WRAPPER_PATH, HelperRequest, SERVICE_PATH, client_binary_path,
-    client_log_path, service_content_uses_owned_paths, service_file,
+    AUTH_FAILURE_MARKERS, AUTH_SUCCESS_MARKER, AuthOptions, CLIENT_DIR, CLIENT_WRAPPER_PATH,
+    HelperRequest, SERVICE_PATH, client_binary_path, client_log_path,
+    service_content_uses_owned_paths, service_file,
 };
 use std::fs;
 use std::io::{IsTerminal, Read, Write};
@@ -19,7 +21,7 @@ const ACTION_LOCK_PATH: &str = "/run/rjsupplicant-helper.lock";
 
 fn main() -> ExitCode {
     match run() {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(err) => {
             eprintln!("rjsupplicant-helper: {err:#}");
             ExitCode::FAILURE
@@ -27,10 +29,15 @@ fn main() -> ExitCode {
     }
 }
 
-fn run() -> Result<()> {
+fn run() -> Result<ExitCode> {
     ensure_root()?;
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     let request = HelperRequest::parse(&args)?;
+    // ExecCondition 专用判定：只读探测，不做任何状态改动。
+    // 它不参与动作锁：既不该被界面动作挡住，也不该挡住界面动作。
+    if let HelperRequest::ShouldAuthenticate(nic) = &request {
+        return Ok(should_authenticate_exit_code(nic));
+    }
     // 串行化所有会改动认证状态的动作：两个实例并发时会交叉读取同一份 run.log
     // 做成败判定（把对方的结果当本轮），写服务单元与 systemctl 交错也会留下
     // 半配置状态。`restore-network` 由 systemd 以 root 调用，绝不能被界面动作
@@ -78,7 +85,49 @@ fn run() -> Result<()> {
             restore_network_services();
             Ok(())
         }
+        HelperRequest::ShouldAuthenticate(_) => {
+            unreachable!("should-authenticate 已在动作锁之前提前返回")
+        }
+    }?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// systemd ExecCondition 判定：退出码 1 = 跳过本次启动（systemd 视为成功、
+/// 不触发 Restart），0 = 需要认证、继续执行 ExecStart。探测无法判断时按
+/// "需要认证"处理，保持旧行为（宁可多跑一次客户端，也不要漏掉认证）。
+fn should_authenticate_exit_code(nic: &str) -> ExitCode {
+    match autostart_decision(
+        netcheck::carrier_up(nic),
+        netcheck::wired_path_reachable(nic),
+    ) {
+        AuthDecision::SkipNoCarrier => {
+            println!("{nic} 未连接网线，跳过开机认证");
+            ExitCode::from(1)
+        }
+        AuthDecision::SkipAlreadyOnline => {
+            println!("{nic} 已可访问外网（认证会话保持），跳过开机认证");
+            ExitCode::from(1)
+        }
+        AuthDecision::Authenticate => ExitCode::SUCCESS,
     }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum AuthDecision {
+    Authenticate,
+    SkipNoCarrier,
+    SkipAlreadyOnline,
+}
+
+/// 纯决策：网线未连接或已联网时都不需要启动客户端去重新认证。
+fn autostart_decision(carrier: Option<bool>, reachable: Option<bool>) -> AuthDecision {
+    if carrier == Some(false) {
+        return AuthDecision::SkipNoCarrier;
+    }
+    if reachable == Some(true) {
+        return AuthDecision::SkipAlreadyOnline;
+    }
+    AuthDecision::Authenticate
 }
 
 fn ensure_root() -> Result<()> {
@@ -120,6 +169,11 @@ fn acquire_action_lock() -> Result<fs::File> {
 
 fn authenticate(options: &AuthOptions) -> Result<()> {
     ensure_client_installed()?;
+    // 网线未连接时不必启动客户端：官方客户端在该状态下会 SIGSEGV（实测
+    // 12 次崩溃中有 3 次发生在无网线/无地址窗口），提前给出清晰错误。
+    if netcheck::carrier_up(&options.nic) == Some(false) {
+        anyhow::bail!("{} 没有检测到网线连接，请检查网线后重试", options.nic);
+    }
     let args = client_arguments(options, true);
     let log_path = client_log_path();
     let mut log_offset = fs::metadata(&log_path).map(|meta| meta.len()).unwrap_or(0);
@@ -135,7 +189,7 @@ fn authenticate(options: &AuthOptions) -> Result<()> {
     // 客户端可能在任何一次判定之前就退出（网线未插、认证服务器不通、崩溃），
     // 那时它已经停掉了 NetworkManager；用守卫兜住所有出口，避免无线被静默切断。
     let _network_guard = NetworkRestorer;
-    await_auth_result(&mut child, &log_path, &mut log_offset)
+    await_auth_result(&mut child, &log_path, &mut log_offset, &options.nic)
 }
 
 /// DHCP 注入时序节点：客户端在此期间完成启动并停掉 NetworkManager。
@@ -154,6 +208,7 @@ fn await_auth_result(
     child: &mut std::process::Child,
     log_path: &Path,
     log_offset: &mut u64,
+    nic: &str,
 ) -> Result<()> {
     // 客户端退出码不可靠（DHCP 失败也返回 0），成败以启动后新增的官方日志判定。
     let started = std::time::Instant::now();
@@ -169,11 +224,10 @@ fn await_auth_result(
         match outcome {
             AuthOutcome::Succeeded => return Ok(()),
             AuthOutcome::ClientExited => {
-                // 认证成功的前提是客户端保持前台运行并持有会话（与开机自启 unit
-                // 的 Type=simple 同一判据），进程不在了就说明本轮没有建立会话。
-                // 旧实现在这里返回 Ok，GUI 会放成功霞光并记一次“成功”。
-                // 退出码不参与判定：实测客户端 DHCP 失败也返回 0。
-                return Err(anyhow::anyhow!("认证未完成：官方客户端进程已退出"));
+                // 退出码不可靠（实测 DHCP 失败也返回 0）。客户端在网关会话
+                // 已建立后仍可能 SIGSEGV（实测：认证成功但没来得及写日志），
+                // 因此用有线路径探测确认：确实可用才算本轮成功。
+                return exited_outcome_for(netcheck::wired_path_reachable(nic));
             }
             AuthOutcome::Failed(reason) => {
                 // 判到失败但客户端还活着：它已带 `-p` 明文口令且不会建立会话，
@@ -206,6 +260,17 @@ fn terminate_client(child: &mut std::process::Child) {
     let _ = child.wait();
 }
 
+/// 客户端退出后的判定：有线路径确实可用 → 认证已生效（Ok），这是实机事故
+/// 校正过的唯一可靠信号（客户端在会话建立后仍会崩溃、且不会写"认证成功"）。
+/// 探测不可用（None）与不可达（false）一律按未完成处理，避免把失败伪装成成功。
+fn exited_outcome_for(reachable: Option<bool>) -> Result<()> {
+    if reachable == Some(true) {
+        println!("官方客户端已退出，但有线路径已可用：认证会话已建立");
+        return Ok(());
+    }
+    anyhow::bail!("认证未完成：官方客户端进程已退出")
+}
+
 #[derive(Debug, Eq, PartialEq)]
 enum AuthOutcome {
     Pending,
@@ -225,7 +290,7 @@ fn classify_auth(client_exited: bool, new_log: Option<&str>) -> AuthOutcome {
     let Some(new_log) = new_log else {
         return AuthOutcome::Pending;
     };
-    if new_log.contains("认证成功") {
+    if new_log.contains(AUTH_SUCCESS_MARKER) {
         return AuthOutcome::Succeeded;
     }
     match auth_failure_reason(new_log) {
@@ -260,13 +325,7 @@ fn new_log_tail(path: &Path, offset: &mut u64) -> Option<String> {
 }
 
 fn auth_failure_reason(new_log: &str) -> Option<String> {
-    const MARKERS: &[&str] = &[
-        "网线没有连接上",
-        "无法连接认证服务器",
-        "认证失败",
-        "无法获取动态IP地址",
-    ];
-    MARKERS
+    AUTH_FAILURE_MARKERS
         .iter()
         .find(|marker| new_log.contains(**marker))
         .map(|marker| marker.to_string())
@@ -624,5 +683,34 @@ mod tests {
             classify_auth(false, Some("认证成功\n上次认证失败的原因已修复")),
             AuthOutcome::Succeeded
         );
+    }
+
+    #[test]
+    fn autostart_skips_only_when_provably_unnecessary() {
+        // 无网线 → 跳过；已联网 → 跳过；其余（含不可判断 None）→ 需要认证。
+        assert_eq!(
+            autostart_decision(Some(false), None),
+            AuthDecision::SkipNoCarrier
+        );
+        assert_eq!(
+            autostart_decision(Some(true), Some(true)),
+            AuthDecision::SkipAlreadyOnline
+        );
+        assert_eq!(
+            autostart_decision(Some(true), Some(false)),
+            AuthDecision::Authenticate
+        );
+        assert_eq!(
+            autostart_decision(Some(true), None),
+            AuthDecision::Authenticate
+        );
+        assert_eq!(autostart_decision(None, None), AuthDecision::Authenticate);
+    }
+
+    #[test]
+    fn client_exit_counts_as_success_only_when_path_is_proven_usable() {
+        assert!(exited_outcome_for(Some(true)).is_ok());
+        assert!(exited_outcome_for(Some(false)).is_err());
+        assert!(exited_outcome_for(None).is_err());
     }
 }

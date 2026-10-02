@@ -1,11 +1,11 @@
 # rjsupplicant-gui 项目交接文档
 
-- 最后更新：2026-10-01
+- 最后更新：2026-10-02
 - 当前版本：0.3.0（实机联调修复轮、重启失联事故修复轮、**2026-10-01 会话保持识别与开机认证跳过轮**均已完成）
 - 项目状态：后端与提权链功能冻结（提权边界与状态可信度三轮修复已解除其中被用户明确要求修改的条目）；前端皮肤完成；**2026-09-01 校园有线网实机联调**与 **2026-09-02 重启事故修复轮**已完成；手动认证实测成功；**提权边界轮 / 并发与资源轮 / 状态可信度与渲染资源轮 + 两轮 CI 修复已完成、已提交推送本机已部署，GitHub Actions 全绿**；等待用户最终手动确认错误密码、polkit 交互与开机自启（含修复后的 Type=simple 单元），以及 README「已知安全边界」两项是否进一步处置
 - 最终验收代码基线：`9ff5645`
-- 当前代码基线：`e748cae`（含 2026-10-01 会话保持轮 3.4 与探测环境一致性轮 3.5，已推送 origin/main；该两轮代码的 CI 全绿——`e0499e5` 运行的 Arch Linux 作业 success，`e748cae` 的运行被 concurrency 取代取消属预期）
-- 主分支：`main`，与 `origin/main` 同步（`e748cae` 已推送）
+- 当前代码基线：`ac182c9`（2026-10-01 两轮改动的推送基线，CI 全绿）；2026-10-02 的 FlClash/TUN 崩溃修复与开机链路竞态修复见 3.6 节（本轮提交随后推送）
+- 主分支：`main`，与 `origin/main` 同步（`ac182c9`；3.6 节改动随后推送）
 - 远端：`git@github.com:tjz123psh/-GUI.git`
 
 ## 1. 交接结论
@@ -192,6 +192,15 @@
 2. **日志预览去噪**（`src/ui.rs`）：客户端日志优先（≤4 行）；客户端为空才回退清洗后的 journal 摘要，界面不再出现 `systemd[1]:` 字样。
 3. **单窗口**：`activate` 只 `present()` 既有窗口，不再叠出第二窗口/第二条轮询。
 4. **实机证据**：默认 / 伪造代理 / 恶意 curlrc 三环境探测均 `Some(true)`（同环境裸 curl exit 7 对照）；FlClash 停止（TUN 设备消失）后三路探测仍全 `true`，恢复后原状复原；GUI OCR 文字层确认「已连接 + 会话保持 + 客户端日志预览」；新 GUI 哈希 `39a11a23`。新版 helper 已重装（哈希 `2b23e78e`）：干净与伪造代理两种 root 环境下 `should-authenticate eno1` 均 exit 1（跳过），`systemctl start` → `Result=exec-condition`、NM 未被停、无新 coredump。
+
+## 3.6 FlClash/TUN 崩溃根因修复与开机链路竞态修复轮（2026-10-02，用户报告重启后连不上）
+
+用户报告重启后「网络又连接不上」。实机取证（journal、run.log、coredump、getifaddrs 枚举）定位到两个独立缺陷：
+
+1. **根因 1：FlClash TUN 触发官方客户端确定性 SIGSEGV**。FlClash(mihomo) 的 TUN 接口在 glibc `getifaddrs()` 里返回 `ifa_addr == NULL` 的条目；官方 2014 客户端 `get_nics_info` 不做空指针检查，启动约 3 秒必崩（`segfault at 0 ip 0x451999`）。**修复**：`compat/nicshim.c` 垫片（摘除 NULL 地址条目）+ wrapper 按需 `LD_PRELOAD`（覆盖式）+ install.sh 用 cc 编译安装 root-owned `nicshim.so` + helper 新子命令 `install-wrapper` 刷新既有安装；CI 增加编译与合成链表行为门禁。
+2. **根因 2：开机 4 秒链路竞态**。开机时 r8169 尚未 Link Up，ExecCondition 判定"未连接网线"跳过自动认证。**修复**：`should-authenticate` 载波为 0 时进入 20 秒宽限窗口（2 秒轮询）。
+
+实机验证：合成链表门禁通过；`disconnect → systemctl start` 端到端重连成功（09:59:48 认证成功、单元 active/running、探测 404/12ms、`/proc/<pid>/environ` 含 wrapper 注入的 `LD_PRELOAD`）；veth 计时验证载波宽限（carrier=0 → 20.015s 后跳过；carrier=1 → 4.0s 判定认证）。未验证：真重启开机路径、"网线后插自动认证"（仍手动）。
 
 ## 4. 技术栈与仓库结构
 
@@ -573,8 +582,9 @@ timeout 3s target/release/rjsupplicant-gui
 ## 11. 已知限制
 
 - 官方客户端是闭源旧程序，类似 `sysctl: 写入错误: 错误的文件描述符` 的兼容性错误无法在 GUI 内部根治。
-- 官方客户端在会话建立后仍可能 SIGSEGV（实测认证成功但没来得及写「认证成功」日志）；helper 与 GUI 用有线路径探测识别「会话保持」，依据是真实探测而不是客户端日志，因此状态可能比日志乐观，但不会凭空猜测。
-- 开机认证单元在"已联网（会话保持）或网线未连接"时会主动跳过本次启动（ExecCondition），不再为无关会话反复停 NM / 反复崩溃；需要强制重新认证时手动点「连接」。
+- 官方客户端在会话建立后仍可能 SIGSEGV（实测认证成功但没来得及写「认证成功」日志）；helper 与 GUI 用有线路径探测识别「会话保持」，依据是真实探测而不是客户端日志，因此状态可能比日志乐观，但不会凭空猜测。垫片只消除 `getifaddrs` 空地址这一已定位的确定性根因，其它崩溃路径不受影响。
+- 官方 2014 客户端在 `getifaddrs()` 出现 `ifa_addr == NULL` 条目时会必崩（FlClash/mihomo 等 TUN 接口会提供这种条目）；已内置 `compat/nicshim.c` 垫片并由 wrapper 按需 `LD_PRELOAD`（覆盖式），安装依赖因此新增 `gcc`。
+- 开机认证单元在"已联网（会话保持）或网线未连接"时会主动跳过本次启动（ExecCondition），不再为无关会话反复停 NM / 反复崩溃；载波为 0 时会先等最多 20 秒（2026-10-02 实测开机约 4 秒后链路才 Up），到点仍未 Link Up 才按"未接网线"跳过。需要强制重新认证时手动点「连接」。
 - 官方客户端启动时会主动停止 NetworkManager（strace 实证），helper 已在认证/断开/自启/重启后自动恢复；期间有约 8 秒的无线离线窗口，属客户端设计行为、无法阻止。
 - 官方客户端内置 DHCP 在现代内核上不发任何报文（pcap 实证，认证实际成功、端口放行、学校 DHCP 正常），helper 通过认证后约 8 秒恢复 NM、由 NM 内部 DHCP 补位；该注入依赖客户端的 `/proc/net/route` 轮询判定，属兼容性补丁。
 - 官方客户端没有协议级成功回调，GUI 只能可靠判断进程、链路和服务状态，账号是否通过仍需看日志。
@@ -634,7 +644,7 @@ update-desktop-database ~/.local/share/applications
 2. 错误密码时 GUI 状态、提示和日志是否符合实际结果。（未测）
 3. 手动断开、重新连接以及 service 正在运行时的断开行为是否正确。**手动断开已 CLI 验证（断开成功、NM 保持 active、Wi-Fi 恢复）**。
 4. polkit 授权、取消授权和授权保留期间的六个 helper 动作是否正常。**授权（pkexec 弹窗输密码）已多次实测通过；取消/保留协议未专项验证**。
-5. 启用开机自动认证后重启，systemd 是否按预期工作（已联网/无网线时跳过、断网时认证）；关闭自启后是否彻底停止并禁用服务。（未测；unit 已带 ExecStartPost restore-network 与 ExecCondition should-authenticate，注意验证 8 秒等待时序与新的 5 次 / 300 秒限流）
+5. 启用开机自动认证后重启，systemd 是否按预期工作（已联网/无网线时跳过、断网时认证）；关闭自启后是否彻底停止并禁用服务。（**2026-10-02 部分验证**：单元路径 `disconnect → systemctl start` 端到端重连成功、载波宽限用 veth 计时验证 20.015s；**真重启后的完整开机路径仍未测**。unit 已带 ExecStartPost restore-network、ExecCondition should-authenticate（含 20 秒载波宽限）与 5 次 / 300 秒限流）
 
 若以上项目全部通过，`v0.3.0` 即可视为个人使用的最终版本。若出现问题，应先记录操作步骤、界面状态和脱敏后的 `run.log`/journal，再针对具体故障修改；不要在没有复现证据时继续重构。
 

@@ -56,6 +56,7 @@ touch \
   "${SYSTEMD_DIR}/rjsupplicant.service" \
   "${PRIVILEGED_DIR}/rjsupplicant-helper" \
   "${PRIVILEGED_DIR}/rjsupplicant" \
+  "${PRIVILEGED_DIR}/nicshim.so" \
   "${ROOT_CLIENT_DIR}/x64/rjsupplicant" \
   "${POLICY_DIR}/io.github.pang.RjSupplicantGui.policy"
 chmod 755 \
@@ -91,9 +92,30 @@ if [[ "${1:-}" == "${RJSUPPLICANT_LIBEXEC_DIR:-}/rjsupplicant-helper" ]]; then
         "${RJSUPPLICANT_PRIVILEGED_CLIENT_DIR}/x86/rjsupplicant" \
         "${RJSUPPLICANT_LIBEXEC_DIR}/rjsupplicant"
       ;;
+    install-wrapper)
+      # 真实 helper 会原子重写 wrapper；沙箱里只需要可观察的调用痕迹。
+      ;;
     disconnect) ;;
     *) exit 1 ;;
   esac
+  exit 0
+fi
+if [[ "${1:-}" == "install" ]]; then
+  # 非 root 的测试环境无法执行 install -o root -g root 的 chown；落点都在
+  # /tmp 沙箱内，属主无关紧要，去掉属主参数后仍用真实 install 落盘。
+  shift
+  install_args=()
+  while (( $# > 0 )); do
+    case "$1" in
+      -o | -g)
+        shift 2
+        continue
+        ;;
+    esac
+    install_args+=("$1")
+    shift
+  done
+  install "${install_args[@]}"
   exit 0
 fi
 exec "$@"
@@ -238,10 +260,13 @@ PATH="${FAKE_BIN}:${PATH}" \
 [[ -x "${INSTALL_HOME}/.local/bin/rjsupplicant-gui" ]]
 [[ -x "${INSTALL_LIBEXEC}/rjsupplicant-helper" ]]
 [[ -x "${INSTALL_LIBEXEC}/rjsupplicant" ]]
+[[ -x "${INSTALL_LIBEXEC}/nicshim.so" ]]
 [[ -x "${INSTALL_ROOT_CLIENT}/x64/rjsupplicant" ]]
 [[ -f "${INSTALL_POLICY}/io.github.pang.RjSupplicantGui.policy" ]]
 [[ ! -e "${INSTALL_SYSTEMD}/rjsupplicant.service" ]]
-grep -Fq 'gtk4 libadwaita polkit desktop-file-utils unzip' "${PACMAN_LOG}"
+grep -Fq 'gtk4 libadwaita polkit desktop-file-utils unzip net-tools gcc' "${PACMAN_LOG}"
+# 每次安装都要让既有安装的 wrapper 升级到带垫片加载逻辑的新版。
+grep -Fq "${INSTALL_LIBEXEC}/rjsupplicant-helper install-wrapper" "${SUDO_LOG}"
 
 HOME="${INSTALL_HOME}" \
 XDG_DATA_HOME="${INSTALL_DATA}" \

@@ -34,6 +34,10 @@ pub const AUTH_HISTORY_FAILURE_MARKERS: &[&str] =
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HelperRequest {
     InstallClient(PathBuf),
+    /// 仅由 install.sh 以 sudo 调用 root helper：重写官方客户端 wrapper，
+    /// 把既有安装升级到带 getifaddrs 垫片加载逻辑的新版。与 restore-network、
+    /// should-authenticate 同类，只由 root 侧调用，因此不进 polkit 动作表。
+    InstallWrapper,
     Authenticate(AuthOptions),
     Disconnect,
     EnableService(AuthOptions),
@@ -62,6 +66,7 @@ impl HelperRequest {
                 }
                 Ok(Self::InstallClient(path))
             }
+            "install-wrapper" if args.len() == 1 => Ok(Self::InstallWrapper),
             "authenticate" if args.len() == 5 => {
                 let options = parse_options(&args[1..], None)?;
                 Ok(Self::Authenticate(options))
@@ -89,6 +94,7 @@ impl HelperRequest {
                 "install-client".to_string(),
                 path.to_string_lossy().into_owned(),
             ],
+            Self::InstallWrapper => vec!["install-wrapper".to_string()],
             Self::Authenticate(options) => options_arguments("authenticate", options),
             Self::Disconnect => vec!["disconnect".to_string()],
             Self::EnableService(options) => options_arguments("enable-service", options),
@@ -566,6 +572,19 @@ mod tests {
         );
         assert!(
             HelperRequest::parse(&["restore-network".to_string(), "extra".to_string()]).is_err()
+        );
+    }
+
+    #[test]
+    fn parses_install_wrapper_action() {
+        let request = HelperRequest::InstallWrapper;
+        assert_eq!(
+            HelperRequest::parse(&request.arguments()).expect("round-trip"),
+            request
+        );
+        assert_eq!(request.arguments(), ["install-wrapper"]);
+        assert!(
+            HelperRequest::parse(&["install-wrapper".to_string(), "extra".to_string()]).is_err()
         );
     }
 

@@ -124,7 +124,7 @@ install_system_deps() {
 
   if need_cmd pacman; then
     log "安装/确认 Arch Linux 依赖。"
-    local dependencies=(gtk4 libadwaita polkit desktop-file-utils unzip net-tools)
+    local dependencies=(gtk4 libadwaita polkit desktop-file-utils unzip net-tools gcc)
     if cargo --version >/dev/null 2>&1 && rustc --version >/dev/null 2>&1; then
       log "检测到可用 Rust 工具链，保留当前 rustup/cargo 配置。"
     else
@@ -134,7 +134,7 @@ install_system_deps() {
     return
   fi
 
-  log "未检测到 pacman；请手动安装 Rust、GTK4、libadwaita、polkit、desktop-file-utils、unzip。"
+  log "未检测到 pacman；请手动安装 Rust、GTK4、libadwaita、polkit、desktop-file-utils、unzip 与 gcc（垫片编译需要 cc）。"
 }
 
 find_official_zip() {
@@ -162,6 +162,24 @@ build_binaries() {
     "${BUILD_DIR}/release/rjsupplicant-gui" \
     "${BUILD_DIR}/release/rjsupplicant-helper"
   cargo build --locked --release --manifest-path "${ROOT_DIR}/Cargo.toml"
+}
+
+build_nicshim() {
+  # 垫片是官方客户端的防崩溃必需件：FlClash/TUN 在场时 glibc getifaddrs()
+  # 会返回 ifa_addr==NULL 的条目，官方 2014 客户端无空指针检查，启动约 3 秒
+  # 必崩。宁可在安装时明确失败，也不要装出一个会崩溃的环境。
+  if ! need_cmd cc; then
+    die "缺少 cc（gcc）：无法编译 getifaddrs 兼容垫片；没有它 FlClash/TUN 在场时官方客户端必崩。请安装 gcc 后重新运行 scripts/install.sh。"
+  fi
+  log "编译 getifaddrs 兼容垫片。"
+  rm -f "${BUILD_DIR}/nicshim.so"
+  cc -shared -fPIC -O2 -Wall -Wextra -Werror \
+    -o "${BUILD_DIR}/nicshim.so" "${ROOT_DIR}/compat/nicshim.c" -ldl
+}
+
+install_nicshim() {
+  log "安装 root-owned getifaddrs 垫片。"
+  sudo install -D -m 755 -o root -g root "${BUILD_DIR}/nicshim.so" "${LIBEXEC_DIR}/nicshim.so"
 }
 
 cleanup_build_artifacts() {
@@ -204,6 +222,14 @@ install_official_client() {
 
   log "通过 root-owned helper 安装官方客户端：${zip_path}"
   sudo "${HELPER_FILE}" install-client "$(realpath "${zip_path}")"
+}
+
+refresh_wrapper() {
+  # 每次安装都执行：既有安装的 wrapper 里没有垫片加载逻辑，只有重写才能让
+  # 升级后的安装获得防崩溃垫片；helper 侧用原子替换，幂等且不要求客户端
+  # 二进制已安装。
+  log "刷新官方客户端 wrapper。"
+  sudo "${HELPER_FILE}" install-wrapper
 }
 
 install_gui() {
@@ -329,8 +355,11 @@ main() {
   preflight_privileges
   install_system_deps
   build_binaries
+  build_nicshim
   install_privileged_helper
+  install_nicshim
   install_official_client
+  refresh_wrapper
   install_gui
   cleanup_build_artifacts
 

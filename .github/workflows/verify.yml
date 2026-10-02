@@ -52,6 +52,22 @@ jobs:
       - name: Build release binary
         run: cargo build --locked --release
 
+      - name: Compile and verify the ifaddrs compatibility shim
+        run: |
+          cc -shared -fPIC -O2 -Wall -Wextra -Werror -o /tmp/nicshim.so compat/nicshim.c -ldl
+          cc -O2 -Wall -Wextra -Werror -o /tmp/nicshim-test tests/nicshim.c
+          cc -shared -fPIC -O2 -Wall -Wextra -Werror -DNICSHIM_TEST_FAKE \
+            -o /tmp/nicshim-fake.so tests/nicshim.c
+          # 合成链表的「无垫片」运行必须能看见 NULL 条目，证明断言有区分力。
+          if LD_PRELOAD=/tmp/nicshim-fake.so /tmp/nicshim-test >/dev/null 2>&1; then
+            echo '合成 NULL 条目在无垫片时未被检出' >&2
+            exit 1
+          fi
+          # 带垫片时必须摘除头/中/尾全部 NULL 条目，只留一个正常节点。
+          shim_output="$(LD_PRELOAD="/tmp/nicshim.so /tmp/nicshim-fake.so" /tmp/nicshim-test)"
+          printf '%s\n' "${shim_output}"
+          [[ "${shim_output}" == "total=1 null=0" ]]
+
       - name: Validate shell scripts
         run: |
           bash -n scripts/bootstrap.sh scripts/install.sh
@@ -73,7 +89,8 @@ jobs:
           # 且覆盖所有文本文件（当前仓库干净，因此这条不会因历史遗留而失败）。
           matches="$(grep -rlE \
             --include='*.rs' --include='*.sh' --include='*.md' --include='*.toml' \
-            --include='*.yml' --include='*.policy' --include='*.desktop' --include='.gitignore' \
+            --include='*.yml' --include='*.c' --include='*.policy' --include='*.desktop' \
+            --include='.gitignore' \
             --exclude-dir=target --exclude-dir=.git \
             '[[:space:]]+$' . || true)"
           if [ -n "${matches}" ]; then

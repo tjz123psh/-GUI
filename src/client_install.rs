@@ -27,6 +27,24 @@ pub fn install_official_client(zip_path: &Path, app_dir: &Path, client_path: &Pa
     result
 }
 
+/// 只刷新官方客户端 wrapper，不要求客户端二进制已存在。
+///
+/// 供 install.sh 在每次安装时以 root helper 调用：既有安装里的 wrapper 不含
+/// getifaddrs 垫片加载逻辑，只有重写才能升级；同时新装客户端时也可用同一份
+/// 逻辑。写入复用 `write_wrapper_temp` + `rename` 的原子替换，失败时清理临时
+/// 文件，不留下半写状态。
+pub fn install_wrapper_only(bin_dir: &Path) -> Result<()> {
+    fs::create_dir_all(bin_dir).context("无法创建客户端 wrapper 目录")?;
+    let app_dir = Path::new(crate::privileged::CLIENT_DIR);
+    let client_path = bin_dir.join("rjsupplicant");
+    let wrapper_temp = write_wrapper_temp(bin_dir, &wrapper_script(app_dir, bin_dir))?;
+    if let Err(err) = fs::rename(&wrapper_temp, &client_path) {
+        let _ = fs::remove_file(&wrapper_temp);
+        return Err(err).context("无法安装官方客户端 wrapper");
+    }
+    Ok(())
+}
+
 fn snapshot_archive(source_path: &Path, destination: &Path) -> Result<()> {
     let mut source_options = fs::OpenOptions::new();
     source_options.read(true);
@@ -99,7 +117,7 @@ fn install_official_client_inner(
     fs::create_dir_all(bin_dir).context("无法创建用户程序目录")?;
     let app_parent = app_dir.parent().context("无法确定客户端安装目录")?;
     fs::create_dir_all(app_parent).context("无法创建客户端安装目录")?;
-    let wrapper_temp = write_wrapper_temp(bin_dir, &wrapper_script(app_dir))?;
+    let wrapper_temp = write_wrapper_temp(bin_dir, &wrapper_script(app_dir, bin_dir))?;
 
     let previous = staging.join("previous-installation");
     let had_previous = app_dir.exists();
@@ -270,7 +288,10 @@ fn make_client_binaries_executable(extracted: &Path) -> Result<()> {
     Ok(())
 }
 
-fn wrapper_script(app_dir: &Path) -> String {
+fn wrapper_script(app_dir: &Path, bin_dir: &Path) -> String {
+    // 垫片路径与 wrapper 同目录（root-owned，install.sh 编译安装）。
+    // LD_PRELOAD 必须直接覆盖而不是追加：wrapper 以 root 运行官方客户端，
+    // 追加会把调用者/用户环境里的 preload 带进特权进程（提权面）。
     format!(
         "#!/usr/bin/bash\n\
          set -euo pipefail\n\
@@ -279,10 +300,17 @@ fn wrapper_script(app_dir: &Path) -> String {
          if [[ \"$(/usr/bin/getconf LONG_BIT)\" != \"64\" ]]; then\n\
            arch_dir=\"${{app_dir}}/x86\"\n\
          fi\n\
+         # 官方 2014 客户端在 FlClash/TUN 存在时对 getifaddrs 的 ifa_addr==NULL\n\
+         # 条目无空指针检查，必崩；垫片不存在时静默跳过（不影响旧安装）。\n\
+         shim={}\n\
+         if [[ -r \"${{shim}}\" ]]; then\n\
+           export LD_PRELOAD=\"${{shim}}\"\n\
+         fi\n\
          cd \"${{arch_dir}}\"\n\
          export LD_LIBRARY_PATH=\"${{arch_dir}}/lib\"\n\
          exec \"${{arch_dir}}/rjsupplicant\" \"$@\"\n",
-        shell_quote(&app_dir.to_string_lossy())
+        shell_quote(&app_dir.to_string_lossy()),
+        shell_quote(&bin_dir.join("nicshim.so").to_string_lossy())
     )
 }
 
@@ -433,7 +461,10 @@ mod tests {
 
     #[test]
     fn quotes_wrapper_data_path() {
-        let script = wrapper_script(Path::new("/home/student's data/rjsupplicant"));
+        let script = wrapper_script(
+            Path::new("/home/student's data/rjsupplicant"),
+            Path::new("/home/student's data/bin"),
+        );
 
         assert!(script.starts_with("#!/usr/bin/bash\n"));
         assert!(script.contains("app_dir='/home/student'\"'\"'s data/rjsupplicant'"));
@@ -441,6 +472,27 @@ mod tests {
         assert!(script.contains("export LD_LIBRARY_PATH=\"${arch_dir}/lib\""));
         assert!(!script.contains("${LD_LIBRARY_PATH"));
         assert!(script.contains("exec \"${arch_dir}/rjsupplicant\" \"$@\""));
+    }
+
+    #[test]
+    fn wrapper_loads_ifaddrs_shim_only_when_present() {
+        let script = wrapper_script(
+            Path::new("/usr/lib/rjsupplicant"),
+            Path::new("/usr/lib/rjsupplicant-gui"),
+        );
+
+        assert!(script.contains("shim='/usr/lib/rjsupplicant-gui/nicshim.so'"));
+        assert!(script.contains("if [[ -r \"${shim}\" ]]; then"));
+        // 必须覆盖而不是追加 LD_PRELOAD：不能把用户/环境的 preload 带进
+        // 以 root 运行的官方客户端进程。
+        assert!(script.contains("export LD_PRELOAD=\"${shim}\""));
+        assert!(!script.contains("${LD_PRELOAD"));
+        // 垫片要在 exec 之前加载。
+        let shim_pos = script.find("export LD_PRELOAD").expect("定位垫片加载");
+        let exec_pos = script
+            .find("exec \"${arch_dir}/rjsupplicant\"")
+            .expect("定位客户端 exec");
+        assert!(shim_pos < exec_pos);
     }
 
     #[test]
@@ -492,6 +544,35 @@ mod tests {
         assert!(result.is_err());
         assert!(app_dir.join("old-marker").is_file());
         assert!(!app_dir.join("x64/rjsupplicant").exists());
+        fs::remove_dir_all(root).expect("clean fixture root");
+    }
+
+    #[test]
+    fn installs_wrapper_without_client_binary() {
+        // install-wrapper 子命令只重写 wrapper：目录里没有客户端二进制也应成功，
+        // 且不留下临时文件。
+        let root = create_staging_dir(&std::env::temp_dir()).expect("create fixture root");
+        let bin_dir = root.join("libexec");
+        install_wrapper_only(&bin_dir).expect("install wrapper only");
+
+        let wrapper_path = bin_dir.join("rjsupplicant");
+        let wrapper = fs::read_to_string(&wrapper_path).expect("read installed wrapper");
+        assert!(wrapper.contains(&shell_quote(crate::privileged::CLIENT_DIR)));
+        assert!(wrapper.contains("nicshim.so"));
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(&wrapper_path)
+                .expect("read wrapper mode")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+        assert_eq!(
+            fs::read_dir(&bin_dir).expect("list bin dir").count(),
+            1,
+            "目录里应只有 wrapper，临时文件必须已 rename 或清理"
+        );
         fs::remove_dir_all(root).expect("clean fixture root");
     }
 

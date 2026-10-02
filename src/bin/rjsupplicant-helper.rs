@@ -41,9 +41,10 @@ fn run() -> Result<ExitCode> {
     // 串行化所有会改动认证状态的动作：两个实例并发时会交叉读取同一份 run.log
     // 做成败判定（把对方的结果当本轮），写服务单元与 systemctl 交错也会留下
     // 半配置状态。`restore-network` 由 systemd 以 root 调用，绝不能被界面动作
-    // 挡住，所以不参与加锁。
+    // 挡住，所以不参与加锁；`install-wrapper` 同理，只由 install.sh 以 sudo
+    // 调用且不改认证状态，安装时不应被界面动作挡住。
     let _action_lock = match &request {
-        HelperRequest::RestoreNetwork => None,
+        HelperRequest::RestoreNetwork | HelperRequest::InstallWrapper => None,
         _ => Some(acquire_action_lock()?),
     };
     match request {
@@ -51,6 +52,11 @@ fn run() -> Result<ExitCode> {
             &zip_path,
             Path::new(CLIENT_DIR),
             Path::new(CLIENT_WRAPPER_PATH),
+        ),
+        HelperRequest::InstallWrapper => client_install::install_wrapper_only(
+            Path::new(CLIENT_WRAPPER_PATH)
+                .parent()
+                .context("无法确定官方客户端 wrapper 目录")?,
         ),
         HelperRequest::Authenticate(mut options) => {
             options.password = read_auth_password()?;
@@ -95,9 +101,36 @@ fn run() -> Result<ExitCode> {
 /// systemd ExecCondition 判定：退出码 1 = 跳过本次启动（systemd 视为成功、
 /// 不触发 Restart），0 = 需要认证、继续执行 ExecStart。探测无法判断时按
 /// "需要认证"处理，保持旧行为（宁可多跑一次客户端，也不要漏掉认证）。
+/// 开机时网卡链路可能还在协商：r8169 实机（2026-10-02）在 systemd 启动本单元
+/// 后约 4 秒才 Link Up——09:36:32 判定"未连接网线"跳过自动认证，09:36:36 链路
+/// 才起来。这里给链路一个宽限窗口：期间载波变为 1 就继续认证；到点仍未起来才
+/// 按"未接网线"处理。网卡不存在（None=无法判断）不等待。
+const CARRIER_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+const CARRIER_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+
+fn wait_for_carrier(
+    nic: &str,
+    timeout: std::time::Duration,
+    step: std::time::Duration,
+) -> Option<bool> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match netcheck::carrier_up(nic) {
+            Some(true) => return Some(true),
+            None => return None,
+            Some(false) => {
+                if std::time::Instant::now() >= deadline {
+                    return Some(false);
+                }
+                std::thread::sleep(step);
+            }
+        }
+    }
+}
+
 fn should_authenticate_exit_code(nic: &str) -> ExitCode {
     match autostart_decision(
-        netcheck::carrier_up(nic),
+        wait_for_carrier(nic, CARRIER_WAIT, CARRIER_POLL),
         netcheck::wired_path_reachable(nic),
     ) {
         AuthDecision::SkipNoCarrier => {
@@ -705,6 +738,23 @@ mod tests {
             AuthDecision::Authenticate
         );
         assert_eq!(autostart_decision(None, None), AuthDecision::Authenticate);
+    }
+
+    #[test]
+    fn carrier_wait_is_bounded_and_immediate_when_decided() {
+        // 超时为零：立即返回当前载波状态，不做任何等待。断言与 carrier_up 一致，
+        // 不依赖本机链路此刻是 Up 还是 Down。
+        let started = std::time::Instant::now();
+        let waited = wait_for_carrier("eno1", std::time::Duration::ZERO, CARRIER_POLL);
+        assert_eq!(waited, netcheck::carrier_up("eno1"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        // 不存在的网卡（None=无法判断）不进入等待窗口。
+        let started = std::time::Instant::now();
+        assert_eq!(
+            wait_for_carrier("rj-nonexistent0", CARRIER_WAIT, CARRIER_POLL),
+            None
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
     }
 
     #[test]

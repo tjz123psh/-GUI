@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased - 2026-10-02
+
+### FlClash/TUN 崩溃根因修复与开机链路竞态修复（蜂群并行：子代理实现垫片流水线 + 主代理实现载波宽限与整合）
+
+用户报告重启后「网络又连接不上」。实机定位为两个独立缺陷，均已修复并验证：
+
+- **根因 1：官方客户端在 FlClash TUN 存在时确定性 SIGSEGV**。FlClash(mihomo) 的 TUN 接口在 glibc `getifaddrs()` 结果里给出 `ifa_addr == NULL` 的条目（实机全机 31 条中唯一一条）；官方 2014 客户端在 `get_nics_info` 遍历链表时直接解引用 `ifa_addr->sa_family`（无空指针检查），启动约 3 秒必崩（`segfault at 0 ip 0x451999`，崩溃指令 `movzwl (%rax),%r14d`）。这解释了此前的"间歇性崩溃"：只要 FlClash 的 TUN 在枚举时刻存在就必崩——2026-10-02 单日 6 次启动 6 次同一地址崩溃。
+  修复：新增 `compat/nicshim.c` 兼容垫片——`dlsym(RTLD_NEXT,"getifaddrs")` 包装，把 `ifa_addr==NULL` 的节点摘出链表（glibc 的 getifaddrs 是一整块分配、`freeifaddrs` 释放整块，摘链不泄漏）。`scripts/install.sh` 用 `cc`（依赖新增 gcc）编译为 `libexec/nicshim.so` 并以 root:root 0755 安装；官方客户端 wrapper 在 exec 前按需 `export LD_PRELOAD`（**覆盖而非追加**，防止把调用者环境的 preload 带进 root 客户端；垫片缺失时静默跳过，旧安装不受影响）。新增 helper 子命令 `install-wrapper`（只由 install.sh 以 sudo 调用；不进 polkit 动作表——pkexec 按 `exec.argv1` 匹配动作，无对应动作即无法触发）让既有安装也能升级 wrapper。CI 增加垫片编译与合成链表行为门禁（`tests/nicshim.c`，覆盖头/中/尾三处摘链）。
+- **根因 2：开机自动认证被约 4 秒的链路竞态跳过**。2026-10-02 开机时 r8169 在 09:36:32 仍 `Link is Down`，ExecCondition 判定"未连接网线"跳过；09:36:36 链路才 Up。修复：`should-authenticate` 在载波为 0 时进入 20 秒宽限窗口（2 秒轮询），期间 Link Up 即继续认证；网卡不存在（None）不等待。
+
+验证（全部实机）：
+- 垫片行为门禁（CI 同款命令本地重跑）：合成链表"无垫片"运行检出 2 个 NULL（exit 1）；`LD_PRELOAD="nicshim.so nicshim-fake.so"` 后 `total=1 null=0`（exit 0）。
+- 端到端：`helper disconnect` 断开现有会话（探测超时）→ `systemctl start rjsupplicant.service`（ExecCondition 放行）→ 客户端经新 wrapper 启动 → 09:59:48 认证成功、单元 `active/running`、eno1 `192.168.129.140/23`、探测 404/12ms；`/proc/<pid>/environ` 证实 `LD_PRELOAD=/usr/lib/rjsupplicant-gui/nicshim.so` 由 wrapper 注入。
+- 载波宽限计时（veth 对，测后即删）：carrier=0 时 `should-authenticate` 等待 20.015s 后输出"rjtest0 未连接网线，跳过开机认证"（exit 1）；carrier=1 时 4.0s 内判定"需要认证"（exit 0，其中约 2s 为 curl 连接超时）。
+- 门禁：28+33+10 项测试（另 1 项 ignored 真机冒烟）、`clippy --all-targets -D warnings`、`fmt --check`、`bash -n`、`shellcheck`（4 个脚本）、`tests/install_uninstall.sh`、`tests/bootstrap.sh`、release 构建、行尾空白扫描全绿。
+- 未验证：真重启后的完整开机路径（链路协商时序；本轮以 veth 计时 + 单元路径做了替代验证）；"网线后插自动认证"仍为手动操作（本次未加定时器）。
+
 ## Unreleased - 2026-10-01
 
 ### 会话保持识别与开机认证跳过轮（实机事故：显示「未连接」但网络可用）

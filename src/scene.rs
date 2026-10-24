@@ -14,7 +14,7 @@
 //! 画面焦点移到素材左端虚化区，实现"窄列装饰零负担"。
 
 use gtk4 as gtk;
-use gtk4::cairo::{Context, ImageSurface, LinearGradient, RadialGradient};
+use gtk4::cairo::{Context, ImageSurface, LineCap, LinearGradient, RadialGradient};
 use gtk4::glib;
 use gtk4::prelude::*;
 use std::cell::{Cell, RefCell};
@@ -51,12 +51,12 @@ const SUCCESS_UNTIL_IDLE: f64 = 10.0;
 /// 所以这条只兜"外层彻底卡住"，不会掐掉正常长度的认证。
 const CONNECTING_UNTIL_IDLE: f64 = 240.0;
 
-/// 场景帧预算（秒）：Idle 只有慢速花瓣与薄雾在动，30fps 看不出阶跃；特效层用
-/// 满帧率保证光带/霞光连续。这个窗口是常驻的，不该一直吃满刷新率。
+/// 场景帧预算（秒）：只有 Connecting/Success/Failed 需要逐帧动画，30fps 已经
+/// 足够顺滑；Idle 是静态图，帧时钟完全停下，不再为飘落花瓣/薄雾常驻耗电。
 const IDLE_FRAME_INTERVAL: f64 = 1.0 / 30.0;
-const EFFECT_FRAME_INTERVAL: f64 = 1.0 / 60.0;
-/// 链路光点是主视觉反馈，保持满帧率。
-const LINK_FRAME_INTERVAL: f64 = 1.0 / 60.0;
+const EFFECT_FRAME_INTERVAL: f64 = 1.0 / 30.0;
+/// 链路光点是主视觉反馈，30fps 与场景同频，避免两套帧时钟互相抢刷新。
+const LINK_FRAME_INTERVAL: f64 = 1.0 / 30.0;
 
 /// 未钳制进度：1.0 = 动画跑完，大于 1.0 = 在满强度上又停留了多少比例。
 fn progress_of(mode: Mode, elapsed: f64) -> f64 {
@@ -105,9 +105,14 @@ fn frame_due(now: f64, last: Option<f64>, interval: f64) -> bool {
     }
 }
 
+/// 场景只在认证动效期间需要帧时钟；Idle 静态停帧。
+fn scene_needs_frames(mode: Mode) -> bool {
+    !matches!(mode, Mode::Idle)
+}
+
 /// 链路在 Idle 下是静态图（pulse 固定、光点速度为 0），不需要逐帧唤醒帧时钟。
 fn link_needs_frames(mode: Mode) -> bool {
-    !matches!(mode, Mode::Idle)
+    scene_needs_frames(mode)
 }
 
 /// 链路节点图标：Tabler 线性图标（24px 源，深樱紫 #b8507c 描边，
@@ -178,6 +183,8 @@ impl State {
 pub struct Scene {
     area: gtk::DrawingArea,
     state: Rc<RefCell<State>>,
+    /// 动画期帧回调是否已挂载。Idle 时卸载，set_mode 重新进入动画模式时挂回。
+    ticking: Rc<Cell<bool>>,
 }
 
 impl Scene {
@@ -197,22 +204,13 @@ impl Scene {
             draw_scene(cr, w as f64, h as f64, &s, &draw_sakura);
         });
 
-        let state2 = state.clone();
-        // 只用 GTK 传进来的控件引用重绘：闭包被控件拥有，再把控件克隆进闭包
-        // 就构成自引用环，控件永不释放（每开一个窗口泄漏一份）。
-        area.add_tick_callback(move |area, clock| {
-            // mapped 才是"真的会被画出来"：is_visible() 只看 visible 标记，窗口
-            // 最小化/隐藏时子控件仍然 visible，用它判断会继续空转重绘。
-            let t = clock.frame_time() as f64 / 1_000_000.0;
-            // borrow 在 queue_draw 之前结束，避免与 draw 回调形成双借用 panic。
-            let redraw = state2.borrow_mut().advance(t, area.is_mapped());
-            if redraw {
-                area.queue_draw();
-            }
-            glib::ControlFlow::Continue
-        });
-
-        Scene { area, state }
+        // 初始 Idle 是静态图，不挂载常驻帧回调；进入 Connecting/Success/Failed
+        // 时由 set_mode 挂载，模式自动回落 Idle 后回调自行退出。
+        Scene {
+            area,
+            state,
+            ticking: Rc::new(Cell::new(false)),
+        }
     }
 
     pub fn widget(&self) -> &gtk::DrawingArea {
@@ -220,11 +218,46 @@ impl Scene {
     }
 
     pub fn set_mode(&self, mode: Mode) {
-        let mut s = self.state.borrow_mut();
-        s.mode = mode;
-        s.start = s.t;
-        drop(s);
+        {
+            // Idle 不跑帧时钟，`State::t` 会停在上一段动画结束的时刻；模式切换
+            // 必须以当前单调钟重新起算，否则长时间 Idle 后第一次连接会带着
+            // 几十秒的旧进度直接跳到动画终点。
+            let now = glib::monotonic_time() as f64 / 1_000_000.0;
+            let mut s = self.state.borrow_mut();
+            s.t = now;
+            s.start = now;
+            s.mode = mode;
+            if !self.area.is_mapped() {
+                s.hidden = true;
+            }
+        }
         self.area.queue_draw();
+        if scene_needs_frames(mode) && !self.ticking.get() {
+            self.arm_tick();
+        }
+    }
+
+    /// 挂载动画期帧回调。只用 GTK 传进来的控件引用重绘：闭包被控件拥有，
+    /// 再把控件克隆进闭包就构成自引用环，控件永不释放。
+    fn arm_tick(&self) {
+        self.ticking.set(true);
+        let state = self.state.clone();
+        let ticking = self.ticking.clone();
+        self.area.add_tick_callback(move |area, clock| {
+            // mapped 才是"真的会被画出来"：is_visible() 只看 visible 标记，窗口
+            // 最小化/隐藏时子控件仍然 visible，用它判断会继续空转重绘。
+            let t = clock.frame_time() as f64 / 1_000_000.0;
+            let redraw = state.borrow_mut().advance(t, area.is_mapped());
+            if redraw {
+                area.queue_draw();
+            }
+            let idle = state.borrow().mode == Mode::Idle;
+            if idle {
+                ticking.set(false);
+                return glib::ControlFlow::Break;
+            }
+            glib::ControlFlow::Continue
+        });
     }
 
     /// 设置画面水平焦点。0.5=居中（默认）；越接近 0 越显示素材左端
@@ -263,9 +296,21 @@ impl Link {
         area.set_hexpand(true);
         area.set_vexpand(true);
 
+        // PNG 只解码一次：旧实现把 create_from_png 放在 draw 回调里，动画期间
+        // 每帧都要解两张 64px 图标，纯属浪费。这里是编译期内嵌素材，缓存成
+        // ImageSurface 后 draw 只做缩放绘制。
+        let device_icon = load_png(ICON_DEVICE);
+        let gateway_icon = load_png(ICON_GATEWAY);
         let draw_mode = mode.clone();
         area.set_draw_func(move |_, cr, w, h| {
-            draw_link(cr, w as f64, h as f64, draw_mode.get());
+            draw_link(
+                cr,
+                w as f64,
+                h as f64,
+                draw_mode.get(),
+                &device_icon,
+                &gateway_icon,
+            );
         });
 
         // 初始 Idle 是静态图，不挂载帧回调：常驻小工具不该逐帧唤醒帧时钟。
@@ -330,7 +375,14 @@ impl Link {
 ///   Connecting 粉色流动光点缓慢推进
 ///   Success    亮金粉链路 + 快速光点 + 节点光晕（签名时刻）
 ///   Failed     冷红虚线闪烁
-fn draw_link(cr: &Context, w: f64, h: f64, mode: Mode) {
+fn draw_link(
+    cr: &Context,
+    w: f64,
+    h: f64,
+    mode: Mode,
+    device_icon: &ImageSurface,
+    gateway_icon: &ImageSurface,
+) {
     if w < 120.0 || h < 80.0 {
         return;
     }
@@ -355,50 +407,91 @@ fn draw_link(cr: &Context, w: f64, h: f64, mode: Mode) {
         _ => (0.76, 0.30, 0.49, 0.30 + 0.25 * pulse),
     };
     cr.set_line_width(3.0);
+    cr.set_line_cap(LineCap::Round);
+    if mode == Mode::Failed {
+        // 失败态用虚线表达"链路中断"，与成功态实线形成明确对比。
+        cr.set_dash(&[7.0, 6.0], 0.0);
+    } else {
+        cr.set_dash(&[], 0.0);
+    }
     cr.set_source_rgba(link_color.0, link_color.1, link_color.2, link_color.3);
     cr.move_to(left_x + node_r, cy);
     cr.line_to(right_x - node_r, cy);
     let _ = cr.stroke();
+    cr.set_dash(&[], 0.0);
 
-    // 流动光点：沿链路往返
+    // 流动光点：沿链路往返；Success 额外画一串递减的拖尾光点。
     let speed = match mode {
         Mode::Success => 1.6,
         Mode::Connecting => 0.8,
         _ => 0.0,
     };
     if speed > 0.0 {
-        let span = right_x - node_r - (left_x + node_r);
+        let start = left_x + node_r;
+        let span = right_x - node_r - start;
         let pos = (t * speed).fract();
-        let x = left_x + node_r + span * pos;
-        let glow_r = if mode == Mode::Success { 1.0 } else { 0.9 };
-        let glow_g = if mode == Mode::Success { 0.62 } else { 0.42 };
-        let glow_b = if mode == Mode::Success { 0.75 } else { 0.55 };
-        let rg = RadialGradient::new(x, cy, 0.0, x, cy, 14.0);
-        rg.add_color_stop_rgba(0.0, glow_r, glow_g, glow_b, 0.95);
-        rg.add_color_stop_rgba(1.0, glow_r, glow_g, glow_b, 0.0);
-        let _ = cr.set_source(&rg);
-        let _ = cr.paint();
+        let x = start + span * pos;
+        let (glow_r, glow_g, glow_b) = if mode == Mode::Success {
+            (1.0, 0.62, 0.75)
+        } else {
+            (0.9, 0.42, 0.55)
+        };
+        if mode == Mode::Success {
+            for i in 1..=4 {
+                let tx = x - span * 0.035 * i as f64;
+                if tx < start {
+                    continue;
+                }
+                let alpha = 0.50 * (1.0 - i as f64 / 5.0);
+                draw_glow(
+                    cr,
+                    tx,
+                    cy,
+                    10.0 - i as f64 * 1.4,
+                    (glow_r, glow_g, glow_b),
+                    alpha,
+                );
+            }
+        }
+        draw_glow(cr, x, cy, 14.0, (glow_r, glow_g, glow_b), 0.95);
     }
 
-    // 链路上方漂移的樱花色调点缀（保持主题）
     // ---- 左节点：设备（圆形玻璃底 + 笔记本图标）----
     draw_node_base(cr, left_x, cy, node_r, mode);
-    draw_node_icon(cr, left_x, cy, node_r, ICON_DEVICE);
+    draw_node_icon(cr, left_x, cy, node_r, device_icon);
 
     // ---- 右节点：校园网关（圆形玻璃底 + 服务器图标）----
     draw_node_base(cr, right_x, cy, node_r, mode);
-    draw_node_icon(cr, right_x, cy, node_r, ICON_GATEWAY);
+    draw_node_icon(cr, right_x, cy, node_r, gateway_icon);
 }
 
-/// 节点圆形玻璃底，成功时带暖粉光晕。
+/// 光点：局部 radial gradient，只在光点半径内绘制，避免整幅画布铺渐变。
+fn draw_glow(cr: &Context, x: f64, y: f64, radius: f64, color: (f64, f64, f64), alpha: f64) {
+    let (r, g, b) = color;
+    let _ = cr.save();
+    cr.arc(x, y, radius, 0.0, std::f64::consts::TAU);
+    cr.clip();
+    let rg = RadialGradient::new(x, y, 0.0, x, y, radius);
+    rg.add_color_stop_rgba(0.0, r, g, b, alpha);
+    rg.add_color_stop_rgba(1.0, r, g, b, 0.0);
+    let _ = cr.set_source(&rg);
+    let _ = cr.paint();
+    let _ = cr.restore();
+}
+
+/// 节点圆形玻璃底，成功时带暖粉光晕（光晕裁剪在节点局部区域）。
 fn draw_node_base(cr: &Context, x: f64, y: f64, r: f64, mode: Mode) {
-    let halo = mode == Mode::Success;
-    if halo {
-        let rg = RadialGradient::new(x, y, r * 0.4, x, y, r * 2.1);
+    if mode == Mode::Success {
+        let halo_r = r * 2.1;
+        let _ = cr.save();
+        cr.arc(x, y, halo_r, 0.0, std::f64::consts::TAU);
+        cr.clip();
+        let rg = RadialGradient::new(x, y, r * 0.4, x, y, halo_r);
         rg.add_color_stop_rgba(0.0, 1.0, 0.62, 0.78, 0.55);
         rg.add_color_stop_rgba(1.0, 1.0, 0.62, 0.78, 0.0);
         let _ = cr.set_source(&rg);
         let _ = cr.paint();
+        let _ = cr.restore();
     }
     let bg = LinearGradient::new(x, y - r, x, y + r);
     bg.add_color_stop_rgba(0.0, 1.0, 0.95, 0.98, 0.92);
@@ -413,19 +506,18 @@ fn draw_node_base(cr: &Context, x: f64, y: f64, r: f64, mode: Mode) {
     let _ = cr.restore();
 }
 
-/// 在节点圆形玻璃底上绘制 Tabler 图标：内接于圆、随节点半径缩放，
-/// PNG 自带 alpha，与底部圆渐变自然合成。解码失败时静默跳过（只留圆底）。
-fn draw_node_icon(cr: &Context, x: f64, y: f64, r: f64, png: &[u8]) {
-    let mut reader = png;
-    let Ok(icon) = ImageSurface::create_from_png(&mut reader) else {
+/// 在节点圆形玻璃底上绘制已缓存的 Tabler 图标：内接于圆、随节点半径缩放，
+/// PNG 自带 alpha，与底部圆渐变自然合成。
+fn draw_node_icon(cr: &Context, x: f64, y: f64, r: f64, icon: &ImageSurface) {
+    if icon.width() < 2 || icon.height() < 2 {
         return;
-    };
+    }
     // 内接于圆的正方形边长（约 r*1.25 是圆内最大内接方，留描边呼吸边用 1.20）
     let s = r * 1.20;
     let _ = cr.save();
     cr.translate(x - s / 2.0, y - s / 2.0);
     cr.scale(s / 64.0, s / 64.0);
-    let _ = cr.set_source_surface(&icon, 0.0, 0.0);
+    let _ = cr.set_source_surface(icon, 0.0, 0.0);
     let _ = cr.paint();
     let _ = cr.restore();
 }
@@ -562,11 +654,18 @@ fn draw_mist(cr: &Context, _w: f64, h: f64, t: f64) {
 fn draw_connecting_glow(cr: &Context, w: f64, h: f64, p: f64) {
     let cx = w * 0.5;
     let cy = h * 1.05 - p * h * 0.5;
-    let rg = RadialGradient::new(cx, cy, 0.0, cx, cy, h * 0.55);
+    let radius = h * 0.55;
+    // 只画光晕实际覆盖的下半屏区域，避免每帧对整幅画布铺 radial gradient。
+    let top = (cy - radius).max(0.0);
+    let _ = cr.save();
+    cr.rectangle(0.0, top, w, h - top);
+    cr.clip();
+    let rg = RadialGradient::new(cx, cy, 0.0, cx, cy, radius);
     rg.add_color_stop_rgba(0.0, 1.0, 0.55, 0.70, 0.30 * p);
     rg.add_color_stop_rgba(1.0, 1.0, 0.55, 0.70, 0.0);
     let _ = cr.set_source(&rg);
     let _ = cr.paint();
+    let _ = cr.restore();
 }
 
 /// 认证成功：全画布粉色霞光漫开。
@@ -594,6 +693,7 @@ mod tests {
     use super::{
         CONNECTING_UNTIL_IDLE, FAILED_ANIM, IDLE_FRAME_INTERVAL, Mode, SUCCESS_UNTIL_IDLE, State,
         fallback_progress, frame_due, link_needs_frames, mode_after_progress, progress_of,
+        scene_needs_frames,
     };
 
     /// 该模式停留多少秒后自动回落 Idle；`None` = 永不自治回落。
@@ -721,6 +821,14 @@ mod tests {
         );
         for mode in [Mode::Connecting, Mode::Success, Mode::Failed] {
             assert!(link_needs_frames(mode));
+        }
+    }
+
+    #[test]
+    fn scene_only_ticks_during_animation_modes() {
+        assert!(!scene_needs_frames(Mode::Idle), "Idle 必须静态停帧");
+        for mode in [Mode::Connecting, Mode::Success, Mode::Failed] {
+            assert!(scene_needs_frames(mode));
         }
     }
 }

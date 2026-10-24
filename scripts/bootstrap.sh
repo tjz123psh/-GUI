@@ -8,6 +8,7 @@ CLIENT_URL="https://etr.gdufs.edu.cn/wlxg/RG_Supplicant_For_Linux_V1.31.zip"
 CLIENT_SHA256="d211d9a6efbe5f9dcc27eb78af9515a279b3e44dfc8580e6801b79e9a4f1eea9"
 CLIENT_FILENAME="RG_Supplicant_For_Linux_V1.31.zip"
 SOURCE_DIR="${RJSUPPLICANT_SOURCE_DIR:-${HOME:-}/.local/src/rjsupplicant-gui}"
+ROOT_CLIENT_DIR="${RJSUPPLICANT_PRIVILEGED_CLIENT_DIR:-/usr/lib/rjsupplicant}"
 
 log() {
   printf '[rjsupplicant-bootstrap] %s\n' "$*"
@@ -32,6 +33,7 @@ EOF
 
 validate_environment() {
   [[ -n "${HOME:-}" ]] || die "HOME 为空，无法确定源码目录。"
+  [[ "${HOME}" == /* ]] || die "HOME 必须是绝对路径：${HOME}"
   [[ "${SOURCE_DIR}" == /* && "${SOURCE_DIR}" != "/" ]] ||
     die "源码目录必须是非根绝对路径：${SOURCE_DIR}"
 
@@ -61,11 +63,67 @@ validate_checkout() {
   [[ -f "${SOURCE_DIR}/scripts/install.sh" ]] || die "下载内容缺少安装脚本。"
 }
 
+current_arch_name() {
+  case "$(uname -m)" in
+    x86_64) printf '%s\n' "x64" ;;
+    i386 | i686) printf '%s\n' "x86" ;;
+    *) printf '%s\n' "unsupported-arch" ;;
+  esac
+}
+
+root_owned_executable() {
+  local path="$1" owner mode
+  [[ -f "${path}" ]] || return 1
+  owner="$(stat -c '%u' -- "${path}" 2>/dev/null)" || return 1
+  mode="$(stat -c '%a' -- "${path}" 2>/dev/null)" || return 1
+  [[ "${owner}" == "0" ]] || return 1
+  [[ $((8#"${mode}" & 8#022)) -eq 0 ]] || return 1
+  [[ -x "${path}" ]]
+}
+
+root_official_client_ready() {
+  local arch
+  arch="$(current_arch_name)"
+  root_owned_executable "${ROOT_CLIENT_DIR}/${arch}/rjsupplicant"
+}
+
+run_git_with_retry() {
+  local attempt delay=2
+  for attempt in 1 2 3; do
+    if "$@"; then
+      return 0
+    fi
+    if ((attempt < 3)); then
+      log "Git 操作失败（第 ${attempt}/3 次），${delay} 秒后重试。"
+      sleep "${delay}"
+      delay=$((delay * 2))
+    fi
+  done
+  return 1
+}
+
+clone_git_checkout() {
+  local attempt delay=2
+  for attempt in 1 2 3; do
+    if git clone --depth 1 --branch main "${REPOSITORY_URL}" "${SOURCE_DIR}"; then
+      return 0
+    fi
+    # 失败的 clone 可能留下半成品目录；清理后重试，避免第二次误报“已存在”。
+    rm -rf -- "${SOURCE_DIR}"
+    if ((attempt < 3)); then
+      log "Git 操作失败（第 ${attempt}/3 次），${delay} 秒后重试。"
+      sleep "${delay}"
+      delay=$((delay * 2))
+    fi
+  done
+  return 1
+}
+
 update_git_checkout() {
   if [[ ! -e "${SOURCE_DIR}" ]]; then
     log "克隆 GitHub 源码到 ${SOURCE_DIR}。"
     mkdir -p "$(dirname -- "${SOURCE_DIR}")"
-    git clone --depth 1 --branch main "${REPOSITORY_URL}" "${SOURCE_DIR}"
+    clone_git_checkout || die "无法从 GitHub 克隆源码（已重试 3 次）。"
     return
   fi
 
@@ -81,7 +139,8 @@ update_git_checkout() {
     die "源码仓库 origin 不是项目 GitHub 地址，拒绝自动执行。"
 
   log "从 GitHub 检查更新。"
-  git -C "${SOURCE_DIR}" fetch origin main
+  run_git_with_retry git -C "${SOURCE_DIR}" fetch origin main ||
+    die "无法从 GitHub 获取源码更新（已重试 3 次）。"
   git -C "${SOURCE_DIR}" merge-base --is-ancestor HEAD FETCH_HEAD ||
     die "本地 main 与 GitHub 已分叉，拒绝自动合并。"
   git -C "${SOURCE_DIR}" merge --ff-only FETCH_HEAD
@@ -105,7 +164,10 @@ download_archive_checkout() {
   trap cleanup_archive EXIT
 
   log "从 GitHub 下载 main 分支源码。"
-  curl --fail --silent --show-error --location "${ARCHIVE_URL}" --output "${archive}"
+  curl --fail --silent --show-error --location \
+    --retry 3 --retry-delay 2 --retry-connrefused \
+    --connect-timeout 10 --max-time 300 \
+    "${ARCHIVE_URL}" --output "${archive}"
   mkdir "${checkout}"
   tar -xzf "${archive}" -C "${checkout}" --strip-components=1
   [[ -f "${checkout}/Cargo.toml" && -f "${checkout}/scripts/install.sh" ]] ||
@@ -116,18 +178,36 @@ download_archive_checkout() {
 }
 
 ensure_official_client_zip() {
-  command -v curl >/dev/null 2>&1 || die "找不到 curl。"
-  command -v sha256sum >/dev/null 2>&1 || die "找不到 sha256sum。"
-
+  local actual
   if [[ -n "${RJSUPPLICANT_ZIP:-}" ]]; then
     [[ -f "${RJSUPPLICANT_ZIP}" ]] ||
       die "RJSUPPLICANT_ZIP 指向的文件不存在：${RJSUPPLICANT_ZIP}"
-    log "使用指定的官方客户端：${RJSUPPLICANT_ZIP}"
+    command -v sha256sum >/dev/null 2>&1 || die "找不到 sha256sum。"
+    actual="$(sha256sum -- "${RJSUPPLICANT_ZIP}")"
+    actual="${actual%% *}"
+    if [[ "${actual}" != "${CLIENT_SHA256}" ]]; then
+      if [[ "${RJSUPPLICANT_ALLOW_UNVERIFIED_ZIP:-0}" == "1" ]]; then
+        log "警告：已设置 RJSUPPLICANT_ALLOW_UNVERIFIED_ZIP=1，跳过 SHA-256 校验；使用未经完整性验证的客户端 ZIP 存在被篡改风险：${RJSUPPLICANT_ZIP}"
+      else
+        die "RJSUPPLICANT_ZIP 的 SHA-256 校验失败（期望 ${CLIENT_SHA256}，实际 ${actual}）：${RJSUPPLICANT_ZIP}。如确需使用未验证文件，请显式设置 RJSUPPLICANT_ALLOW_UNVERIFIED_ZIP=1 并自行承担风险。"
+      fi
+    else
+      log "使用指定的官方客户端（SHA-256 校验通过）：${RJSUPPLICANT_ZIP}"
+    fi
     export RJSUPPLICANT_ZIP
     return
   fi
 
-  local destination actual temporary
+  if root_official_client_ready &&
+    [[ "${RJSUPPLICANT_FORCE_CLIENT_INSTALL:-0}" != "1" ]]; then
+    log "检测到 root-owned 官方客户端已安装，跳过学校 ZIP 下载（可用 RJSUPPLICANT_FORCE_CLIENT_INSTALL=1 强制重新安装）。"
+    return
+  fi
+
+  command -v curl >/dev/null 2>&1 || die "找不到 curl。"
+  command -v sha256sum >/dev/null 2>&1 || die "找不到 sha256sum。"
+
+  local destination temporary
   destination="${HOME}/Downloads/${CLIENT_FILENAME}"
   if [[ -f "${destination}" ]]; then
     actual="$(sha256sum "${destination}")"
@@ -148,7 +228,10 @@ ensure_official_client_zip() {
   trap cleanup_client_download EXIT
 
   log "从广东外语外贸大学官网下载 Linux 客户端。"
-  curl --fail --silent --show-error --location "${CLIENT_URL}" --output "${temporary}"
+  curl --fail --silent --show-error --location \
+    --retry 3 --retry-delay 2 --retry-connrefused \
+    --connect-timeout 10 --max-time 300 \
+    "${CLIENT_URL}" --output "${temporary}"
   actual="$(sha256sum "${temporary}")"
   actual="${actual%% *}"
   [[ "${actual}" == "${CLIENT_SHA256}" ]] ||

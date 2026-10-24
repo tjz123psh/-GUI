@@ -1,11 +1,11 @@
 # rjsupplicant-gui 项目交接文档
 
-- 最后更新：2026-10-02
-- 当前版本：0.3.0（实机联调修复轮、重启失联事故修复轮、**2026-10-01 会话保持识别与开机认证跳过轮**均已完成）
-- 项目状态：后端与提权链功能冻结（提权边界与状态可信度三轮修复已解除其中被用户明确要求修改的条目）；前端皮肤完成；**2026-09-01 校园有线网实机联调**与 **2026-09-02 重启事故修复轮**已完成；手动认证实测成功；**提权边界轮 / 并发与资源轮 / 状态可信度与渲染资源轮 + 两轮 CI 修复已完成、已提交推送本机已部署，GitHub Actions 全绿**；**2026-10-02 FlClash/TUN 崩溃修复与开机链路竞态修复轮已完成并实机验证**；等待用户最终手动确认错误密码、polkit 交互与开机自启（含修复后的 Type=simple 单元），以及 README「已知安全边界」两项是否进一步处置
+- 最后更新：2026-10-24
+- 当前版本：0.3.0（实机联调修复轮、重启失联事故修复轮、2026-10-01 会话保持识别与开机认证跳过轮、**2026-10-24 状态可信度/GUI/安装脚本加固轮**均已完成）
+- 项目状态：2026-10-24 按用户要求解冻后端与前端做了一轮全面边界修复（状态判定、helper 认证退出码、GUI 结构与美化、安装脚本），当前待部署与实机复核；此前后端与提权链功能冻结（提权边界与状态可信度三轮修复已解除其中被用户明确要求修改的条目）；前端皮肤完成；**2026-09-01 校园有线网实机联调**与 **2026-09-02 重启事故修复轮**已完成；手动认证实测成功；**提权边界轮 / 并发与资源轮 / 状态可信度与渲染资源轮 + 两轮 CI 修复已完成、已提交推送本机已部署，GitHub Actions 全绿**；**2026-10-02 FlClash/TUN 崩溃修复与开机链路竞态修复轮已完成并实机验证**；等待用户最终手动确认错误密码、polkit 交互与开机自启（含修复后的 Type=simple 单元），以及 README「已知安全边界」两项是否进一步处置
 - 最终验收代码基线：`9ff5645`
-- 当前代码基线：`f05bc6c`（2026-10-02 FlClash/TUN 崩溃修复与开机链路竞态修复，已推送 origin/main，CI 全绿——run 36953764102 的 Arch Linux 作业 success）
-- 主分支：`main`，与 `origin/main` 同步（`f05bc6c`）
+- 当前代码基线：`f05bc6c` + 2026-10-24 工作区改动（尚未提交/推送；详见 CHANGELOG「2026-10-24」）
+- 主分支：`main`；本轮工作在 `wip/hardening` 分支完成后并入 `main` 并推送
 - 远端：`git@github.com:tjz123psh/-GUI.git`
 
 ## 1. 交接结论
@@ -201,6 +201,21 @@
 2. **根因 2：开机 4 秒链路竞态**。开机时 r8169 尚未 Link Up，ExecCondition 判定"未连接网线"跳过自动认证。**修复**：`should-authenticate` 载波为 0 时进入 20 秒宽限窗口（2 秒轮询）。
 
 实机验证：合成链表门禁通过；`disconnect → systemctl start` 端到端重连成功（09:59:48 认证成功、单元 active/running、探测 404/12ms、`/proc/<pid>/environ` 含 wrapper 注入的 `LD_PRELOAD`）；veth 计时验证载波宽限（carrier=0 → 20.015s 后跳过；carrier=1 → 4.0s 判定认证）。未验证：真重启开机路径、"网线后插自动认证"（仍手动）。
+
+## 3.7 状态可信度 / 认证判定 / GUI 与安装脚本加固轮（2026-10-24，batch 蜂群）
+
+用户报告「明明连接上了、能正常使用却显示未连接」，要求找出所有边界情况、修 bug、美化 GUI 并重新部署。四个只读审计（状态语义、UI/场景、helper/特权、安装脚本）定位后，按写集互斥由 worker 实现，主代理整合与实机验证。
+
+**最重要实证**：本机 `en_US.UTF-8` 下官方客户端 `run.log` 实际写 `Success` / `Supplicate failure`，旧代码只匹配中文 `认证成功`。一次已成功的 GUI 认证因此被 helper 判成 Pending，等满 68 秒后 `return Ok(())` 假成功；期间网络已通、GUI 一直「未连接」。修复为 `privileged::AuthLineKind` 中英文整行判定 + helper 先日志后进程 + 超时 `AuthConclusion::Unconfirmed`（退出码 3），GUI 对应「认证结果未确认」。
+
+其余关键修复：
+- 探测三态 `CarrierState`/`ProbeOutcome`；carrier Unknown 不短路；HTTP 状态码过滤 captive portal；多目标 TCP + 始终 libc 兜底；至少两个方法明确失败才 Unreachable。UI 四态 `LinkState`（已连接/客户端运行中/未连接/状态未知），探测 Unknown 且 IPv4+默认路由时按网卡地址证据显示已连接。
+- `ClientProcessState` 跳过僵尸、root 进程 exe 不可读时退回 comm（hidepid 不再误报未知）；`systemctl show` 一次读全服务字段；`wired_interfaces` 保留 VLAN/bridge/USB，不伪造 eno1。
+- 刷新 generation 丢弃过期结果；状态命令 3 秒硬超时；连接开始「认证中…」；状态胶囊 FlowBox 2×2；缺失客户端 banner+禁用；自启开关重入保护；长文本 ellipsize；大状态字截断修复。
+- 视觉：对比度提升、状态色令牌、focus/disabled/hover、headerbar 32px、卡片阴影收敛、net-info 对齐、链路动效细化、场景 Idle 停帧与图标缓存。
+- 脚本：测试模式 `realpath -m` 防越界、删除 `$HOME` wrapper sudo 回退、显式 ZIP SHA-256、已装客户端跳过下载、curl/git 重试、libadwaita 运行时检查（本机本轮的 GUI 无法启动正是 `pacman -Rns kate kooha` 连带卸载 libadwaita 所致）。
+
+验证：97 项 Rust 测试、clippy/fmt/release、shellcheck/隔离回归全绿；KWin 1920×1080 实机 640/960/1280 三档截图复核；未验证错误密码英文终局、polkit 取消/保留、真重启开机路径。
 
 ## 4. 技术栈与仓库结构
 
@@ -463,7 +478,7 @@ xmllint --noout data/io.github.pang.RjSupplicantGui.policy
 git diff --check
 ```
 
-当前 Rust 测试共 33 项，覆盖设置参数校验、新旧认证命令构造、密码标准输入校验、helper 参数拒绝、固定 root service、旧 service 路径拒绝、systemd 参数转义、认证轮询判定优先级（早退优先于日志标记、成功不被"认证失败"字样翻盘）、认证日志偏移前进与截断/坏字节恢复、ZIP 路径/源文件/符号链接校验、权限收紧、客户端安装、wrapper 生成和失败回滚、提权目标 root-owned 闸门、`command_exists` 执行位判定与提权有界等待（超时须终止并回收子进程）；另有 2 个隔离 shell 回归脚本，分别覆盖 curl 引导下载/校验/覆盖保护，以及安装卸载、root-owned 产物、不安全 ZIP、回滚、服务清理、拒绝以 root 执行用户可写 wrapper 和配置保留。
+当前 Rust 测试共 97 项（35 lib + 50 GUI + 12 helper，另有 1 项真实探测 ignored），覆盖设置参数校验、新旧认证命令构造、密码标准输入校验、helper 参数拒绝、固定 root service、旧 service 路径拒绝、systemd 参数转义、认证轮询判定优先级（早退优先于日志标记、成功不被"认证失败"字样翻盘）、认证日志偏移前进与截断/坏字节恢复、ZIP 路径/源文件/符号链接校验、权限收紧、客户端安装、wrapper 生成和失败回滚、提权目标 root-owned 闸门、`command_exists` 执行位判定与提权有界等待（超时须终止并回收子进程）；另有 2 个隔离 shell 回归脚本，分别覆盖 curl 引导下载/校验/覆盖保护，以及安装卸载、root-owned 产物、不安全 ZIP、回滚、服务清理、拒绝以 root 执行用户可写 wrapper 和配置保留。
 
 GitHub Actions 的 `Verify` 工作流使用 `archlinux:latest` 容器执行同一组检查，避免 Ubuntu 较旧的 libadwaita 版本与正式目标不一致。工作流在 push、pull request 和手动触发时运行，并使用 `Cargo.lock` 的锁定依赖。
 

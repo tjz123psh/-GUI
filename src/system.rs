@@ -6,14 +6,14 @@
 use crate::config::{self, SERVICE, Settings};
 use anyhow::{Context, Result};
 use rjsupplicant_gui::privileged::{
-    self, AUTH_HISTORY_FAILURE_MARKERS, AUTH_SUCCESS_MARKER, AuthOptions, CLIENT_DIR, HELPER_PATH,
-    HelperRequest,
+    self, AuthLineKind, AuthOptions, CLIENT_DIR, HELPER_PATH, HelperRequest,
 };
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
 
 const PKEXEC_PATH: &str = "/usr/bin/pkexec";
 const SUDO_PATH: &str = "/usr/bin/sudo";
@@ -24,10 +24,21 @@ const IP_BIN: &str = "/usr/bin/ip";
 /// 所有点击被吞掉却无法取消（旧实现无超时；终端回退改成"等待结果"后一度无上界）。
 const ELEVATION_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// 状态类命令（systemctl/nmcli/journalctl/ps）的硬超时：任何一个卡住都不能
+/// 让 10 秒轮询永久停在 refreshing=true，把界面冻结在旧状态。
+const STATUS_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommandSpec {
     pub program: String,
     pub args: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClientProcessState {
+    Running,
+    NotRunning,
+    Unknown,
 }
 
 #[derive(Clone, Debug)]
@@ -38,15 +49,34 @@ pub struct ClientStatus {
     /// 服务内容安全但模板过旧（缺少「已联网跳过」的 ExecCondition）：
     /// 只需重新开启一次开机认证完成迁移，与"不安全"区分展示。
     pub service_template_outdated: bool,
+    pub client_process: ClientProcessState,
+    /// 兼容旧前端：等价于 `client_process == ClientProcessState::Running`。
     pub client_running: bool,
     pub client_uptime_seconds: Option<u64>,
     pub service_enabled: String,
     pub service_active: String,
+    pub service_sub: String,
+    pub service_result: String,
     pub last_log: String,
     /// NetworkManager 无线射频是否启用。射频状态由 NM 持久化，
     /// 用户手动关 Wi-Fi 后重启仍保持关闭（实测事故源头之一）。
-    pub wifi_radio_enabled: bool,
+    /// `None` 表示 nmcli 缺失或输出无法判断，调用方不得按"已启用"或"已关闭"误报。
+    pub wifi_radio_enabled: Option<bool>,
 }
+
+/// 认证 helper 退出码 3 对应的错误：认证结果未确认（既不是成功也不是失败）。
+#[derive(Debug)]
+pub struct AuthUnconfirmed;
+
+impl std::fmt::Display for AuthUnconfirmed {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("认证结果未确认（AuthUnconfirmed）")
+    }
+}
+
+impl std::error::Error for AuthUnconfirmed {}
+
+const AUTH_UNCONFIRMED_MARKER: &str = "AuthUnconfirmed";
 
 #[derive(Clone, Debug)]
 pub enum Action {
@@ -58,27 +88,100 @@ pub enum Action {
     RestartService,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ServiceProperties {
+    load_state: String,
+    unit_file_state: String,
+    active_state: String,
+    sub_state: String,
+    result: String,
+}
+
+impl Default for ServiceProperties {
+    fn default() -> Self {
+        Self {
+            load_state: "unknown".to_string(),
+            unit_file_state: "unknown".to_string(),
+            active_state: "unknown".to_string(),
+            sub_state: "unknown".to_string(),
+            result: "unknown".to_string(),
+        }
+    }
+}
+
+fn parse_service_properties(text: &str) -> ServiceProperties {
+    let mut properties = ServiceProperties::default();
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = value.trim();
+        let value = if value.is_empty() { "unknown" } else { value };
+        let slot = match key.trim() {
+            "LoadState" => &mut properties.load_state,
+            "UnitFileState" => &mut properties.unit_file_state,
+            "ActiveState" => &mut properties.active_state,
+            "SubState" => &mut properties.sub_state,
+            "Result" => &mut properties.result,
+            _ => continue,
+        };
+        *slot = value.to_string();
+    }
+    properties
+}
+
+fn load_service_properties() -> ServiceProperties {
+    // 一次性读取全部字段，避免 is-enabled/is-active 两次调用之间状态漂移。
+    let args = [
+        "show",
+        "-p",
+        "LoadState",
+        "-p",
+        "UnitFileState",
+        "-p",
+        "ActiveState",
+        "-p",
+        "SubState",
+        "-p",
+        "Result",
+        "--",
+        SERVICE,
+    ];
+    let mut command = Command::new(SYSTEMCTL_PATH);
+    command.args(args);
+    let Some(output) = command_output_with_timeout(command, STATUS_COMMAND_TIMEOUT) else {
+        return ServiceProperties::default();
+    };
+    if !output.status.success() {
+        return ServiceProperties::default();
+    }
+    parse_service_properties(&String::from_utf8_lossy(&output.stdout))
+}
+
 pub fn load_status() -> ClientStatus {
-    let (client_running, client_uptime_seconds) = client_process_info();
+    let (client_process, client_uptime_seconds) = client_process_info();
+    let client_running = client_process == ClientProcessState::Running;
     let privileged_ready = privileged_client_ready();
     let legacy_ready = legacy_client_ready();
-    let service_enabled = command_text(SYSTEMCTL_PATH, &["is-enabled", SERVICE])
-        .unwrap_or_else(|| "unknown".to_string());
-    let service_active = command_text(SYSTEMCTL_PATH, &["is-active", SERVICE])
-        .unwrap_or_else(|| "unknown".to_string());
-    // 未知时按"已启用"处理（不误报）；nmcli 随 NetworkManager 安装。
+    let service = load_service_properties();
     let wifi_radio_enabled = command_text("/usr/bin/nmcli", &["-t", "-f", "WIFI", "radio"])
-        .map(|value| value.trim() == "enabled")
-        .unwrap_or(true);
+        .and_then(|value| match value.trim() {
+            "enabled" => Some(true),
+            "disabled" => Some(false),
+            _ => None,
+        });
     ClientStatus {
         client_installed: privileged_ready || legacy_ready,
         client_requires_migration: helper_installed() && !privileged_ready && legacy_ready,
         service_requires_migration: privileged_ready && installed_service_is_unsafe(),
         service_template_outdated: privileged_ready && installed_service_is_outdated(),
+        client_process,
         client_running,
         client_uptime_seconds,
-        service_enabled,
-        service_active,
+        service_enabled: service.unit_file_state,
+        service_active: service.active_state,
+        service_sub: service.sub_state,
+        service_result: service.result,
         last_log: recent_log(),
         wifi_radio_enabled,
     }
@@ -93,24 +196,29 @@ pub fn wired_interfaces() -> Vec<String> {
             let name = entry.file_name().into_string().ok()?;
             let path = entry.path();
             let link_type = fs::read_to_string(path.join("type")).ok()?;
-            if name == "lo" || link_type.trim() != "1" || path.join("wireless").exists() {
+            if is_excluded_wired_interface(&name)
+                || link_type.trim() != "1"
+                || path.join("wireless").exists()
+            {
                 return None;
             }
+            // `device` 存在的是物理网卡/USB 网卡；VLAN、bridge、bond 没有该链接，
+            // 但仍要保留，只是排在物理网卡之后。
             Some((name, path.join("device").exists()))
         })
         .collect::<Vec<_>>();
 
     ethernet.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
-    let has_physical = ethernet.iter().any(|(_, physical)| *physical);
-    let mut names = ethernet
-        .into_iter()
-        .filter(|(_, physical)| !has_physical || *physical)
-        .map(|(name, _)| name)
-        .collect::<Vec<_>>();
-    if names.is_empty() {
-        names.push("eno1".to_string());
-    }
-    names
+    ethernet.into_iter().map(|(name, _)| name).collect()
+}
+
+fn is_excluded_wired_interface(name: &str) -> bool {
+    name == "lo"
+        || [
+            "docker", "virbr", "vmnet", "veth", "br-", "tun", "tap", "wg",
+        ]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
 }
 
 /// 网卡物理链路是否已连接；读不到 carrier（网卡不存在等）返回 `None`，
@@ -166,6 +274,61 @@ pub fn interface_gateway(name: &str) -> Option<String> {
     None
 }
 
+/// 网卡是否已有 IPv4 地址。先看 sysfs 网卡是否存在，再用 `ip -4` 读取；
+/// 子进程有硬超时，避免网络栈异常时卡住状态刷新。
+pub fn interface_has_ipv4(name: &str) -> bool {
+    let name = name.trim();
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains('/')
+        || name.contains('\0')
+        || !Path::new("/sys/class/net").join(name).is_dir()
+    {
+        return false;
+    }
+    let mut command = Command::new(IP_BIN);
+    command.args(["-4", "-o", "addr", "show", "dev", name]);
+    let Some(output) = command_output_with_timeout(command, Duration::from_millis(800)) else {
+        return false;
+    };
+    output.status.success() && ipv4_output_has_address(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn ipv4_output_has_address(text: &str) -> bool {
+    text.lines().any(|line| {
+        let mut words = line.split_whitespace();
+        words.any(|word| word == "inet") && words.any(|word| word.contains('.'))
+    })
+}
+
+/// 网卡是否有默认路由。直接解析 `/proc/net/route`，不做任何阻塞调用。
+pub fn interface_has_default_route(name: &str) -> bool {
+    let Ok(text) = fs::read_to_string("/proc/net/route") else {
+        return false;
+    };
+    parse_default_route(&text, name.trim())
+}
+
+fn parse_default_route(text: &str, name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    text.lines().skip(1).any(|line| {
+        let mut fields = line.split_whitespace();
+        let Some(interface) = fields.next() else {
+            return false;
+        };
+        let Some(destination) = fields.next() else {
+            return false;
+        };
+        let Some(gateway) = fields.next() else {
+            return false;
+        };
+        interface == name && destination == "00000000" && gateway != "00000000"
+    })
+}
+
 pub fn install_official_client(zip_path: &Path) -> Result<()> {
     if helper_installed() {
         let zip_path = fs::canonicalize(zip_path).context("无法读取选择的安装包路径")?;
@@ -201,6 +364,18 @@ pub fn authenticate(settings: &Settings, password: &str) -> Result<()> {
         );
     }
     run_elevated_wait(Action::Authenticate, &spec.program, &spec.args)
+}
+
+/// 判断错误是否表示"helper 退出码 3：认证结果未确认"。
+/// 调用方据此保留忙碌/待确认状态，而不是当成明确失败去清空会话或提示密码错误。
+pub fn is_auth_unconfirmed(err: &anyhow::Error) -> bool {
+    if err.downcast_ref::<AuthUnconfirmed>().is_some() {
+        return true;
+    }
+    err.chain().any(|cause| {
+        let text = cause.to_string();
+        text.contains(AUTH_UNCONFIRMED_MARKER) || text.contains("认证结果未确认")
+    })
 }
 
 pub fn disconnect() -> Result<()> {
@@ -302,7 +477,8 @@ fn ensure_root_owned_program(program: &str) -> Result<()> {
 /// 终端回退：kitty/foot/alacritty/xterm 在被执行命令退出后才关闭，因此等待终端
 /// 进程即可拿到真实结果。旧实现在 `spawn()` 后直接返回成功，会把失败伪装成完成；
 /// 等待同样受 `ELEVATION_WAIT_TIMEOUT` 上界约束，避免密码提示挂起时 GUI 永久忙碌。
-fn run_terminal_elevated(title: &str, program: &str, args: &[String]) -> Result<()> {
+fn run_terminal_elevated(action: &Action, program: &str, args: &[String]) -> Result<()> {
+    let title = action_label(action);
     let mut command_args = vec![SUDO_PATH.to_string(), program.to_string()];
     command_args.extend(args.iter().cloned());
     let mut child = spawn_terminal(title, &command_args)?;
@@ -310,10 +486,18 @@ fn run_terminal_elevated(title: &str, program: &str, args: &[String]) -> Result<
     else {
         anyhow::bail!("{title} 在终端中等待超时，请确认该终端窗口（可能仍在等待密码）后重试");
     };
+    status_result(action, status).context("终端中的管理员命令执行失败")
+}
+
+/// 统一把子进程退出状态转成错误：认证动作的退出码 3 必须保留"未确认"语义。
+fn status_result(action: &Action, status: ExitStatus) -> Result<()> {
     if status.success() {
         return Ok(());
     }
-    anyhow::bail!("终端中的 sudo 执行失败：{status}")
+    if matches!(action, Action::Authenticate) && status.code() == Some(3) {
+        return Err(anyhow::Error::new(AuthUnconfirmed));
+    }
+    anyhow::bail!("{} 执行失败：{}", action_label(action), status)
 }
 
 /// 有界等待提权子进程：正常结束返回其状态；超时则终止并回收直接子进程后返回
@@ -381,14 +565,10 @@ fn run_elevated_wait_with_input(
             anyhow::bail!("{} 授权等待超时，请重试", action_label(&action));
         };
 
-        if status.success() {
-            return Ok(());
-        }
-
-        anyhow::bail!("{} 执行失败：{}", action_label(&action), status);
+        return status_result(&action, status);
     }
 
-    run_terminal_elevated(action_label(&action), program, args)
+    run_terminal_elevated(&action, program, args)
 }
 
 #[cfg(test)]
@@ -576,8 +756,9 @@ fn run_terminal(title: &str, args: &[String]) -> Result<()> {
 fn recent_log() -> String {
     let journal = command_text("journalctl", &["-u", SERVICE, "-n", "60", "--no-pager"])
         .filter(|text| !text.is_empty() && !text.contains("-- No entries --"));
-    let client = fs::read_to_string(client_log_path())
+    let client = fs::read(client_log_path())
         .ok()
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
         .filter(|text| !text.trim().is_empty())
         .map(|text| tail_lines(&text, 80));
 
@@ -597,32 +778,55 @@ fn tail_lines(text: &str, count: usize) -> String {
 }
 
 /// 官方日志中最近一次明确判定：`(时间, 是否成功, 详情)`。
-/// 供「连接详情」在应用重启后仍显示历史（会话内记录为空时回退到这里）。
+/// 只读末尾 64KiB，避免日志无限增长后每次刷新都整文件读入。
+const AUTH_LOG_TAIL_BYTES: u64 = 64 * 1024;
+
 pub fn last_auth_from_log() -> Option<(String, bool, String)> {
-    let text = fs::read_to_string(client_log_path()).ok()?;
+    let text = read_file_tail(&client_log_path(), AUTH_LOG_TAIL_BYTES)?;
     parse_last_auth(&text)
 }
 
-/// 只看末尾 200 行，从后往前找第一条"以终局标记开头"的行。
-/// 用"行首"而不是"包含"：官方成功横幅里的"上次认证失败的原因已修复"也含
-/// 标记词，但它出现在 `认证成功` 之后，不是判定行本身。
+fn read_file_tail(path: &Path, max_bytes: u64) -> Option<String> {
+    let mut file = fs::File::open(path).ok()?;
+    let length = file.metadata().ok()?.len();
+    let start = length.saturating_sub(max_bytes);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).ok()?;
+    let mut text = String::from_utf8_lossy(&bytes).into_owned();
+    if start > 0 {
+        // 截断点可能落在半行：丢掉第一行残片，避免把残片误认成判定行。
+        let newline = text.find('\n')?;
+        text.drain(..=newline);
+    }
+    Some(text)
+}
+
+/// 从后往前找第一条终局判定；Transient（重试提示）跳过继续向前找。
+/// 判定本身由 helper/GUI 共用的 `classify_auth_line` 完成，中英文日志同一套规则。
 fn parse_last_auth(text: &str) -> Option<(String, bool, String)> {
-    text.lines().rev().take(200).find_map(|line| {
+    for line in text.lines().rev() {
         let (time, body) = split_log_timestamp(line.trim());
         if body.is_empty() {
-            return None;
+            continue;
         }
-        if body.starts_with(AUTH_SUCCESS_MARKER) {
-            return Some((time, true, body.chars().take(32).collect()));
+        let detail = body.chars().take(32).collect::<String>();
+        match privileged::classify_auth_line(&body) {
+            Some(AuthLineKind::Success) => return Some((time, true, detail)),
+            Some(AuthLineKind::TerminalFailure) => {
+                // classify_auth_line 对终局失败用 contains；官方成功横幅里的
+                // “上次认证失败的原因已修复”也含标记，但不是判定行。判定行
+                // 必须以实际 marker 开头。
+                if privileged::auth_line_reason(&body)
+                    .is_some_and(|marker| body.starts_with(marker))
+                {
+                    return Some((time, false, detail));
+                }
+            }
+            Some(AuthLineKind::TransientFailure) | None => {}
         }
-        if AUTH_HISTORY_FAILURE_MARKERS
-            .iter()
-            .any(|marker| body.starts_with(marker))
-        {
-            return Some((time, false, body.chars().take(32).collect()));
-        }
-        None
-    })
+    }
+    None
 }
 
 /// 切出日志行前缀 "YYYY-MM-DD HH:MM:SS"，返回 ("MM-DD HH:MM", 其余内容)。
@@ -657,30 +861,92 @@ fn strip_timestamp_prefix(line: &str) -> Option<(String, String)> {
     None
 }
 
-fn client_process_info() -> (bool, Option<u64>) {
-    let pid = fs::read_dir("/proc")
-        .ok()
-        .into_iter()
-        .flat_map(|entries| entries.flatten())
-        .filter(|entry| {
-            entry
-                .file_name()
-                .to_string_lossy()
-                .chars()
-                .all(|ch| ch.is_ascii_digit())
-        })
-        .find_map(|entry| {
-            fs::read_to_string(entry.path().join("comm"))
-                .ok()
-                .filter(|name| name.trim() == "rjsupplicant")
-                .map(|_| entry.file_name().to_string_lossy().into_owned())
-        });
-    let Some(pid) = pid else {
-        return (false, None);
+fn client_process_info() -> (ClientProcessState, Option<u64>) {
+    let entries = match fs::read_dir("/proc") {
+        Ok(entries) => entries,
+        // /proc 读不了时无法判断，绝不能谎报“未运行”。
+        Err(_) => return (ClientProcessState::Unknown, None),
     };
+    let mut inaccessible = false;
+    let mut found_pid = None;
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let pid = file_name.to_string_lossy();
+        if pid.is_empty() || !pid.chars().all(|ch| ch.is_ascii_digit()) {
+            continue;
+        }
+        let comm = match fs::read_to_string(entry.path().join("comm")) {
+            Ok(comm) => comm,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                // hidepid 等安全策略可能隐藏真正的客户端进程。
+                inaccessible = true;
+                continue;
+            }
+            Err(_) => continue,
+        };
+        if comm.trim() != "rjsupplicant" {
+            continue;
+        }
+        let stat = match fs::read_to_string(entry.path().join("stat")) {
+            Ok(stat) => stat,
+            // 权限受限时无法判断僵尸状态，但 comm 已匹配；继续按运行中处理，
+            // 不能让 root 客户的 /proc 隐藏把真实会话报成“未知”。
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => String::new(),
+            Err(_) => continue,
+        };
+        // 僵尸/死亡进程的 comm 仍是 rjsupplicant，但已经不持有任何会话。
+        if matches!(proc_stat_state(&stat), Some('Z' | 'X')) {
+            continue;
+        }
+        let exe = match fs::read_link(entry.path().join("exe")) {
+            Ok(exe) => exe,
+            // root helper 启动的客户端以 root 运行；普通用户读 /proc/<pid>/exe
+            // 会得到 EACCES。comm 已匹配且非僵尸，不能再报“未知”。
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                found_pid = Some(pid.into_owned());
+                break;
+            }
+            Err(_) => continue,
+        };
+        if !is_client_exe_target(&exe) {
+            continue;
+        }
+        found_pid = Some(pid.into_owned());
+        break;
+    }
+
+    let state = aggregate_client_process_state(found_pid.is_some(), inaccessible);
+    if state != ClientProcessState::Running {
+        return (state, None);
+    }
+    let pid = found_pid.expect("Running 状态必然有 pid");
     let uptime = command_text("ps", &["-o", "etimes=", "-p", &pid])
         .and_then(|value| value.trim().parse::<u64>().ok());
-    (true, uptime)
+    (ClientProcessState::Running, uptime)
+}
+
+fn aggregate_client_process_state(found: bool, inaccessible: bool) -> ClientProcessState {
+    if found {
+        ClientProcessState::Running
+    } else if inaccessible {
+        // 有进程信息因权限读不到：可能是客户端，也可能不是——只能报未知。
+        ClientProcessState::Unknown
+    } else {
+        ClientProcessState::NotRunning
+    }
+}
+
+/// `/proc/<pid>/stat` 的 state 是 `comm` 右括号后的第一个字段；
+/// 用 rfind 处理 comm 中可能出现的空格/括号。
+fn proc_stat_state(stat: &str) -> Option<char> {
+    let close = stat.rfind(')')?;
+    stat[close + 1..].split_whitespace().next()?.chars().next()
+}
+
+fn is_client_exe_target(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == "rjsupplicant" || name == "rjsupplicant (deleted)")
 }
 
 fn open_with_default_app(target: impl AsRef<std::ffi::OsStr>) -> Result<()> {
@@ -696,7 +962,9 @@ fn open_with_default_app(target: impl AsRef<std::ffi::OsStr>) -> Result<()> {
 }
 
 fn command_text(program: &str, args: &[&str]) -> Option<String> {
-    let output = Command::new(program).args(args).output().ok()?;
+    let mut command = Command::new(program);
+    command.args(args);
+    let output = command_output_with_timeout(command, STATUS_COMMAND_TIMEOUT)?;
     let text = if output.stdout.is_empty() {
         String::from_utf8_lossy(&output.stderr).to_string()
     } else {
@@ -704,6 +972,37 @@ fn command_text(program: &str, args: &[&str]) -> Option<String> {
     };
 
     Some(text.trim().to_string())
+}
+
+/// 有界读取短命令输出：到期直接 kill，避免 `ip` 等命令卡住状态刷新。
+fn command_output_with_timeout(
+    mut command: Command,
+    timeout: Duration,
+) -> Option<std::process::Output> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().ok()?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return child.wait_with_output().ok(),
+            Ok(None) => {}
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        std::thread::sleep((deadline - now).min(Duration::from_millis(20)));
+    }
 }
 
 fn command_exists(program: &str) -> bool {
@@ -1059,5 +1358,183 @@ mod tests {
         let (time, ok, _) = parse_last_auth("认证失败\n").expect("无时间前缀也能解析");
         assert!(time.is_empty());
         assert!(!ok);
+    }
+
+    #[test]
+    fn parses_chinese_and_english_auth_results() {
+        // 英文环境：Success / Authentication failed 与中文标记必须等价。
+        let english = "2026-10-01 09:03:50 Success\n\
+                       2026-10-01 09:04:00 Supplicate failure\n\
+                       2026-10-01 09:05:00 Authentication failed\n";
+        assert_eq!(
+            parse_last_auth(english),
+            Some((
+                "10-01 09:05".to_string(),
+                false,
+                "Authentication failed".to_string()
+            ))
+        );
+
+        // Transient（Supplicate failure）不是终局：必须继续向前找到真正的成功。
+        let retry_after_success =
+            "2026-10-01 09:03:50 Success\n2026-10-01 09:04:00 Supplicate failure\n";
+        assert_eq!(
+            parse_last_auth(retry_after_success),
+            Some(("10-01 09:03".to_string(), true, "Success".to_string()))
+        );
+
+        for transient in [
+            "2026-10-01 09:04:00 Adapter links down\n",
+            "2026-10-01 09:04:00 Adapter cann't work\n",
+            "2026-10-01 09:04:00 IP has chaged\n",
+        ] {
+            let log = format!("2026-10-01 09:03:50 认证成功\n{transient}");
+            assert_eq!(
+                parse_last_auth(&log),
+                Some(("10-01 09:03".to_string(), true, "认证成功".to_string())),
+                "{transient:?} 是重试提示，不应成为最近认证结果"
+            );
+        }
+    }
+
+    #[test]
+    fn maps_client_process_states_without_false_negatives() {
+        assert_eq!(
+            aggregate_client_process_state(true, false),
+            ClientProcessState::Running
+        );
+        assert_eq!(
+            aggregate_client_process_state(true, true),
+            ClientProcessState::Running,
+            "找到运行中的客户端时，其他进程不可读不应影响结论"
+        );
+        assert_eq!(
+            aggregate_client_process_state(false, true),
+            ClientProcessState::Unknown,
+            "权限不足只能报未知，不能报未运行"
+        );
+        assert_eq!(
+            aggregate_client_process_state(false, false),
+            ClientProcessState::NotRunning
+        );
+
+        // /proc/<pid>/stat 的 comm 可能包含空格/括号，state 取最后一个 ')' 之后。
+        assert_eq!(proc_stat_state("123 (rj supp (licant)) Z 1 2 3"), Some('Z'));
+        assert_eq!(proc_stat_state("123 (rjsupplicant) R 1 2 3"), Some('R'));
+        assert!(is_client_exe_target(Path::new(
+            "/usr/lib/rjsupplicant/rjsupplicant"
+        )));
+        assert!(!is_client_exe_target(Path::new("/bin/bash")));
+    }
+
+    #[test]
+    fn parses_systemctl_show_service_properties() {
+        let properties = parse_service_properties(
+            "LoadState=loaded\n\
+             UnitFileState=enabled\n\
+             ActiveState=active\n\
+             SubState=running\n\
+             Result=success\n",
+        );
+        assert_eq!(properties.load_state, "loaded");
+        assert_eq!(properties.unit_file_state, "enabled");
+        assert_eq!(properties.active_state, "active");
+        assert_eq!(properties.sub_state, "running");
+        assert_eq!(properties.result, "success");
+
+        // 命令失败/没有输出时各字段都是 unknown，调用方不会误报为正常。
+        let unknown = parse_service_properties("");
+        assert_eq!(unknown, ServiceProperties::default());
+        let empty_values = parse_service_properties("UnitFileState=\nActiveState=\n");
+        assert_eq!(empty_values.unit_file_state, "unknown");
+        assert_eq!(empty_values.active_state, "unknown");
+    }
+
+    #[test]
+    fn parses_default_route_from_proc_net_route() {
+        let routes = "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n\
+                      eno1\t00000000\t0101A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0\n\
+                      eno1\t0001A8C0\t00000000\t0001\t0\t0\t100\t00FFFFFF\t0\t0\t0\n";
+        assert!(parse_default_route(routes, "eno1"));
+        assert!(!parse_default_route(routes, "eno2"));
+        assert!(!parse_default_route(routes, ""));
+        let no_gateway = "Iface\tDestination\tGateway\n\
+                          eno1\t00000000\t00000000\n";
+        assert!(!parse_default_route(no_gateway, "eno1"));
+    }
+
+    #[test]
+    fn detects_ipv4_address_in_ip_output() {
+        assert!(ipv4_output_has_address(
+            "2: eno1    inet 192.168.1.5/24 brd 192.168.1.255 scope global eno1\n"
+        ));
+        assert!(!ipv4_output_has_address(
+            "2: eno1    inet6 fe80::1/64 scope link\n"
+        ));
+        assert!(!ipv4_output_has_address(""));
+        assert!(!interface_has_ipv4("rj-nonexistent0"));
+        assert!(!interface_has_default_route("rj-nonexistent0"));
+    }
+
+    #[test]
+    fn wired_interface_filter_keeps_vlan_bridge_bond_and_usb() {
+        for virtual_name in [
+            "lo", "docker0", "virbr0", "vmnet1", "veth123", "br-abcd", "tun0", "tap0", "wg0",
+        ] {
+            assert!(
+                is_excluded_wired_interface(virtual_name),
+                "{virtual_name} 不应出现在有线网卡列表"
+            );
+        }
+        for real_name in ["eno1", "enp4s0", "usb0", "eno1.100", "br0", "bond0"] {
+            assert!(
+                !is_excluded_wired_interface(real_name),
+                "{real_name} 应保留在有线网卡列表"
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_command_output_captures_and_times_out() {
+        let mut echo = Command::new("/bin/sh");
+        echo.args(["-c", "printf ok"]);
+        let output =
+            command_output_with_timeout(echo, Duration::from_secs(1)).expect("短命令应正常结束");
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"ok");
+
+        let mut slow = Command::new("/bin/sleep");
+        slow.arg("5");
+        let started = Instant::now();
+        assert!(command_output_with_timeout(slow, Duration::from_millis(50)).is_none());
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn reads_only_the_log_tail() {
+        let path =
+            std::env::temp_dir().join(format!("rjsupplicant-gui-log-tail-{}", std::process::id()));
+        let content = format!("{}\nTAIL\n", "x".repeat(256));
+        fs::write(&path, &content).expect("写入临时日志");
+        let tail = read_file_tail(&path, 32).expect("应读取末尾");
+        fs::remove_file(&path).expect("清理临时日志");
+        assert!(!tail.contains('x'), "只应保留末尾 32 字节：{tail:?}");
+        assert!(tail.ends_with("TAIL\n"));
+    }
+
+    #[test]
+    fn auth_unconfirmed_is_recognized() {
+        let err = anyhow::anyhow!(AUTH_UNCONFIRMED_MARKER);
+        assert!(is_auth_unconfirmed(&err));
+        assert!(is_auth_unconfirmed(&anyhow::anyhow!("认证结果未确认")));
+        assert!(!is_auth_unconfirmed(&anyhow::anyhow!("认证失败")));
+
+        let status = Command::new("sh")
+            .args(["-c", "exit 3"])
+            .status()
+            .expect("启动 sh 模拟 helper 退出码 3");
+        let err = status_result(&Action::Authenticate, status)
+            .expect_err("认证退出码 3 必须返回未确认错误");
+        assert!(is_auth_unconfirmed(&err));
     }
 }

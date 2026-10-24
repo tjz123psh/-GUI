@@ -2,8 +2,8 @@ use anyhow::{Context, Result};
 use rjsupplicant_gui::client_install;
 use rjsupplicant_gui::netcheck;
 use rjsupplicant_gui::privileged::{
-    AUTH_FAILURE_MARKERS, AUTH_SUCCESS_MARKER, AuthOptions, CLIENT_DIR, CLIENT_WRAPPER_PATH,
-    HelperRequest, SERVICE_PATH, client_binary_path, client_log_path,
+    AuthLineKind, AuthOptions, CLIENT_DIR, CLIENT_WRAPPER_PATH, HelperRequest, SERVICE_PATH,
+    auth_line_reason, classify_auth_text, client_binary_path, client_log_path,
     service_content_uses_owned_paths, service_file,
 };
 use std::fs;
@@ -60,7 +60,15 @@ fn run() -> Result<ExitCode> {
         ),
         HelperRequest::Authenticate(mut options) => {
             options.password = read_auth_password()?;
-            authenticate(&options)
+            match authenticate(&options)? {
+                AuthConclusion::Confirmed => Ok(()),
+                AuthConclusion::Unconfirmed => {
+                    eprintln!(
+                        "认证结果未确认：官方客户端未给出明确的认证结果，或客户端已退出且无法探测有线路径"
+                    );
+                    std::process::exit(3);
+                }
+            }
         }
         HelperRequest::Disconnect => {
             let result = disconnect();
@@ -200,7 +208,7 @@ fn acquire_action_lock() -> Result<fs::File> {
     Ok(file)
 }
 
-fn authenticate(options: &AuthOptions) -> Result<()> {
+fn authenticate(options: &AuthOptions) -> Result<AuthConclusion> {
     ensure_client_installed()?;
     // 网线未连接时不必启动客户端：官方客户端在该状态下会 SIGSEGV（实测
     // 12 次崩溃中有 3 次发生在无网线/无地址窗口），提前给出清晰错误。
@@ -242,20 +250,38 @@ fn await_auth_result(
     log_path: &Path,
     log_offset: &mut u64,
     nic: &str,
-) -> Result<()> {
+) -> Result<AuthConclusion> {
+    await_auth_result_with_timeout(
+        child,
+        log_path,
+        log_offset,
+        nic,
+        DHCP_RESTORE_DELAY + AUTH_RESULT_TIMEOUT,
+    )
+}
+
+/// 实际轮询逻辑；超时以参数注入，便于单测用很短的窗口覆盖“未确认”路径。
+fn await_auth_result_with_timeout(
+    child: &mut std::process::Child,
+    log_path: &Path,
+    log_offset: &mut u64,
+    nic: &str,
+    timeout: std::time::Duration,
+) -> Result<AuthConclusion> {
     // 客户端退出码不可靠（DHCP 失败也返回 0），成败以启动后新增的官方日志判定。
     let started = std::time::Instant::now();
     let mut restored = false;
     loop {
-        let outcome = classify_auth(
-            child
-                .try_wait()
-                .with_context(|| "有线认证失败：等待客户端退出失败")?
-                .is_some(),
-            new_log_tail(log_path, log_offset).as_deref(),
-        );
+        // 先确认进程状态再读日志：进程刚退出时，先把退出前写下的最后一段日志读全，
+        // 否则同一轮里可能把“已写 Success 后退出”误送进探测分支。
+        let client_exited = child
+            .try_wait()
+            .with_context(|| "有线认证失败：等待客户端退出失败")?
+            .is_some();
+        let new_log = new_log_tail(log_path, log_offset);
+        let outcome = classify_auth(client_exited, new_log.as_deref());
         match outcome {
-            AuthOutcome::Succeeded => return Ok(()),
+            AuthOutcome::Succeeded => return Ok(AuthConclusion::Confirmed),
             AuthOutcome::ClientExited => {
                 // 退出码不可靠（实测 DHCP 失败也返回 0）。客户端在网关会话
                 // 已建立后仍可能 SIGSEGV（实测：认证成功但没来得及写日志），
@@ -280,8 +306,8 @@ fn await_auth_result(
         // 失败判定窗口（客户端 DHCP 超时约 45 秒）。
         // 超时说明本轮判不出结果，此时**不**杀客户端：慢网络上"再等一会就成功"
         // 与"卡死"无法区分，误杀会真把一次能成的认证打断。
-        if started.elapsed() >= DHCP_RESTORE_DELAY + AUTH_RESULT_TIMEOUT {
-            return Ok(());
+        if started.elapsed() >= timeout {
+            return Ok(AuthConclusion::Unconfirmed);
         }
         std::thread::sleep(AUTH_POLL_INTERVAL);
     }
@@ -293,15 +319,25 @@ fn terminate_client(child: &mut std::process::Child) {
     let _ = child.wait();
 }
 
-/// 客户端退出后的判定：有线路径确实可用 → 认证已生效（Ok），这是实机事故
+/// 客户端退出后的判定：有线路径确实可用 → 认证已生效（Confirmed），这是实机事故
 /// 校正过的唯一可靠信号（客户端在会话建立后仍会崩溃、且不会写"认证成功"）。
-/// 探测不可用（None）与不可达（false）一律按未完成处理，避免把失败伪装成成功。
-fn exited_outcome_for(reachable: Option<bool>) -> Result<()> {
-    if reachable == Some(true) {
-        println!("官方客户端已退出，但有线路径已可用：认证会话已建立");
-        return Ok(());
+/// 探测明确不可达（false）才按未完成报错；探测不可用（None）返回 Unconfirmed，
+/// 让调用方保留“未确认”状态，而不是伪造成功或误报失败。
+fn exited_outcome_for(reachable: Option<bool>) -> Result<AuthConclusion> {
+    match reachable {
+        Some(true) => {
+            println!("官方客户端已退出，但有线路径已可用：认证会话已建立");
+            Ok(AuthConclusion::Confirmed)
+        }
+        Some(false) => anyhow::bail!("认证未完成：官方客户端进程已退出"),
+        None => Ok(AuthConclusion::Unconfirmed),
     }
-    anyhow::bail!("认证未完成：官方客户端进程已退出")
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AuthConclusion {
+    Confirmed,
+    Unconfirmed,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -312,24 +348,29 @@ enum AuthOutcome {
     Failed(String),
 }
 
-/// 单轮判定优先级：进程已退出 > 认证成功 > 失败标记。
-/// 早退排最前，是为了不把客户端崩溃后残留的日志行当成本轮结果；
-/// 「认证成功」排在失败标记之前，是为了避免官方客户端粘贴的管理中心提示里
-/// 出现「认证失败」字样时，把一次真实成功翻成失败。
+/// 单轮判定优先级：本轮新增日志里的成功证据最高；没有成功证据时才看进程退出。
+/// 重试提示（`Supplicate failure`、`Adapter links down`、`网线没有连接上` 等）
+/// 一律保持 Pending，绝不能据此终止仍在重试的客户端。
+/// 终局失败直接返回原因；`classify_auth_text` 内部已保证成功优先于失败字样，
+/// 避免官方客户端粘贴的管理中心提示里出现「认证失败」时把真实成功翻成失败。
 fn classify_auth(client_exited: bool, new_log: Option<&str>) -> AuthOutcome {
+    let new_log_kind = new_log.and_then(classify_auth_text);
+    match new_log_kind {
+        Some(AuthLineKind::Success) => return AuthOutcome::Succeeded,
+        Some(AuthLineKind::TerminalFailure) => {
+            let reason = new_log.and_then(auth_line_reason).unwrap_or("认证失败");
+            return AuthOutcome::Failed(reason.to_string());
+        }
+        Some(AuthLineKind::TransientFailure) if client_exited => {
+            return AuthOutcome::ClientExited;
+        }
+        Some(AuthLineKind::TransientFailure) => return AuthOutcome::Pending,
+        None => {}
+    }
     if client_exited {
         return AuthOutcome::ClientExited;
     }
-    let Some(new_log) = new_log else {
-        return AuthOutcome::Pending;
-    };
-    if new_log.contains(AUTH_SUCCESS_MARKER) {
-        return AuthOutcome::Succeeded;
-    }
-    match auth_failure_reason(new_log) {
-        Some(reason) => AuthOutcome::Failed(reason),
-        None => AuthOutcome::Pending,
-    }
+    AuthOutcome::Pending
 }
 
 /// 读取 `offset` 之后的新增日志，并把 `offset` 推进到本次消费到的位置。
@@ -355,13 +396,6 @@ fn new_log_tail(path: &Path, offset: &mut u64) -> Option<String> {
     }
     *offset = size;
     Some(text)
-}
-
-fn auth_failure_reason(new_log: &str) -> Option<String> {
-    AUTH_FAILURE_MARKERS
-        .iter()
-        .find(|marker| new_log.contains(**marker))
-        .map(|marker| marker.to_string())
 }
 
 fn read_auth_password() -> Result<Option<String>> {
@@ -611,24 +645,55 @@ mod tests {
     }
 
     #[test]
-    fn detects_auth_failure_markers() {
+    fn recognizes_english_success_and_keeps_retry_markers_pending() {
         assert_eq!(
-            auth_failure_reason("网线没有连接上，请检查网卡连接").as_deref(),
-            Some("网线没有连接上")
+            classify_auth(false, Some("2026-10-24 09:50:55 Success\n")),
+            AuthOutcome::Succeeded
         );
         assert_eq!(
-            auth_failure_reason("2026-09-01 17:15:44 无法获取动态IP地址").as_deref(),
-            Some("无法获取动态IP地址")
+            classify_auth(false, Some("Success")),
+            AuthOutcome::Succeeded
+        );
+        for retry in [
+            "2026-10-24 09:50:55 Supplicate failure\n",
+            "2026-10-24 09:50:55 Adapter links down, Please check it.\n",
+            "2026-10-24 09:50:55 网线没有连接上，请检查网卡连接。\n",
+        ] {
+            assert_eq!(
+                classify_auth(false, Some(retry)),
+                AuthOutcome::Pending,
+                "{retry}"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_failure_is_reported_with_its_marker() {
+        assert_eq!(
+            classify_auth(
+                false,
+                Some("2026-10-24 09:50:55 Authentication failure,Reason： ...\n")
+            ),
+            AuthOutcome::Failed("Authentication failure".to_string())
         );
         assert_eq!(
-            auth_failure_reason("认证失败无法连接认证服务器。").as_deref(),
-            Some("无法连接认证服务器")
+            classify_auth(
+                false,
+                Some("2026-10-24 09:50:55 Unable to get dynamic IP address.\n")
+            ),
+            AuthOutcome::Failed("Unable to get dynamic IP address".to_string())
         );
         assert_eq!(
-            auth_failure_reason("认证成功\n管理中心提示： 欢迎使用广外大网络！").as_deref(),
-            None
+            classify_auth(
+                false,
+                Some("2026-10-24 09:50:55 认证失败，无法连接认证服务器。\n")
+            ),
+            AuthOutcome::Failed("认证失败".to_string())
         );
-        assert_eq!(auth_failure_reason("").as_deref(), None);
+        assert_eq!(
+            classify_auth(false, Some("2026-10-24 09:50:55 无法连接认证服务器。\n")),
+            AuthOutcome::Failed("无法连接认证服务器".to_string())
+        );
     }
 
     #[test]
@@ -689,24 +754,28 @@ mod tests {
     }
 
     #[test]
-    fn early_client_exit_is_not_confused_with_auth_success() {
-        // 客户端崩溃后残留的“认证成功”不能被当成本轮结果；这条路径同时
-        // 必须触发网络恢复，由 authenticate 里的 NetworkRestorer 守卫保证。
+    fn client_exit_with_success_log_is_still_success() {
+        // 客户端可能在写完成功日志后立刻退出；本轮日志的成功证据优先级最高。
         assert_eq!(
-            classify_auth(true, Some("认证成功")),
-            AuthOutcome::ClientExited
+            classify_auth(true, Some("2026-10-24 09:50:55 Success\n")),
+            AuthOutcome::Succeeded
+        );
+        assert_eq!(
+            classify_auth(true, Some("2026-10-24 09:50:55 认证成功\n")),
+            AuthOutcome::Succeeded
         );
         assert_eq!(classify_auth(true, None), AuthOutcome::ClientExited);
+        // 退出后只剩重试提示也属于“没有成功证据”，交给探测判定而不是空等。
+        assert_eq!(
+            classify_auth(true, Some("2026-10-24 09:50:55 Supplicate failure\n")),
+            AuthOutcome::ClientExited
+        );
     }
 
     #[test]
     fn classifies_running_client_by_new_log_only() {
         assert_eq!(classify_auth(false, None), AuthOutcome::Pending);
         assert_eq!(classify_auth(false, Some("")), AuthOutcome::Pending);
-        assert_eq!(
-            classify_auth(false, Some("网线没有连接上，请检查网卡连接")),
-            AuthOutcome::Failed("网线没有连接上".to_string())
-        );
         assert_eq!(
             classify_auth(false, Some("认证成功\n管理中心提示： 欢迎使用广外大网络！")),
             AuthOutcome::Succeeded
@@ -716,6 +785,27 @@ mod tests {
             classify_auth(false, Some("认证成功\n上次认证失败的原因已修复")),
             AuthOutcome::Succeeded
         );
+    }
+
+    #[test]
+    fn auth_timeout_returns_unconfirmed_without_claiming_success() {
+        let mut child = Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .expect("spawn sleep helper");
+        let mut offset = 0;
+        let started = std::time::Instant::now();
+        let conclusion = await_auth_result_with_timeout(
+            &mut child,
+            Path::new("/dev/null"),
+            &mut offset,
+            "rj-nonexistent0",
+            std::time::Duration::from_millis(150),
+        )
+        .expect("timeout must not be an error");
+        assert_eq!(conclusion, AuthConclusion::Unconfirmed);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        terminate_client(&mut child);
     }
 
     #[test]
@@ -759,8 +849,14 @@ mod tests {
 
     #[test]
     fn client_exit_counts_as_success_only_when_path_is_proven_usable() {
-        assert!(exited_outcome_for(Some(true)).is_ok());
+        assert_eq!(
+            exited_outcome_for(Some(true)).expect("reachable path"),
+            AuthConclusion::Confirmed
+        );
         assert!(exited_outcome_for(Some(false)).is_err());
-        assert!(exited_outcome_for(None).is_err());
+        assert_eq!(
+            exited_outcome_for(None).expect("unknown path is not an error"),
+            AuthConclusion::Unconfirmed
+        );
     }
 }

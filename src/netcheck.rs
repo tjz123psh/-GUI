@@ -19,9 +19,14 @@
 //!   * curl 首参固定 `--disable`：`~/.curlrc` 里的 `proxy = ...` 能改写目标，
 //!     只有放在第一个参数位置才会被 curl 忽略；
 //!   * 工具只从固定绝对目录查找，不信任 PATH（桌面会话的 PATH 可被包装脚本改写）；
-//!   * curl、ping 都缺失时用 libc 直接做绑定网卡的 TCP 兜底，不再直接返回
-//!     `None`；兜底同样只读，不改任何系统状态。
+//!   * curl/ping 失败后始终用 libc 直接做绑定网卡的 TCP 兜底，不因缺少某一个
+//!     工具而放弃；兜底同样只读，不改任何系统状态。
+//!
+//! 判定语义：只有"明确失败"才可能得到 [`ProbeOutcome::Unreachable`]。carrier
+//! 读不到（[`CarrierState::Unknown`]）仍继续探测；超时、权限不足、工具缺失都
+//! 只能得到 [`ProbeOutcome::Unknown`]，避免把一次测不到误报成"未连接"。
 
+use std::collections::BTreeSet;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -31,9 +36,35 @@ use std::time::{Duration, Instant};
 const PROBE_IPV4: &str = "223.5.5.5";
 /// [`PROBE_IPV4`] 的八位组形式，供 libc 兜底路径直接构造 `sockaddr_in`。
 const PROBE_IPV4_OCTETS: [u8; 4] = [223, 5, 5, 5];
+/// 第二个 TCP 目标：1.1.1.1:443，用于排除单一目标/单一端口被校园网策略拦截。
+const SECONDARY_IPV4_OCTETS: [u8; 4] = [1, 1, 1, 1];
 const PROBE_URL: &str = "http://223.5.5.5/";
-/// TCP 兜底只连 80 端口，语义与 HTTP 探测一致：能完成三次握手就算路径可用。
+/// HTTP 探测与 libc TCP/80 兜底使用同一端口。
 const PROBE_PORT: u16 = 80;
+
+#[derive(Clone, Copy)]
+struct TcpTarget {
+    octets: [u8; 4],
+    port: u16,
+}
+
+/// 多目标 TCP 探测：任一成功即可达。223.5.5.5:80 与 HTTP 探测同目标，
+/// 但走独立的内核实现，用于在 curl 缺失/失败时验证同一条链路。
+const TCP_TARGETS: [TcpTarget; 3] = [
+    TcpTarget {
+        octets: PROBE_IPV4_OCTETS,
+        port: PROBE_PORT,
+    },
+    TcpTarget {
+        octets: PROBE_IPV4_OCTETS,
+        port: 443,
+    },
+    TcpTarget {
+        octets: SECONDARY_IPV4_OCTETS,
+        port: 443,
+    },
+];
+
 /// 探测工具只允许从这些绝对目录里找；顺序固定，永不走 PATH。
 const TOOL_DIRS: [&str; 3] = ["/usr/bin", "/bin", "/usr/local/bin"];
 const CURL_NAME: &str = "curl";
@@ -48,48 +79,154 @@ const PROXY_ENV_VARS: [&str; 6] = [
     "ALL_PROXY",
 ];
 const CARRIER_DIR: &str = "/sys/class/net";
-/// curl/ping 都缺失时的 libc 兜底预算，与 curl 的 `--connect-timeout 2` 对齐。
-const LIBC_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// 网卡物理链路是否已连接；网卡不存在或 carrier 读不到时返回 `None`。
-pub fn carrier_up(nic: &str) -> Option<bool> {
+/// 一次状态刷新最多花在探测上的时间。单项预算都受这个总 deadline 约束，
+/// 即使 curl/ping/libc 全部超时也不会超过约 4 秒。
+const PROBE_TOTAL_TIMEOUT: Duration = Duration::from_secs(4);
+const HTTP_PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
+const ICMP_PROBE_TIMEOUT: Duration = Duration::from_millis(1000);
+const LIBC_TARGET_TIMEOUT: Duration = Duration::from_millis(1000);
+
+/// 网卡物理链路状态。`Missing` 表示网卡不存在；`Unknown` 表示网卡存在但
+/// carrier 因权限/驱动原因读不到——后者不能当作"没有网线"。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CarrierState {
+    Up,
+    Down,
+    Missing,
+    Unknown,
+}
+
+/// 有线路径探测结论。只有多个独立方法都明确失败时才给出 `Unreachable`。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProbeOutcome {
+    Reachable,
+    Unreachable,
+    Unknown,
+}
+
+/// 读取网卡载波状态；名字非法或网卡不存在为 `Missing`，读不到为 `Unknown`。
+pub fn carrier_state(nic: &str) -> CarrierState {
     let nic = nic.trim();
     if !valid_nic_name(nic) {
-        return None;
+        return CarrierState::Missing;
     }
     let path = Path::new(CARRIER_DIR).join(nic);
-    if !path.is_dir() {
-        return None;
+    match std::fs::metadata(&path) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => return CarrierState::Missing,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return CarrierState::Missing,
+        Err(_) => return CarrierState::Unknown,
     }
-    std::fs::read_to_string(path.join("carrier"))
-        .ok()
-        .map(|value| value.trim() == "1")
+    match std::fs::read_to_string(path.join("carrier")) {
+        Ok(value) => match value.trim() {
+            "1" => CarrierState::Up,
+            "0" => CarrierState::Down,
+            _ => CarrierState::Unknown,
+        },
+        // 网卡目录存在但 carrier 文件缺失/无权限：无法判断，不是明确断开。
+        Err(_) => CarrierState::Unknown,
+    }
+}
+
+/// 兼容旧调用方：`Some(true)` 载波已连接，`Some(false)` 明确断开，
+/// `None` 表示网卡不存在或无法判断（旧语义下调用方按"未知"处理）。
+pub fn carrier_up(nic: &str) -> Option<bool> {
+    match carrier_state(nic) {
+        CarrierState::Up => Some(true),
+        CarrierState::Down => Some(false),
+        CarrierState::Missing | CarrierState::Unknown => None,
+    }
 }
 
 /// 判断 `nic` 的有线路径当前是否可用。
 ///
-/// `Some(true)` 可用；`Some(false)` 不可用（含网卡不存在、无网线、探测失败）；
-/// `None` 表示探测工具缺失且内核兜底也无权限执行、无法判断——调用方按
-/// "需要认证 / 未连接"处理。
-pub fn wired_path_reachable(nic: &str) -> Option<bool> {
+/// `Reachable` 可用；`Unreachable` 是多个独立方法都给出的明确失败；
+/// `Unknown` 表示测不到（超时/权限/工具缺失），调用方不得据此谎报未连接。
+pub fn probe_wired_path(nic: &str) -> ProbeOutcome {
     let nic = nic.trim();
-    if carrier_up(nic) != Some(true) {
-        // 网卡不存在或无网线：有线路径必然不可用，连探测都不必发。
-        return Some(false);
+    let carrier = carrier_state(nic);
+    if carrier_short_circuits(carrier) {
+        return ProbeOutcome::Unreachable;
     }
-    let curl = find_tool(CURL_NAME);
-    let ping = find_tool(PING_NAME);
-    if curl.is_none() && ping.is_none() {
-        // 两个探测工具都缺失时不再直接放弃：内核态 TCP 兜底不依赖任何外部程序。
-        return bind_device_tcp_probe(nic, LIBC_PROBE_TIMEOUT);
+
+    let deadline = Instant::now() + PROBE_TOTAL_TIMEOUT;
+    let mut explicit_methods = BTreeSet::new();
+
+    // HTTP（保留原路径）：绑定网卡、字面 IP，按状态码判断是否被门户劫持。
+    if let Some(curl) = find_tool(CURL_NAME) {
+        let budget = remaining(deadline).min(HTTP_PROBE_TIMEOUT);
+        if !budget.is_zero() {
+            match curl_http_probe(&curl, nic, budget) {
+                AttemptResult::Success => return ProbeOutcome::Reachable,
+                AttemptResult::ExplicitFailure => {
+                    explicit_methods.insert("http");
+                }
+                AttemptResult::Indeterminate | AttemptResult::Unavailable => {}
+            }
+        }
     }
-    if curl.is_some_and(|path| curl_probe(&path, nic)) {
-        return Some(true);
+
+    // ICMP：少数校园网放行 ICMP 但拦截 80/443。ping 的退出码 1 是"没收到
+    // 回复"（超时），不能当作明确失败。
+    if let Some(ping) = find_tool(PING_NAME) {
+        let budget = remaining(deadline).min(ICMP_PROBE_TIMEOUT);
+        if !budget.is_zero() {
+            match icmp_probe_attempt(&ping, nic, budget) {
+                AttemptResult::Success => return ProbeOutcome::Reachable,
+                AttemptResult::ExplicitFailure => {
+                    explicit_methods.insert("icmp");
+                }
+                AttemptResult::Indeterminate | AttemptResult::Unavailable => {}
+            }
+        }
     }
-    if ping.is_some_and(|path| icmp_probe(&path, nic)) {
-        return Some(true);
+
+    // libc TCP 兜底总是尝试（不再等 curl/ping 都缺失），三个目标共享剩余预算。
+    let mut tcp_results = Vec::new();
+    for (index, target) in TCP_TARGETS.iter().enumerate() {
+        let left = (TCP_TARGETS.len() - index) as u32;
+        let budget = (remaining(deadline) / left).min(LIBC_TARGET_TIMEOUT);
+        if budget.is_zero() {
+            break;
+        }
+        let result = bind_device_tcp_probe_target(nic, target.octets, target.port, budget);
+        if result == AttemptResult::Success {
+            return ProbeOutcome::Reachable;
+        }
+        tcp_results.push(result);
     }
-    Some(false)
+    let tcp_result = combine_tcp_results(&tcp_results);
+    if tcp_result == AttemptResult::ExplicitFailure {
+        // 三个目标同属一个 TCP 探测方法；在集合里只记一次。
+        explicit_methods.insert("tcp");
+    }
+
+    // 至少两个独立方法明确失败才算不可达；否则宁可报告未知。
+    if explicit_methods.len() >= 2 {
+        ProbeOutcome::Unreachable
+    } else {
+        ProbeOutcome::Unknown
+    }
+}
+
+/// 只有明确的 Down/Missing 才能不经探测直接判不可达；Unknown 必须继续探测。
+fn carrier_short_circuits(state: CarrierState) -> bool {
+    matches!(state, CarrierState::Down | CarrierState::Missing)
+}
+
+/// 兼容 helper 的旧入口：Reachable=>Some(true), Unreachable=>Some(false),
+/// Unknown=>None。
+pub fn wired_path_reachable(nic: &str) -> Option<bool> {
+    outcome_to_option(probe_wired_path(nic))
+}
+
+fn outcome_to_option(outcome: ProbeOutcome) -> Option<bool> {
+    match outcome {
+        ProbeOutcome::Reachable => Some(true),
+        ProbeOutcome::Unreachable => Some(false),
+        ProbeOutcome::Unknown => None,
+    }
 }
 
 /// 网卡名必须是单个合法路径分量，同时满足内核 `IFNAMSIZ` 限制。
@@ -119,11 +256,14 @@ fn is_executable(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+fn remaining(deadline: Instant) -> Duration {
+    deadline.saturating_duration_since(Instant::now())
+}
+
 /// 探测子进程的公共外壳：清代理变量、钉子进程环境、丢掉全部输出。
 ///
-/// 只看退出码判定结果，因此必须屏蔽 stdout/stderr（curl 的进度表和 ping 的
-/// 本地化输出在不同 locale 下不可解析）。stdin 设为 null 以免子进程停在
-/// 交互提示上耗光超时预算。
+/// stdin 设为 null 以免子进程停在交互提示上耗光超时预算；需要读取 curl
+/// 状态码时调用方会把 stdout 改成 piped。
 fn sanitized_probe_command(program: &Path) -> Command {
     let mut command = Command::new(program);
     command
@@ -140,42 +280,87 @@ fn sanitized_probe_command(program: &Path) -> Command {
     command
 }
 
-/// curl 探测命令：绑定网卡、绕过代理、字面 IP，禁用 `~/.curlrc`。
-fn curl_probe_command(curl: &Path, nic: &str) -> Command {
+/// curl HTTP 探测命令：绑定网卡、绕过代理、字面 IP，禁用 `~/.curlrc`，
+/// 用 `-w '%{http_code}'` 读取响应状态码（不能只看退出码：captive portal
+/// 的 3xx/407/511 也会让 curl 成功退出）。
+fn curl_http_probe_command(curl: &Path, nic: &str, budget: Duration) -> Command {
+    let max_secs = budget.as_secs_f64().clamp(0.2, 4.0);
+    let connect_secs = max_secs.min(2.0);
+    let max_time = format!("{max_secs:.1}");
+    let connect_timeout = format!("{connect_secs:.1}");
+
     let mut command = sanitized_probe_command(curl);
-    command.args([
+    command
         // 必须是首参：只有第一个参数位置的 --disable 才会让 curl 完全不读
         // ~/.curlrc / $CURL_HOME/curlrc，否则配置里的 `proxy = ...` 会生效。
-        "--disable",
+        .arg("--disable")
         // 字面 IPv4 已排除域名，-4 只是防止网络栈做无谓的家族选择。
-        "-4",
-        "--noproxy",
+        .arg("-4")
+        .arg("--noproxy")
         // 命令行优先于任何代理环境变量；配合上面的 env_remove 双保险。
-        "*",
-        "--interface",
+        .arg("*")
+        .arg("--interface")
         // 非 IP 字符串会让 curl 用 SO_BINDTODEVICE 绑定设备，流量不经过 TUN。
-        nic,
-        "-sS",
-        "-o",
-        "/dev/null",
-        "--connect-timeout",
-        "2",
-        "--max-time",
-        "4",
-        PROBE_URL,
-    ]);
+        .arg(nic)
+        .args(["-sS", "-o", "/dev/null"])
+        .arg("--connect-timeout")
+        .arg(connect_timeout)
+        .arg("--max-time")
+        .arg(max_time)
+        .arg("-w")
+        .arg("%{http_code}")
+        .arg(PROBE_URL)
+        .stdout(Stdio::piped());
     command
 }
 
-/// curl 探测：任何 HTTP 响应（含 404）都算路径可用，只看退出码。
-fn curl_probe(curl: &Path, nic: &str) -> bool {
-    curl_probe_command(curl, nic)
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+fn curl_http_probe(curl: &Path, nic: &str, budget: Duration) -> AttemptResult {
+    let command = curl_http_probe_command(curl, nic, budget);
+    let outcome = run_command_with_timeout(command, budget);
+    match outcome {
+        CommandOutcome::Exited(output) => {
+            if output.status.success() {
+                match parse_http_code(&output.stdout) {
+                    Some(code) => classify_http_code(code),
+                    None => AttemptResult::Indeterminate,
+                }
+            } else {
+                classify_curl_failure(output.status.code())
+            }
+        }
+        CommandOutcome::TimedOut => AttemptResult::Indeterminate,
+        CommandOutcome::Failed => AttemptResult::Unavailable,
+    }
 }
 
-/// ping 探测命令：数字输出、单包、2 秒超时、绑定网卡；只看退出码。
+fn parse_http_code(stdout: &[u8]) -> Option<u16> {
+    String::from_utf8_lossy(stdout)
+        .split_whitespace()
+        .last()?
+        .parse()
+        .ok()
+}
+
+/// 2xx/404 才是正常可达；3xx/407/511 是 captive portal/代理认证页。
+fn classify_http_code(code: u16) -> AttemptResult {
+    match code {
+        200..=299 | 404 => AttemptResult::Success,
+        0 => AttemptResult::Indeterminate,
+        _ => AttemptResult::ExplicitFailure,
+    }
+}
+
+/// curl 自身失败退出码：超时是未知，工具/参数/写输出等本地问题也是未知；
+/// 其余连接错误（拒绝、不可达、TLS 等）视为明确失败。
+fn classify_curl_failure(code: Option<i32>) -> AttemptResult {
+    match code {
+        Some(28) => AttemptResult::Indeterminate,
+        Some(1..=5 | 23) | None => AttemptResult::Unavailable,
+        Some(_) => AttemptResult::ExplicitFailure,
+    }
+}
+
+/// ping 探测命令：数字输出、单包、2 秒等待、绑定网卡；只看退出码。
 fn icmp_probe_command(ping: &Path, nic: &str) -> Command {
     let mut command = sanitized_probe_command(ping);
     command.args([
@@ -185,12 +370,77 @@ fn icmp_probe_command(ping: &Path, nic: &str) -> Command {
     command
 }
 
-/// ICMP 兜底：少数校园网放行 ICMP 但拦截 80/443。
-fn icmp_probe(ping: &Path, nic: &str) -> bool {
-    icmp_probe_command(ping, nic)
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+fn icmp_probe_attempt(ping: &Path, nic: &str, budget: Duration) -> AttemptResult {
+    let command = icmp_probe_command(ping, nic);
+    match run_command_with_timeout(command, budget) {
+        CommandOutcome::Exited(output) if output.status.success() => AttemptResult::Success,
+        // ping 的退出码 1 通常就是"超时未收到回复"，不是明确不可达。
+        CommandOutcome::Exited(_) | CommandOutcome::TimedOut => AttemptResult::Indeterminate,
+        CommandOutcome::Failed => AttemptResult::Unavailable,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AttemptResult {
+    Success,
+    ExplicitFailure,
+    Indeterminate,
+    Unavailable,
+}
+
+enum CommandOutcome {
+    Exited(std::process::Output),
+    TimedOut,
+    Failed,
+}
+
+/// 有界运行探测子进程：到期立即 kill，绝不让单次状态刷新被某个工具拖住。
+fn run_command_with_timeout(mut command: Command, timeout: Duration) -> CommandOutcome {
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(_) => return CommandOutcome::Failed,
+    };
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                return match child.wait_with_output() {
+                    Ok(output) => CommandOutcome::Exited(output),
+                    Err(_) => CommandOutcome::Failed,
+                };
+            }
+            Ok(None) => {}
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return CommandOutcome::Failed;
+            }
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return CommandOutcome::TimedOut;
+        }
+        std::thread::sleep((deadline - now).min(Duration::from_millis(20)));
+    }
+}
+
+fn combine_tcp_results(results: &[AttemptResult]) -> AttemptResult {
+    if results.contains(&AttemptResult::Success) {
+        return AttemptResult::Success;
+    }
+    if !results.is_empty()
+        && results
+            .iter()
+            .all(|result| *result == AttemptResult::ExplicitFailure)
+    {
+        AttemptResult::ExplicitFailure
+    } else if results.contains(&AttemptResult::Unavailable) || results.is_empty() {
+        AttemptResult::Unavailable
+    } else {
+        AttemptResult::Indeterminate
+    }
 }
 
 /// 关闭裸 fd 的最小 RAII；探测路径上任何提前返回都不能泄漏描述符。
@@ -203,14 +453,27 @@ impl Drop for CloseOnDrop {
     }
 }
 
-/// curl、ping 都不可用时的内核兜底：`SO_BINDTODEVICE` + 非阻塞 connect + poll。
-///
-/// 返回 `None` 表示本进程无权绑定设备（内核要求 CAP_NET_RAW 的 EPERM）或参数
-/// 不可用，保留"无法判断"语义；`Some(false)` 才是绑定了设备后的明确探测失败。
-/// 不依赖 curl/ping，也不解析任何输出；除了一个 TCP 连接尝试外不改系统状态。
+/// 兼容旧调用方的单目标 libc TCP 探测（固定 223.5.5.5:80）。
+#[cfg(test)]
 fn bind_device_tcp_probe(nic: &str, timeout: Duration) -> Option<bool> {
+    match bind_device_tcp_probe_target(nic, PROBE_IPV4_OCTETS, PROBE_PORT, timeout) {
+        AttemptResult::Success => Some(true),
+        AttemptResult::ExplicitFailure => Some(false),
+        AttemptResult::Indeterminate | AttemptResult::Unavailable => None,
+    }
+}
+
+/// 单目标内核兜底：`SO_BINDTODEVICE` + 非阻塞 connect + poll。
+///
+/// 不依赖 curl/ping，也不解析任何输出；除了一个 TCP 连接尝试外不改系统状态。
+fn bind_device_tcp_probe_target(
+    nic: &str,
+    octets: [u8; 4],
+    port: u16,
+    timeout: Duration,
+) -> AttemptResult {
     if !valid_nic_name(nic) {
-        return None;
+        return AttemptResult::Unavailable;
     }
     // SAFETY: 所有 libc 调用使用的都是本地初始化的、类型正确的缓冲区与结构体；
     // socket 成功后由 CloseOnDrop 在函数任意返回路径上关闭，不泄漏描述符。
@@ -221,15 +484,15 @@ fn bind_device_tcp_probe(nic: &str, timeout: Duration) -> Option<bool> {
             0,
         );
         if fd < 0 {
-            return None;
+            return AttemptResult::Unavailable;
         }
         let _fd = CloseOnDrop(fd);
 
         // 设备名要 NUL 结尾：SO_BINDTODEVICE 会按 optlen 复制并按字符串解释。
         let mut device = [0_u8; libc::IFNAMSIZ];
         device[..nic.len()].copy_from_slice(nic.as_bytes());
-        // 部分内核仍要求 CAP_NET_RAW（返回 EPERM）：此时只能返回 None（无法
-        // 判断），而不是谎报"路径不可用"。本机内核 7.2.7 已允许普通用户绑定。
+        // 部分内核仍要求 CAP_NET_RAW（返回 EPERM）：此时只能返回"无法判断"，
+        // 而不是谎报"路径不可用"。
         if libc::setsockopt(
             fd,
             libc::SOL_SOCKET,
@@ -238,16 +501,16 @@ fn bind_device_tcp_probe(nic: &str, timeout: Duration) -> Option<bool> {
             device.len() as libc::socklen_t,
         ) != 0
         {
-            return None;
+            return classify_socket_errno(std::io::Error::last_os_error().raw_os_error());
         }
 
         let address = libc::sockaddr_in {
             sin_family: libc::AF_INET as libc::sa_family_t,
             // 端口与地址都必须是网络字节序：to_be / from_ne_bytes 让内存布局
             // 与大端表示一致（from_ne_bytes 保证字节按原样落盘，不做数值交换）。
-            sin_port: PROBE_PORT.to_be(),
+            sin_port: port.to_be(),
             sin_addr: libc::in_addr {
-                s_addr: u32::from_ne_bytes(PROBE_IPV4_OCTETS),
+                s_addr: u32::from_ne_bytes(octets),
             },
             sin_zero: [0; 8],
         };
@@ -257,18 +520,18 @@ fn bind_device_tcp_probe(nic: &str, timeout: Duration) -> Option<bool> {
             std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
         );
         if connected == 0 {
-            return Some(true);
+            return AttemptResult::Success;
         }
-        // 非阻塞套接字上"正在连接"是可继续等待的状态，其余错误码直接判失败。
+        // 非阻塞套接字上"正在连接"是可继续等待的状态，其余错误码按语义分类。
         if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINPROGRESS) {
-            return Some(false);
+            return classify_socket_errno(std::io::Error::last_os_error().raw_os_error());
         }
 
         let deadline = Instant::now() + timeout;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                return Some(false);
+                return AttemptResult::Indeterminate;
             }
             let mut pollfd = libc::pollfd {
                 fd,
@@ -282,10 +545,10 @@ fn bind_device_tcp_probe(nic: &str, timeout: Duration) -> Option<bool> {
                 if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
                     continue;
                 }
-                return Some(false);
+                return AttemptResult::Unavailable;
             }
             if ready == 0 {
-                return Some(false);
+                return AttemptResult::Indeterminate;
             }
             break;
         }
@@ -301,9 +564,25 @@ fn bind_device_tcp_probe(nic: &str, timeout: Duration) -> Option<bool> {
             &mut length,
         ) != 0
         {
-            return Some(false);
+            return AttemptResult::Unavailable;
         }
-        Some(so_error == 0)
+        if so_error == 0 {
+            AttemptResult::Success
+        } else {
+            classify_socket_errno(Some(so_error))
+        }
+    }
+}
+
+/// errno 语义：超时与权限问题都不能算"明确不可达"。
+fn classify_socket_errno(errno: Option<i32>) -> AttemptResult {
+    match errno {
+        Some(0) => AttemptResult::Success,
+        Some(libc::ETIMEDOUT | libc::EINPROGRESS | libc::EALREADY | libc::EAGAIN) => {
+            AttemptResult::Indeterminate
+        }
+        Some(libc::EPERM | libc::EACCES) => AttemptResult::Unavailable,
+        _ => AttemptResult::ExplicitFailure,
     }
 }
 
@@ -377,6 +656,8 @@ mod tests {
         assert_eq!(wired_path_reachable("rj-nonexistent0"), Some(false));
         assert_eq!(carrier_up(""), None);
         assert_eq!(carrier_up("rj-nonexistent0"), None);
+        assert_eq!(carrier_state(""), CarrierState::Missing);
+        assert_eq!(carrier_state("rj-nonexistent0"), CarrierState::Missing);
     }
 
     #[test]
@@ -393,18 +674,100 @@ mod tests {
         ] {
             assert!(!valid_nic_name(name), "{name:?} 不应通过校验");
             assert_eq!(carrier_up(name), None, "{name:?} 不应被当作网卡");
+            assert_eq!(carrier_state(name), CarrierState::Missing);
         }
         assert!(valid_nic_name("eno1"));
     }
 
     #[test]
-    fn probe_target_is_a_literal_ipv4_address() {
+    fn unknown_carrier_does_not_short_circuit_to_unreachable() {
+        assert!(carrier_short_circuits(CarrierState::Down));
+        assert!(carrier_short_circuits(CarrierState::Missing));
+        assert!(!carrier_short_circuits(CarrierState::Up));
+        assert!(
+            !carrier_short_circuits(CarrierState::Unknown),
+            "carrier 读不到时必须继续探测，不能直接判不可达"
+        );
+    }
+
+    #[test]
+    fn probe_outcome_maps_to_option() {
+        // helper 旧入口的映射必须稳定；这里不触发任何真实网络请求。
+        assert_eq!(outcome_to_option(ProbeOutcome::Reachable), Some(true));
+        assert_eq!(outcome_to_option(ProbeOutcome::Unreachable), Some(false));
+        assert_eq!(outcome_to_option(ProbeOutcome::Unknown), None);
+    }
+
+    #[test]
+    fn probe_targets_include_required_literal_ipv4_endpoints() {
         // 目标一旦含域名，本机 TUN 的 fake-IP DNS 会把它劫持到 198.18.0.0/15。
         assert!(PROBE_URL.contains(PROBE_IPV4));
         assert_eq!(
             PROBE_IPV4.parse::<std::net::Ipv4Addr>().unwrap().octets(),
             PROBE_IPV4_OCTETS
         );
+        assert_eq!(
+            "1.1.1.1".parse::<std::net::Ipv4Addr>().unwrap().octets(),
+            SECONDARY_IPV4_OCTETS
+        );
+        assert!(
+            TCP_TARGETS
+                .iter()
+                .any(|target| { target.octets == PROBE_IPV4_OCTETS && target.port == PROBE_PORT })
+        );
+        assert!(
+            TCP_TARGETS
+                .iter()
+                .any(|target| { target.octets == PROBE_IPV4_OCTETS && target.port == 443 })
+        );
+        assert!(
+            TCP_TARGETS
+                .iter()
+                .any(|target| { target.octets == SECONDARY_IPV4_OCTETS && target.port == 443 })
+        );
+    }
+
+    #[test]
+    fn http_status_codes_are_classified() {
+        assert_eq!(classify_http_code(200), AttemptResult::Success);
+        assert_eq!(classify_http_code(204), AttemptResult::Success);
+        assert_eq!(classify_http_code(404), AttemptResult::Success);
+        for code in [301, 302, 307, 407, 511, 500] {
+            assert_eq!(
+                classify_http_code(code),
+                AttemptResult::ExplicitFailure,
+                "HTTP {code} 不应被当作可达"
+            );
+        }
+        assert_eq!(classify_http_code(0), AttemptResult::Indeterminate);
+        assert_eq!(parse_http_code(b"200\n"), Some(200));
+        assert_eq!(parse_http_code(b"\n404"), Some(404));
+        assert_eq!(parse_http_code(b""), None);
+    }
+
+    #[test]
+    fn tcp_failure_aggregation_requires_all_targets_to_fail_explicitly() {
+        assert_eq!(
+            combine_tcp_results(&[
+                AttemptResult::ExplicitFailure,
+                AttemptResult::ExplicitFailure,
+                AttemptResult::ExplicitFailure,
+            ]),
+            AttemptResult::ExplicitFailure
+        );
+        assert_eq!(
+            combine_tcp_results(&[AttemptResult::ExplicitFailure, AttemptResult::Indeterminate]),
+            AttemptResult::Indeterminate
+        );
+        assert_eq!(
+            combine_tcp_results(&[AttemptResult::ExplicitFailure, AttemptResult::Unavailable]),
+            AttemptResult::Unavailable
+        );
+        assert_eq!(
+            combine_tcp_results(&[AttemptResult::Success, AttemptResult::ExplicitFailure]),
+            AttemptResult::Success
+        );
+        assert_eq!(combine_tcp_results(&[]), AttemptResult::Unavailable);
     }
 
     #[test]
@@ -433,7 +796,11 @@ mod tests {
             Ok("http://127.0.0.1:1")
         );
 
-        let command = curl_probe_command(Path::new("/usr/bin/curl"), "eno1");
+        let command = curl_http_probe_command(
+            Path::new("/usr/bin/curl"),
+            "eno1",
+            Duration::from_millis(1500),
+        );
         assert_eq!(command.get_program(), Path::new("/usr/bin/curl"));
         let args = args_of(&command);
         // 首参 --disable：放在其它位置时 curl 仍会读 ~/.curlrc 里的 proxy 配置。
@@ -442,6 +809,8 @@ mod tests {
         assert!(args.windows(2).any(|pair| pair == ["--interface", "eno1"]));
         assert!(args.contains(&"-4".to_string()));
         assert!(args.contains(&PROBE_URL.to_string()));
+        // 必须读取状态码，不能只看 curl 的退出码。
+        assert!(args.windows(2).any(|pair| pair == ["-w", "%{http_code}"]));
 
         let envs = envs_of(&command);
         for name in PROXY_ENV_VARS {
@@ -468,6 +837,26 @@ mod tests {
             assert_eq!(envs.get(name), Some(&None), "{name} 必须被显式清除");
         }
         assert_eq!(envs.get("NO_PROXY"), Some(&Some("*".to_string())));
+    }
+
+    #[test]
+    fn bounded_command_runner_captures_output_and_kills_on_timeout() {
+        let mut echo = Command::new("/bin/sh");
+        echo.args(["-c", "printf 200"]).stdout(Stdio::piped());
+        match run_command_with_timeout(echo, Duration::from_secs(1)) {
+            CommandOutcome::Exited(output) => {
+                assert!(output.status.success());
+                assert_eq!(output.stdout, b"200");
+            }
+            _ => panic!("短命令应正常结束"),
+        }
+
+        let mut slow = Command::new("/bin/sleep");
+        slow.arg("5");
+        let started = Instant::now();
+        let outcome = run_command_with_timeout(slow, Duration::from_millis(50));
+        assert!(matches!(outcome, CommandOutcome::TimedOut));
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[test]
@@ -499,22 +888,21 @@ mod tests {
         let ping = find_tool(PING_NAME);
         println!("probe smoke: curl={curl:?} ping={ping:?}");
         if let Some(curl) = &curl {
-            println!("probe smoke: curl_probe={}", curl_probe(curl, &nic));
-        }
-        if let Some(ping) = &ping {
-            println!("probe smoke: icmp_probe={}", icmp_probe(ping, &nic));
-        }
-        // 内核兜底与 curl 是同一探测（TCP/80、绑定网卡）的两套实现，结论必须一致；
-        // 内核不允许绑定设备时返回 None，不影响 curl/ping 路径的结论。
-        let fallback = bind_device_tcp_probe(&nic, LIBC_PROBE_TIMEOUT);
-        println!("probe smoke: libc_tcp_probe={fallback:?}");
-        if let (Some(curl), Some(fallback)) = (&curl, fallback) {
-            assert_eq!(
-                curl_probe(curl, &nic),
-                fallback,
-                "内核兜底与 curl 对同一 TCP/80 路径的结论必须一致"
+            println!(
+                "probe smoke: curl_http_probe={:?}",
+                curl_http_probe(curl, &nic, Duration::from_secs(4))
             );
         }
+        if let Some(ping) = &ping {
+            println!(
+                "probe smoke: icmp_probe={:?}",
+                icmp_probe_attempt(ping, &nic, Duration::from_secs(2))
+            );
+        }
+        // 内核兜底与 HTTP 是同一目标（TCP/80、绑定网卡）的两套实现；
+        // 内核不允许绑定设备时返回"无法判断"，不影响 curl/ping 路径的结论。
+        let fallback = bind_device_tcp_probe(&nic, Duration::from_secs(2));
+        println!("probe smoke: libc_tcp_probe={fallback:?}");
         let reachable = wired_path_reachable(&nic);
         println!("probe smoke: wired_path_reachable({nic}) = {reachable:?}");
         assert_eq!(

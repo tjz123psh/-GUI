@@ -15,19 +15,148 @@ pub struct AuthOptions {
     pub password: Option<String>,
 }
 
-/// 官方客户端 run.log 中的判定标记。helper 的认证轮询与 GUI 的「最近认证」
-/// 历史解析共用同一份，避免两处各写一套、日后改一处漏一处。
+/// 官方客户端 run.log 的单行判定结果。
+///
+/// 日志语言随运行环境变化：本机 `en_US.UTF-8` 下客户端实际写
+/// `Success` / `Supplicate failure`，中文环境写 `认证成功` / `认证失败`。
+/// 历史上这里只匹配中文，导致英文环境下一次已成功的认证要等到 60 秒超时，
+/// 期间 GUI 一直显示“未连接”。marker 表必须由 helper 与 GUI 共用。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AuthLineKind {
+    /// 本轮认证成功（终局）。
+    Success,
+    /// 客户端仍在重试的中间状态：断链重连、单次认证失败、IP 变更等。
+    /// 不能据此终止客户端，也不能写进“最近认证”历史。
+    TransientFailure,
+    /// 本轮认证的终局失败。
+    TerminalFailure,
+}
+
+/// 成功判定必须是整行（去时间戳后）匹配：官方横幅里可能出现
+/// `quit rjsupplicant success.` 之类的非判定文本，`contains` 会误报。
+const AUTH_SUCCESS_LINES: &[&str] = &["认证成功", "Success", "Supplicate success"];
+
+/// 重试中的提示。`Supplicate failure` 实测每次后面都继续认证并最终成功，
+/// 属于客户端内部重试，不能当成终局失败。
+const AUTH_TRANSIENT_MARKERS: &[&str] = &[
+    "网线没有连接上",
+    "Adapter links down",
+    "Adapter cann't work",
+    "网卡已被禁用",
+    "Supplicate failure",
+    "IP has chaged",
+    "IP地址发生变化",
+];
+
+/// 终局失败（中英文两套，取自官方 `uiCHS.ini` / `uiENG.ini`）。
+const AUTH_TERMINAL_MARKERS: &[&str] = &[
+    "认证失败",
+    "无法连接认证服务器",
+    "Can't connect radius server",
+    "无法获取动态IP地址",
+    "Unable to get dynamic IP address",
+    "Authentication failure",
+    "Authentication failed",
+    "IP地址信息获取错误",
+    "Failed to obtain IP information",
+    "认证已关闭",
+    "Supplicate close",
+];
+
+/// 兼容旧调用方的成功标记；新代码请用 [`classify_auth_line`]。
 pub const AUTH_SUCCESS_MARKER: &str = "认证成功";
+
+/// 兼容旧调用方的失败标记；新代码请用 [`classify_auth_line`]（它区分
+/// 重试中的 `Supplicate failure` 与真正的终局失败）。
 pub const AUTH_FAILURE_MARKERS: &[&str] = &[
     "网线没有连接上",
     "无法连接认证服务器",
     "认证失败",
     "无法获取动态IP地址",
 ];
-/// 「最近认证」历史解析使用的终局失败标记。与 [`AUTH_FAILURE_MARKERS`] 故意
-/// 不同：`网线没有连接上` 在官方日志里是链路重协商期间的重试提示（实测每次
-/// 后面都继续认证或转成成功），当成历史结果会误报；`无法获取动态IP地址` 是
-/// 客户端等待 DHCP 超时后的终局失败，必须保留。
+
+/// 判定一行（已去掉时间戳）的语义；无法识别返回 `None`。
+pub fn classify_auth_line(body: &str) -> Option<AuthLineKind> {
+    let line = body.trim();
+    if line.is_empty() {
+        return None;
+    }
+    if AUTH_SUCCESS_LINES
+        .iter()
+        .any(|marker| line.eq_ignore_ascii_case(marker))
+    {
+        return Some(AuthLineKind::Success);
+    }
+    if match_marker(line, AUTH_TERMINAL_MARKERS).is_some() {
+        return Some(AuthLineKind::TerminalFailure);
+    }
+    if match_marker(line, AUTH_TRANSIENT_MARKERS).is_some() {
+        return Some(AuthLineKind::TransientFailure);
+    }
+    None
+}
+
+/// 一段新增日志中优先级最高的判定：成功 > 终局失败 > 重试中。
+/// 成功优先，避免同一段里先出现一次 `Supplicate failure`、随后成功时被翻成失败。
+pub fn classify_auth_text(text: &str) -> Option<AuthLineKind> {
+    let mut fallback = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let body = match split_leading_timestamp(line) {
+            Some((_, body)) => split_leading_timestamp(&body).map_or(body, |(_, inner)| inner),
+            None => line.to_string(),
+        };
+        match classify_auth_line(&body) {
+            Some(AuthLineKind::Success) => return Some(AuthLineKind::Success),
+            Some(AuthLineKind::TerminalFailure) => {
+                fallback.get_or_insert(AuthLineKind::TerminalFailure);
+            }
+            Some(AuthLineKind::TransientFailure) => {
+                fallback.get_or_insert(AuthLineKind::TransientFailure);
+            }
+            None => {}
+        }
+    }
+    fallback
+}
+
+/// 命中 `markers` 中任一标记时返回该标记（用于错误文案）。
+pub fn auth_line_reason(body: &str) -> Option<&'static str> {
+    let line = body.trim();
+    match classify_auth_line(line)? {
+        AuthLineKind::TerminalFailure => match_marker(line, AUTH_TERMINAL_MARKERS),
+        AuthLineKind::TransientFailure => match_marker(line, AUTH_TRANSIENT_MARKERS),
+        AuthLineKind::Success => None,
+    }
+}
+
+fn match_marker(line: &str, markers: &[&'static str]) -> Option<&'static str> {
+    markers
+        .iter()
+        .find(|marker| line.contains(**marker))
+        .copied()
+}
+
+/// 剥掉 `YYYY-MM-DD HH:MM:SS ` 前缀；格式不符时返回 `None`。
+fn split_leading_timestamp(line: &str) -> Option<(String, String)> {
+    let mut parts = line.splitn(3, ' ');
+    let (date, clock, rest) = (parts.next()?, parts.next()?, parts.next()?);
+    if date.len() == 10
+        && clock.len() == 8
+        && date.chars().all(|ch| ch.is_ascii_digit() || ch == '-')
+        && clock.chars().all(|ch| ch.is_ascii_digit() || ch == ':')
+    {
+        return Some((format!("{date} {clock}"), rest.trim().to_string()));
+    }
+    None
+}
+
+/// 「最近认证」历史解析使用的终局失败标记。历史上 `网线没有连接上` 曾被当成
+/// 终局失败，实际是链路重协商期间的重试提示；现在统一由 [`classify_auth_line`]
+/// 区分终局/重试，本常量仅保留给旧测试与文档引用。
 pub const AUTH_HISTORY_FAILURE_MARKERS: &[&str] =
     &["认证失败", "无法连接认证服务器", "无法获取动态IP地址"];
 
@@ -585,6 +714,79 @@ mod tests {
         assert_eq!(request.arguments(), ["install-wrapper"]);
         assert!(
             HelperRequest::parse(&["install-wrapper".to_string(), "extra".to_string()]).is_err()
+        );
+    }
+
+    #[test]
+    fn classifies_english_and_chinese_auth_lines() {
+        for line in ["Success", "认证成功", "Supplicate success", " success "] {
+            assert_eq!(
+                classify_auth_line(line),
+                Some(AuthLineKind::Success),
+                "{line}"
+            );
+        }
+        for line in [
+            "Supplicate failure",
+            "网线没有连接上，请检查网卡连接。",
+            "Adapter links down, Please check it.",
+            "IP has chaged,please re-auth.",
+        ] {
+            assert_eq!(
+                classify_auth_line(line),
+                Some(AuthLineKind::TransientFailure),
+                "{line}"
+            );
+        }
+        for line in [
+            "Authentication failure,Reason： ...",
+            "Can't connect radius server.",
+            "Unable to get dynamic IP address.",
+            "认证失败，可能导致本次认证失败的原因如下",
+            "无法获取动态IP地址",
+            "Supplicate close",
+        ] {
+            assert_eq!(
+                classify_auth_line(line),
+                Some(AuthLineKind::TerminalFailure),
+                "{line}"
+            );
+        }
+        for line in [
+            "Lookup the switch...",
+            "Connecting radius server...",
+            "quit rjsupplicant success.",
+        ] {
+            assert_eq!(classify_auth_line(line), None, "{line}");
+        }
+    }
+
+    #[test]
+    fn classify_auth_text_prioritizes_success_over_retries() {
+        let text = "2026-10-24 09:50:55 Supplicate failure\n\
+            2026-10-24 09:51:01 Success\n";
+        assert_eq!(classify_auth_text(text), Some(AuthLineKind::Success));
+
+        let text = "2026-10-24 09:50:55 Supplicate failure\n\
+            2026-10-24 09:50:56 Lookup the switch...\n";
+        assert_eq!(
+            classify_auth_text(text),
+            Some(AuthLineKind::TransientFailure)
+        );
+
+        assert_eq!(
+            classify_auth_text("Adapter links up, Speed:1000.0 Mbps"),
+            None
+        );
+
+        // 无时间戳的原始行也要能判定（单测与手工粘贴的日志片段不带前缀）。
+        assert_eq!(
+            classify_auth_text("Success\nSupplicate failure"),
+            Some(AuthLineKind::Success)
+        );
+        assert_eq!(
+            classify_auth_text("Supplicate failure"),
+            Some(AuthLineKind::TransientFailure)
         );
     }
 

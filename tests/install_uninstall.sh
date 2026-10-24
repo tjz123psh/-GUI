@@ -349,6 +349,7 @@ LEGACY_LIBEXEC="${TMP_DIR}/legacy-libexec"
 LEGACY_CLIENT="${TMP_DIR}/legacy-client"
 LEGACY_POLICY="${TMP_DIR}/legacy-policy"
 mkdir -p "${LEGACY_HOME}/.local/bin" "${LEGACY_DATA}/rjsupplicant/x64" "${LEGACY_SYSTEMD}"
+touch "${LEGACY_SYSTEMD}/rjsupplicant.service"
 cat >"${LEGACY_HOME}/.local/bin/rjsupplicant" <<'EOF'
 #!/usr/bin/env bash
 printf '旧版 wrapper 被以 root 执行\n' >&2
@@ -381,11 +382,15 @@ if grep -Fq "sudo ${LEGACY_HOME}/.local/bin/rjsupplicant" "${SUDO_LOG}"; then
   printf '安装脚本把用户可写路径交给 sudo 执行\n' >&2
   exit 1
 fi
-grep -Fq '不以 root 执行' "${LEGACY_OUTPUT}" || {
-  printf '拒绝执行用户可写 wrapper 时未给出可操作说明\n' >&2
+grep -Fq 'sudo pkill -x rjsupplicant' "${LEGACY_OUTPUT}" || {
+  printf '无法经 root-owned helper 断开时未提示手动停止命令\n' >&2
   cat "${LEGACY_OUTPUT}" >&2
   exit 1
 }
+# 断开失败必须中止卸载，不能继续删除服务文件、用户侧客户端或 wrapper。
+[[ -f "${LEGACY_SYSTEMD}/rjsupplicant.service" ]]
+[[ -f "${LEGACY_HOME}/.local/bin/rjsupplicant" ]]
+[[ -f "${LEGACY_DATA}/rjsupplicant/x64/rjsupplicant" ]]
 kill "${FAKE_CLIENT_PID}" 2>/dev/null || true
 wait "${FAKE_CLIENT_PID}" 2>/dev/null || true
 
@@ -399,13 +404,57 @@ fi
 
 if HOME="${HOME_DIR}" \
   RJSUPPLICANT_SYSTEMD_DIR="/etc/systemd/system" \
+  RJSUPPLICANT_LIBEXEC_DIR="${PRIVILEGED_DIR}" \
+  RJSUPPLICANT_PRIVILEGED_CLIENT_DIR="${ROOT_CLIENT_DIR}" \
+  RJSUPPLICANT_POLICY_DIR="${POLICY_DIR}" \
   "${ROOT_DIR}/scripts/install.sh" --help >/dev/null 2>&1; then
   printf '测试模式接受了 /tmp 之外的系统路径覆盖\n' >&2
   exit 1
 fi
 
-"${ROOT_DIR}/scripts/install.sh" --help >/dev/null
-if "${ROOT_DIR}/scripts/install.sh" --unknown >/dev/null 2>&1; then
+# /tmp/../etc/... 规范化后会逃出 /tmp，必须在 realpath -m 之后拒绝。
+if HOME="${HOME_DIR}" \
+  RJSUPPLICANT_SYSTEMD_DIR="/tmp/../etc/systemd/system" \
+  RJSUPPLICANT_LIBEXEC_DIR="${PRIVILEGED_DIR}" \
+  RJSUPPLICANT_PRIVILEGED_CLIENT_DIR="${ROOT_CLIENT_DIR}" \
+  RJSUPPLICANT_POLICY_DIR="${POLICY_DIR}" \
+  "${ROOT_DIR}/scripts/install.sh" --help >/dev/null 2>&1; then
+  printf '测试模式接受了 /tmp/../etc 绕过路径\n' >&2
+  exit 1
+fi
+
+# 测试模式下必须提供全部四个路径覆盖，避免未覆盖的系统路径被真实写入。
+if HOME="${HOME_DIR}" \
+  RJSUPPLICANT_SYSTEMD_DIR="${TMP_DIR}/only-systemd" \
+  "${ROOT_DIR}/scripts/install.sh" --help >/dev/null 2>&1; then
+  printf '测试模式缺少其他三个路径覆盖时未拒绝\n' >&2
+  exit 1
+fi
+
+if env -u RJSUPPLICANT_TEST_MODE HOME="relative-home" \
+  "${ROOT_DIR}/scripts/install.sh" --help >/dev/null 2>&1; then
+  printf '相对 HOME 未被拒绝\n' >&2
+  exit 1
+fi
+
+if env -u RJSUPPLICANT_TEST_MODE \
+  HOME="${HOME_DIR}" \
+  XDG_DATA_HOME="relative-data" \
+  "${ROOT_DIR}/scripts/install.sh" --help >/dev/null 2>&1; then
+  printf '相对 XDG_DATA_HOME 未被拒绝\n' >&2
+  exit 1
+fi
+
+if env -u RJSUPPLICANT_TEST_MODE \
+  HOME="${HOME_DIR}" \
+  XDG_CONFIG_HOME="relative-config" \
+  "${ROOT_DIR}/scripts/install.sh" --help >/dev/null 2>&1; then
+  printf '相对 XDG_CONFIG_HOME 未被拒绝\n' >&2
+  exit 1
+fi
+
+env -u RJSUPPLICANT_TEST_MODE "${ROOT_DIR}/scripts/install.sh" --help >/dev/null
+if env -u RJSUPPLICANT_TEST_MODE "${ROOT_DIR}/scripts/install.sh" --unknown >/dev/null 2>&1; then
   printf '未知选项未返回失败状态\n' >&2
   exit 1
 fi

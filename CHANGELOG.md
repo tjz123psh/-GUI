@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased - 2026-10-24
+
+### 状态可信度 / 认证判定 / GUI 与安装脚本加固轮（batch 蜂群：4 路只读审计 + 4 个写集互斥 worker + 主代理整合）
+
+用户报告「明明连接上了、能正常使用却显示未连接」，并要求补齐边界情况、修复 bug、美化 GUI、部署。本机取证确认根因不止一个：
+
+- **认证日志只认中文（本机实证）**：真实客户端在 `en_US.UTF-8` 下写 `Success` / `Supplicate failure`，旧代码只匹配 `认证成功`。helper 因此把一次已成功的认证判成 Pending，等满 68 秒后 `return Ok(())` 假成功；这 60 秒里网络已通、GUI 仍显示「未连接」。修复：`privileged::AuthLineKind` 中英文共享判定（整行匹配 Success / 终局失败 / 重试），helper 先看本轮新增日志再看进程退出；`Supplicate failure`/`网线没有连接上` 按重试处理，绝不终止客户端；超时返回 `AuthConclusion::Unconfirmed`，helper 退出码 3，GUI 显示「认证结果未确认」并刷新真实链路，不再写「最近认证成功」。`parse_last_auth` 同步支持英文并跳过重试行。
+- **探测把「未知」当「未连接」**：`probe_wired_path` 新增 `CarrierState` / `ProbeOutcome` 三态；carrier Unknown 不再短路不可达；HTTP 状态码检查（2xx/404 可达，3xx/407/511 视为门户/代理拦截）；新增 223.5.5.5:443、1.1.1.1:443 TCP 目标；curl/ping 任一失败后 libc 兜底仍执行；至少两个独立方法明确失败才判 Unreachable，否则 Unknown。GUI 新增四态 `LinkState`：探测 Unknown 且有 IPv4+默认路由时按「已连接（网卡地址证据）」展示，客户端运行但探测未确认时显示黄色「客户端运行中」，不再把 Unknown 画成红色未连接。
+- **进程/服务/网卡判定**：`ClientProcessState` 跳过僵尸、校验 `/proc/<pid>/exe`；root 进程 exe 不可读时退回 comm（hidepid 不再误报未知）；`systemctl show` 一次读取 LoadState/UnitFileState/ActiveState/SubState/Result，服务胶囊区分等待重试/停止中/运行中未设开机/未知；`wired_interfaces` 不再伪造 eno1、保留 VLAN/bridge/bond/USB、排除虚拟网卡。
+- **刷新竞态与卡死**：`refresh_generation` 丢弃过期结果；状态类命令统一 3 秒硬超时，单个 `journalctl`/`systemctl` 卡住不会让 `refreshing` 永久锁死；只有首帧失败才回退「检测中」，后续保留上一帧。
+- **GUI 交互与视觉**：连接开始立即「认证中…」；状态胶囊改 FlowBox（760/940/960 档自动 2×2，不再裁切）；客户端缺失时安装横幅 + 连接/自启禁用；自启开关加 `autostart_syncing` 重入保护，回滚不再反向执行 disable-service；所有动态文本加 ellipsize/宽度约束；大状态字去掉 `max_width_chars` 与 letter-spacing（修复「已连…」截断）；提高玻璃胶囊/标题/表单对比度、统一状态色令牌、补 focus-visible/disabled/hover、headerbar 32px、降低卡片阴影、修正 net-info 对齐；链路图圆头线帽/Success 拖尾/Failed 虚线/局部裁剪光晕；场景 Idle 停帧、图标纹理缓存，降低静态 CPU。
+- **安装/引导脚本**：测试模式路径先 `realpath -m` 再校验，封堵 `/tmp/../etc` 越界；删除对 `$HOME` 可写 wrapper 的 sudo 执行回退（断开失败即中止卸载）；显式 `RJSUPPLICANT_ZIP` 强制 SHA-256 校验（除非显式 `RJSUPPLICANT_ALLOW_UNVERIFIED_ZIP=1`）；root 客户端已装时跳过学校 ZIP 下载；curl 3 次重试 + 超时、git clone/fetch 退避重试；安装时检测 libadwaita 运行时并给出可操作修复（本轮本机即因 `pacman -Rns kate kooha` 连带卸载 libadwaita 导致 GUI 无法启动）。
+
+验证：Rust 97 项测试（35 lib + 50 GUI + 12 helper，另 1 项真机探测 ignored）全过；`clippy --all-targets -D warnings`、`fmt --check`、release 构建、`bash -n`、shellcheck 四脚本、`tests/bootstrap.sh`、`tests/install_uninstall.sh`、desktop/XML 校验、`git diff --check` 全绿；KWin 1920×1080 实机截图复核 640/960/1280 三档（窄列单栏/紧凑舞台+2×2 胶囊/完整舞台），修复「已连…」截断与进程未知。未验证：错误密码的真实英文终局、polkit 取消/保留、真重启开机路径。
+
 ## Unreleased - 2026-10-02
 
 ### FlClash/TUN 崩溃根因修复与开机链路竞态修复（蜂群并行：子代理实现垫片流水线 + 主代理实现载波宽限与整合）

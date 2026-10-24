@@ -51,28 +51,66 @@ need_cmd() {
   command -v "$1" >/dev/null 2>&1
 }
 
+validate_user_paths() {
+  [[ "${HOME}" == /* ]] || die "HOME 必须是绝对路径：${HOME}"
+  if [[ -n "${XDG_DATA_HOME:-}" ]]; then
+    [[ "${XDG_DATA_HOME}" == /* ]] ||
+      die "XDG_DATA_HOME 必须是绝对路径：${XDG_DATA_HOME}"
+  fi
+  if [[ -n "${XDG_CONFIG_HOME:-}" ]]; then
+    [[ "${XDG_CONFIG_HOME}" == /* ]] ||
+      die "XDG_CONFIG_HOME 必须是绝对路径：${XDG_CONFIG_HOME}"
+  fi
+}
+
 validate_path_overrides() {
-  local name
+  local name path canonical
   local override_used=0
-  for name in \
-    RJSUPPLICANT_SYSTEMD_DIR \
-    RJSUPPLICANT_LIBEXEC_DIR \
-    RJSUPPLICANT_PRIVILEGED_CLIENT_DIR \
-    RJSUPPLICANT_POLICY_DIR; do
+  local overrides=(
+    RJSUPPLICANT_SYSTEMD_DIR
+    RJSUPPLICANT_LIBEXEC_DIR
+    RJSUPPLICANT_PRIVILEGED_CLIENT_DIR
+    RJSUPPLICANT_POLICY_DIR
+  )
+
+  for name in "${overrides[@]}"; do
     if [[ -v "${name}" && -n "${!name}" ]]; then
       override_used=1
     fi
   done
-  if [[ "${override_used}" == "0" ]]; then
-    return
-  fi
-  [[ "${RJSUPPLICANT_TEST_MODE:-0}" == "1" ]] ||
-    die "系统路径覆盖仅允许隔离回归测试使用。"
 
-  local path
-  for path in "${SYSTEMD_SYSTEM_DIR}" "${LIBEXEC_DIR}" "${ROOT_CLIENT_DIR}" "${POLICY_DIR}"; do
-    [[ "${path}" == /tmp/* ]] || die "测试路径必须位于 /tmp：${path}"
+  if [[ "${RJSUPPLICANT_TEST_MODE:-0}" == "1" ]]; then
+    for name in "${overrides[@]}"; do
+      [[ -n "${!name:-}" ]] ||
+        die "测试模式必须同时设置四个路径覆盖，缺少 ${name}。"
+    done
+  elif [[ "${override_used}" == "1" ]]; then
+    die "系统路径覆盖仅允许隔离回归测试使用。"
+  else
+    return 0
+  fi
+
+  need_cmd realpath || die "缺少 realpath（coreutils），无法校验测试路径。"
+
+  for name in "${overrides[@]}"; do
+    path="${!name}"
+    canonical="$(realpath -m -- "${path}")" ||
+      die "无法规范化测试路径：${path}"
+    [[ "${canonical}" == /tmp/* ]] ||
+      die "测试路径必须位于 /tmp：${path}（规范化后：${canonical}）"
+    [[ "${canonical}" != "/tmp" ]] ||
+      die "测试路径不能是 /tmp 本身：${path}"
+    [[ "${canonical}" != *".."* ]] ||
+      die "测试路径不能包含 ..：${path}（规范化后：${canonical}）"
+    printf -v "${name}" '%s' "${canonical}"
   done
+
+  # 覆盖变量在脚本开头已被用于拼出具体文件路径；规范化后必须重算，
+  # 确保后续读写真正落在 realpath -m 的结果上。
+  SERVICE_FILE="${SYSTEMD_SYSTEM_DIR}/${SERVICE_NAME}"
+  HELPER_FILE="${LIBEXEC_DIR}/rjsupplicant-helper"
+  ROOT_WRAPPER_FILE="${LIBEXEC_DIR}/rjsupplicant"
+  POLICY_FILE="${POLICY_DIR}/${APP_ID}.policy"
 }
 
 current_arch_name() {
@@ -98,28 +136,31 @@ legacy_client_ready() {
   [[ -x "${BIN_DIR}/rjsupplicant" && -x "${APP_DIR}/${arch}/rjsupplicant" ]]
 }
 
-# 提权边界：只有 root-owned 且组/其他不可写的程序才允许交给 sudo 运行。
-# 用户可写的 $HOME 下的文件一旦以 root 执行，等价于把「谁能跑 root 代码」
-# 交给任何能写家目录的进程（恶意包、cron、误点脚本）。
-is_root_owned_executable() {
-  local path="$1" owner mode
-  [[ -f "${path}" ]] || return 1
-  owner="$(stat -c '%u' -- "${path}" 2>/dev/null)" || return 1
-  mode="$(stat -c '%a' -- "${path}" 2>/dev/null)" || return 1
-  [[ "${owner}" == "0" ]] || return 1
-  [[ $((8#"${mode}" & 8#022)) -eq 0 ]] || return 1
-  [[ -x "${path}" ]]
-}
-
 preflight_privileges() {
   need_cmd sudo ||
     die "缺少 sudo：安装与卸载都要靠它写入系统目录。请先安装 sudo（或 polkit 提供的 pkexec），不要以其他方式绕过。"
+}
+
+libadwaita_runtime_available() {
+  if need_cmd pkg-config && pkg-config --exists libadwaita-1 2>/dev/null; then
+    return 0
+  fi
+  if need_cmd ldconfig && ldconfig -p 2>/dev/null | grep -Fq 'libadwaita-1.so'; then
+    return 0
+  fi
+  return 1
 }
 
 install_system_deps() {
   if [[ "${SKIP_SYSTEM_DEPS:-0}" == "1" ]]; then
     log "跳过系统依赖安装。"
     return
+  fi
+
+  local libadwaita_missing=0
+  if ! libadwaita_runtime_available; then
+    libadwaita_missing=1
+    log "未检测到 libadwaita 运行时；依赖列表已包含 libadwaita（可手动执行：sudo pacman -S --needed libadwaita）。"
   fi
 
   if need_cmd pacman; then
@@ -130,8 +171,17 @@ install_system_deps() {
     else
       dependencies=(rust "${dependencies[@]}")
     fi
-    sudo pacman -S --needed "${dependencies[@]}"
+    if ! sudo pacman -S --needed "${dependencies[@]}"; then
+      die "pacman 安装依赖失败。请检查网络、磁盘空间与 pacman 密钥环后重试；若仅缺少 libadwaita，可先执行：sudo pacman -S --needed libadwaita"
+    fi
+    if ! libadwaita_runtime_available; then
+      die "libadwaita 运行时仍不可用。请执行：sudo pacman -S --needed libadwaita，并确认 ldconfig -p 能列出 libadwaita-1.so（或 pkg-config --exists libadwaita-1 成功）。"
+    fi
     return
+  fi
+
+  if [[ "${libadwaita_missing}" == "1" ]]; then
+    die "未检测到 libadwaita 运行时，且当前系统没有 pacman。请使用发行版包管理器安装 libadwaita（Arch：sudo pacman -S --needed libadwaita）。"
   fi
 
   log "未检测到 pacman；请手动安装 Rust、GTK4、libadwaita、polkit、desktop-file-utils、unzip 与 gcc（垫片编译需要 cc）。"
@@ -253,13 +303,21 @@ install_gui() {
 uninstall_service() {
   if [[ ! -e "${SERVICE_FILE}" && ! -L "${SERVICE_FILE}" ]]; then
     log "未发现 systemd 服务，跳过系统服务清理。"
-    return
+    return 0
   fi
 
-  log "停止并移除 systemd 服务：${SERVICE_FILE}"
+  log "停止 systemd 服务：${SERVICE_FILE}"
   if need_cmd systemctl; then
     sudo systemctl disable --now "${SERVICE_NAME}" || die "无法停止 ${SERVICE_NAME}，未继续删除服务文件。"
   fi
+}
+
+remove_service_file() {
+  if [[ ! -e "${SERVICE_FILE}" && ! -L "${SERVICE_FILE}" ]]; then
+    return 0
+  fi
+
+  log "移除 systemd 服务文件：${SERVICE_FILE}"
   sudo rm -f "${SERVICE_FILE}"
   if need_cmd systemctl; then
     sudo systemctl daemon-reload
@@ -273,19 +331,14 @@ disconnect_running_client() {
   fi
   if privileged_client_ready; then
     log "通过 root-owned helper 断开仍在运行的认证进程。"
-    sudo "${HELPER_FILE}" disconnect || die "无法断开认证进程，未继续删除客户端文件。"
+    sudo "${HELPER_FILE}" disconnect ||
+      die "无法通过 root-owned helper 断开认证进程；为防误删，卸载已中止。请手动执行 sudo pkill -x rjsupplicant 后重新运行卸载。"
     return
-  fi
-  if [[ ! -x "${BIN_DIR}/rjsupplicant" ]]; then
-    log "检测到认证进程仍在运行，但 wrapper 不可用；请手动停止该进程。"
-    return
-  fi
-  if ! is_root_owned_executable "${BIN_DIR}/rjsupplicant"; then
-    die "检测到仍在运行的认证进程，但 ${BIN_DIR}/rjsupplicant 不是 root-owned 且他人不可写的程序，为防本地提权不以 root 执行它。请先手动停止该认证进程（例如 sudo kill <该进程 PID>），或先重新安装 root-owned 客户端完成迁移后再卸载。"
   fi
 
-  log "断开仍在运行的手动认证进程。"
-  sudo "${BIN_DIR}/rjsupplicant" -q || die "无法断开认证进程，未继续删除客户端文件。"
+  # 提权边界：绝不把 $HOME 下用户可写的 wrapper 交给 sudo 执行。
+  # 无法经 root-owned helper 断开时，只能让用户手动停止进程。
+  die "检测到仍在运行的认证进程，但 root-owned helper 不可用，无法安全断开；为防误删，卸载已中止。请先手动执行 sudo pkill -x rjsupplicant，然后重新运行卸载。"
 }
 
 uninstall_privileged_files() {
@@ -319,6 +372,7 @@ uninstall() {
   log "卸载将中断当前有线认证连接。"
   uninstall_service
   disconnect_running_client
+  remove_service_file
   uninstall_privileged_files
   uninstall_user_files
 
@@ -331,6 +385,7 @@ uninstall() {
 
 main() {
   [[ -n "${HOME:-}" ]] || die "HOME 为空，无法确定用户安装目录。"
+  validate_user_paths
   validate_path_overrides
 
   case "${1:-}" in

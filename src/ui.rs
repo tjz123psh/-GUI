@@ -20,7 +20,8 @@ use gtk4::glib;
 use libadwaita as adw;
 use rjsupplicant_gui::netcheck;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 /// 三档断点（以 Niri preset 宽度 640/960/1280 为基准，取中间值切档）。
 /// STANDARD_MAX 原为 1080，但 niri 平铺下半屏窗口常见宽度 954-960，
@@ -40,6 +41,147 @@ struct LastAuth {
     /// "X 分钟前"会退回"刚刚"甚至错误。
     at: std::time::Instant,
 }
+
+/// 大状态字/状态条的语义色。连接状态机只关心语义，CSS 负责具体色值。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StageTone {
+    Ok,
+    Success,
+    Busy,
+    Warn,
+    Off,
+    Failed,
+}
+
+impl StageTone {
+    fn stage_class(self) -> &'static str {
+        match self {
+            StageTone::Ok => "stat-ok",
+            StageTone::Success => "stat-success",
+            StageTone::Busy => "stat-busy",
+            StageTone::Warn => "stat-warn",
+            StageTone::Off => "stat-off",
+            StageTone::Failed => "stat-failed",
+        }
+    }
+
+    fn dot_class(self) -> &'static str {
+        match self {
+            StageTone::Ok | StageTone::Success => "dot-ok",
+            StageTone::Busy => "dot-busy",
+            StageTone::Warn => "dot-warn",
+            StageTone::Off => "dot-off",
+            StageTone::Failed => "dot-failed",
+        }
+    }
+
+    /// 连接详情里状态值的文字颜色（HTML markup 不支持 CSS 变量，必须给实色）。
+    fn detail_color(self) -> &'static str {
+        match self {
+            StageTone::Ok | StageTone::Success => "#C14D7C",
+            StageTone::Busy => "#8C4A6B",
+            StageTone::Warn => "#B7791F",
+            StageTone::Off => "#6E5568",
+            StageTone::Failed => "#C63F38",
+        }
+    }
+}
+
+/// 连接展示状态（四态）：探测/载波/客户端进程是三个独立证据源，
+/// 不能再用一个 bool 把"客户端没在跑"直接等同于"未连接"。
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum LinkState {
+    Connected { evidence: String },
+    RunningUnverified,
+    Disconnected { reason: String },
+    Unknown { reason: String },
+}
+
+impl LinkState {
+    fn headline(&self) -> &'static str {
+        match self {
+            LinkState::Connected { .. } => "已连接",
+            LinkState::RunningUnverified => "客户端运行中",
+            LinkState::Disconnected { .. } => "未连接",
+            LinkState::Unknown { .. } => "状态未知",
+        }
+    }
+
+    fn tone(&self) -> StageTone {
+        match self {
+            LinkState::Connected { .. } => StageTone::Ok,
+            LinkState::RunningUnverified => StageTone::Warn,
+            // 载波断开/网卡不存在是"明确未连接"，用中性 off 而不是红色故障。
+            LinkState::Disconnected { .. } | LinkState::Unknown { .. } => StageTone::Off,
+        }
+    }
+
+    fn detail_text(&self) -> String {
+        match self {
+            LinkState::Connected { evidence } => format!("已连接（{evidence}）"),
+            LinkState::RunningUnverified => "客户端运行中（等待路径确认）".to_string(),
+            LinkState::Disconnected { reason } => format!("未连接（{reason}）"),
+            LinkState::Unknown { reason } => format!("状态未知（{reason}）"),
+        }
+    }
+}
+
+/// 纯函数：把载波/探测/进程/网卡地址合成展示状态。
+///
+/// 优先级是产品语义：载波断开是硬事实；探测可达优先于进程（客户端可能已
+/// SIGSEGV 但会话仍保持）；客户端运行时探测未确认只能标黄，不能报未连接；
+/// 探测未知且没有客户端时，只有地址+默认路由都齐全才允许按已连接展示。
+fn classify_link(
+    carrier: &netcheck::CarrierState,
+    probe: &netcheck::ProbeOutcome,
+    client_running: bool,
+    has_ipv4: bool,
+    has_default_route: bool,
+) -> LinkState {
+    match carrier {
+        netcheck::CarrierState::Down => {
+            return LinkState::Disconnected {
+                reason: "网线未连接".to_string(),
+            };
+        }
+        netcheck::CarrierState::Missing => {
+            return LinkState::Disconnected {
+                reason: "网卡不存在".to_string(),
+            };
+        }
+        netcheck::CarrierState::Up | netcheck::CarrierState::Unknown => {}
+    }
+
+    if matches!(probe, netcheck::ProbeOutcome::Reachable) {
+        return LinkState::Connected {
+            evidence: if client_running {
+                "客户端运行且路径可达".to_string()
+            } else {
+                "会话保持 · 路径可达".to_string()
+            },
+        };
+    }
+    if client_running {
+        return LinkState::RunningUnverified;
+    }
+    if matches!(probe, netcheck::ProbeOutcome::Unknown) {
+        if has_ipv4 && has_default_route {
+            return LinkState::Connected {
+                evidence: "网卡已获取地址与默认路由".to_string(),
+            };
+        }
+        return LinkState::Unknown {
+            reason: "探测结果不可用".to_string(),
+        };
+    }
+    LinkState::Disconnected {
+        reason: "有线路径不可达".to_string(),
+    }
+}
+
+/// 认证动效结束后，大状态字保持"认证成功/失败/未确认"的时长。
+/// 10 秒轮询到来时自然回落到链路状态，避免成功文案一闪而过。
+const STAGE_HOLD: Duration = Duration::from_secs(8);
 
 /// 迁移/失败横幅的按钮动作：点击时按当前状态分派，避免把不同状态
 /// 都接到安装对话框上。
@@ -64,6 +206,8 @@ struct Ui {
     stage_sub: gtk::Label,
     /// 状态胶囊：客户端 / 进程 / 服务 / 网卡，(圆点, 值)。
     pills: Vec<(gtk::Box, gtk::Label)>,
+    /// 胶囊 FlowBox：按断点限制列数，窄舞台固定 2×2，宽舞台最多 4 列。
+    pills_flow: gtk::FlowBox,
     /// 窄屏（<760）顶部紧凑状态条：圆点 + 状态字 + 副行 + 网卡胶囊。
     compact_status: gtk::Box,
     compact_dot: gtk::Box,
@@ -106,6 +250,19 @@ struct Ui {
     /// 刷新状态期间为 true：防止 set_active 触发的 notify 回调
     /// 误把"同步开关"当成用户操作去启停 systemd 服务。
     refreshing: Arc<AtomicBool>,
+    /// 每次 refresh 递增；异步结果只有 generation 仍匹配才能落地，
+    /// 防止慢的旧轮询覆盖刚完成的新状态。
+    refresh_generation: Arc<AtomicU64>,
+    /// 是否已经应用过一帧状态（含首次 loading 回退）。只有从未有过界面
+    /// 数据时才回退"检测中…"，后续失败保留上一帧，不能把已有界面打回 loading。
+    has_status: Arc<AtomicBool>,
+    /// 后端明确报告客户端未安装：连接/开机认证禁用，安装按钮升为主操作。
+    client_missing: Arc<AtomicBool>,
+    /// 程序化 set_active 的重入保护，避免开关回滚反向触发 disable-service。
+    autostart_syncing: Arc<AtomicBool>,
+    /// 认证动作结束后短时间压住大状态字（认证成功/连接失败/结果未确认），
+    /// 不让紧随其后的 refresh 立刻覆盖成普通链路状态。
+    stage_hold: Arc<std::sync::Mutex<Option<(String, StageTone, Instant)>>>,
 }
 
 impl Ui {
@@ -146,19 +303,48 @@ impl Ui {
         self.nic.set_selected(keep.unwrap_or(0) as u32);
     }
 
-    /// 同步大状态字（舞台 + 窄屏状态条）与场景/链路模式。
-    fn set_stage(&self, text: &str, ok: bool) {
-        let cls = if ok { "stat-ok" } else { "stat-warn" };
+    /// 同步大状态字（舞台 + 窄屏状态条）的文案与语义色。
+    fn set_stage(&self, text: &str, tone: StageTone) {
         for l in [&self.stage_big, &self.compact_state] {
             l.set_label(text);
-            l.remove_css_class("stat-ok");
-            l.remove_css_class("stat-warn");
-            l.add_css_class(cls);
+            for cls in [
+                "stat-ok",
+                "stat-success",
+                "stat-busy",
+                "stat-warn",
+                "stat-off",
+                "stat-failed",
+            ] {
+                l.remove_css_class(cls);
+            }
+            l.add_css_class(tone.stage_class());
         }
-        self.compact_dot.remove_css_class("dot-ok");
-        self.compact_dot.remove_css_class("dot-warn");
-        self.compact_dot
-            .add_css_class(if ok { "dot-ok" } else { "dot-warn" });
+        for cls in ["dot-ok", "dot-busy", "dot-warn", "dot-off", "dot-failed"] {
+            self.compact_dot.remove_css_class(cls);
+        }
+        self.compact_dot.add_css_class(tone.dot_class());
+    }
+
+    /// 压住大状态字一段时间，让认证结果文案不被紧随其后的刷新覆盖。
+    fn hold_stage(&self, text: &str, tone: StageTone) {
+        if let Ok(mut guard) = self.stage_hold.lock() {
+            *guard = Some((text.to_string(), tone, Instant::now()));
+        }
+        self.set_stage(text, tone);
+    }
+
+    fn stage_hold_active(&self) -> bool {
+        let Ok(mut guard) = self.stage_hold.lock() else {
+            return false;
+        };
+        match guard.as_ref() {
+            Some((_, _, at)) if at.elapsed() < STAGE_HOLD => true,
+            Some(_) => {
+                *guard = None;
+                false
+            }
+            None => false,
+        }
     }
 
     /// 按窗口宽度应用断点：窄屏单栏 + 顶部状态条；宽屏舞台 + 控制台。
@@ -181,8 +367,21 @@ impl Ui {
             self.console.set_margin_end(0);
             self.console.set_size_request(CONSOLE_WIDTH, -1);
             self.console.remove_css_class("solid");
-            self.scene
-                .set_shift(if width < STANDARD_MAX { 0.5 } else { 0.58 });
+            if width < STANDARD_MAX {
+                // 760-939 紧凑舞台只有约 268-448px：状态字降一档，长文案
+                //（客户端运行中/认证结果未确认）也不会顶到舞台边缘。
+                self.stage.add_css_class("narrow-stage");
+                self.scene.set_shift(0.5);
+            } else {
+                self.stage.remove_css_class("narrow-stage");
+                self.scene.set_shift(0.58);
+            }
+            // 按舞台实际可用宽度决定胶囊列数：<520px（760/940/960 档）排成
+            // 稳定的 2×2，宽舞台（1280 档约 788px）才排 4 列；避免 940 档出现
+            // 3+1 的孤行。这里只影响胶囊内部排布，不新增结构断点。
+            let stage_width = width - CONSOLE_WIDTH - 72;
+            self.pills_flow
+                .set_max_children_per_line(if stage_width < 520 { 2 } else { 4 });
         }
     }
 }
@@ -268,7 +467,12 @@ fn make_pill(label: &str) -> (gtk::Box, gtk::Box, gtk::Label) {
     dot.add_css_class("pill-dot");
     // 初值是"加载中"，不能先用表示健康的绿点（窄屏状态条同样用 dot-warn）。
     dot.add_css_class("dot-warn");
-    let value = gtk::Label::builder().label(label).build();
+    let value = gtk::Label::builder()
+        .label(label)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .max_width_chars(18)
+        .xalign(0.0)
+        .build();
     let pill = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(6)
@@ -431,17 +635,21 @@ fn build_window(app: &adw::Application) -> Ui {
         .build();
 
     let stage_big = gtk::Label::builder()
-        .label("未连接")
+        .label("检测中…")
         .css_classes(["stage-big"])
         .halign(gtk::Align::Center)
+        .hexpand(true)
         .margin_top(64)
         .build();
     stage.append(&stage_big);
 
     let stage_sub = gtk::Label::builder()
-        .label("输入账号密码，点击连接")
+        .label("正在检测网络状态…")
         .css_classes(["stage-sub"])
         .halign(gtk::Align::Center)
+        .hexpand(true)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .max_width_chars(52)
         .build();
     stage.append(&stage_sub);
 
@@ -453,10 +661,14 @@ fn build_window(app: &adw::Application) -> Ui {
     link_widget.set_margin_bottom(16);
     stage.append(&link_widget);
 
-    // 状态胶囊行：客户端 / 进程 / 服务 / 网卡
-    let pills_row = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(10)
+    // 状态胶囊：FlowBox 最多 4 列；760px 档舞台只有约 268px，四枚完整胶囊
+    // 放不下时自动换行成 2×2，而不是像横向 Box 那样被窗口边缘裁切。
+    let pills_row = gtk::FlowBox::builder()
+        .max_children_per_line(4)
+        .min_children_per_line(1)
+        .selection_mode(gtk::SelectionMode::None)
+        .column_spacing(10)
+        .row_spacing(8)
         .halign(gtk::Align::Center)
         .margin_bottom(44)
         .build();
@@ -464,10 +676,9 @@ fn build_window(app: &adw::Application) -> Ui {
     let (pill_proc, dot_proc, val_proc) = make_pill("进程 加载中…");
     let (pill_service, dot_service, val_service) = make_pill("服务 加载中…");
     let (pill_nic, dot_nic, val_nic) = make_pill("网卡 加载中…");
-    pills_row.append(&pill_client);
-    pills_row.append(&pill_proc);
-    pills_row.append(&pill_service);
-    pills_row.append(&pill_nic);
+    for pill in [&pill_client, &pill_proc, &pill_service, &pill_nic] {
+        pills_row.append(pill);
+    }
     stage.append(&pills_row);
 
     // ---- 窄屏顶部状态条：圆点 + 状态字 + 副行 + 网卡胶囊 ----
@@ -483,13 +694,19 @@ fn build_window(app: &adw::Application) -> Ui {
     compact_dot.add_css_class("dot-warn");
     compact_status.append(&compact_dot);
     let compact_state = gtk::Label::builder()
-        .label("未连接")
+        .label("检测中…")
         .css_classes(["compact-state"])
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .max_width_chars(14)
         .build();
     compact_status.append(&compact_state);
     let compact_sub = gtk::Label::builder()
-        .label("")
+        .label("正在检测网络状态…")
         .css_classes(["compact-sub"])
+        .hexpand(true)
+        .xalign(0.0)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .max_width_chars(36)
         .build();
     compact_status.append(&compact_sub);
 
@@ -553,9 +770,12 @@ fn build_window(app: &adw::Application) -> Ui {
     let nic_row = form_line(ICON_NETWORK, "网卡", &nic);
     console.append(&nic_row);
     let net_info = gtk::Label::builder()
-        .label("未获取到 IP")
+        .label("检测中…")
         .css_classes(["net-info"])
         .xalign(0.0)
+        .hexpand(true)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .max_width_chars(48)
         .build();
     console.append(&net_info);
 
@@ -613,6 +833,9 @@ fn build_window(app: &adw::Application) -> Ui {
         .css_classes(["log-preview"])
         .xalign(0.0)
         .wrap(true)
+        .lines(LOG_PREVIEW_LINES as i32)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .max_width_chars(72)
         .build();
     console.append(&log_preview);
 
@@ -628,18 +851,27 @@ fn build_window(app: &adw::Application) -> Ui {
         .label("认证账号 -")
         .css_classes(["conn-row"])
         .xalign(0.0)
+        .hexpand(true)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .max_width_chars(44)
         .build();
     console.append(&detail_account);
     let detail_state = gtk::Label::builder()
-        .label("连接状态 未连接")
+        .label("连接状态 检测中…")
         .css_classes(["conn-row"])
         .xalign(0.0)
+        .hexpand(true)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .max_width_chars(44)
         .build();
     console.append(&detail_state);
     let detail_last = gtk::Label::builder()
         .label("最近认证 暂无记录")
         .css_classes(["conn-row"])
         .xalign(0.0)
+        .hexpand(true)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .max_width_chars(44)
         .build();
     console.append(&detail_last);
 
@@ -696,6 +928,7 @@ fn build_window(app: &adw::Application) -> Ui {
             (dot_service, val_service),
             (dot_nic, val_nic),
         ],
+        pills_flow: pills_row.clone(),
         compact_status,
         compact_dot,
         compact_state,
@@ -725,6 +958,11 @@ fn build_window(app: &adw::Application) -> Ui {
         banner,
         busy: Arc::new(AtomicBool::new(false)),
         refreshing: Arc::new(AtomicBool::new(false)),
+        refresh_generation: Arc::new(AtomicU64::new(0)),
+        has_status: Arc::new(AtomicBool::new(false)),
+        client_missing: Arc::new(AtomicBool::new(false)),
+        autostart_syncing: Arc::new(AtomicBool::new(false)),
+        stage_hold: Arc::new(std::sync::Mutex::new(None)),
     };
 
     wire_events(&ui);
@@ -742,6 +980,12 @@ fn build_window(app: &adw::Application) -> Ui {
 /// 加载主题样式：樱花基调 + 舞台透明 + 控制台玻璃 + 实色文字。
 fn load_theme_css() {
     let css = r#"
+    /* ---- 状态色令牌：ok=健康 / warn=待确认（黄）/ off=中性未知 ---- */
+    @define-color ok #FF6F91;
+    @define-color warn #B7791F;
+    @define-color off #8C7285;
+    @define-color bad #C63F38;
+
     /* ---- 文字实色系：深紫主 / 紫灰次 / 浅灰禁，不用低透明度叠加 ---- */
     window {
         background-color: #cfa4b6;
@@ -788,10 +1032,13 @@ fn load_theme_css() {
         box-shadow: 0 1px 6px alpha(#2d1420, 0.25);
     }
     headerbar button {
-        background-color: alpha(#ffffff, 0.45);
+        background-color: alpha(#ffffff, 0.60);
         color: #4A3048;
         border-radius: 999px;
         border: 1px solid alpha(#ffffff, 0.85);
+        min-width: 32px;
+        min-height: 32px;
+        padding: 0;
         transition: all 180ms ease-out;
     }
     headerbar button:hover {
@@ -821,7 +1068,7 @@ fn load_theme_css() {
         border-radius: 28px;
         border: 1px solid alpha(#ffffff, 0.55);
         box-shadow:
-            0 20px 60px alpha(#502846, 0.22),
+            0 12px 32px alpha(#502846, 0.16),
             inset 0 1px 0 alpha(#ffffff, 0.95);
         padding: 16px 28px;
     }
@@ -842,7 +1089,7 @@ fn load_theme_css() {
         font-size: 9.5pt;
         font-weight: 700;
         color: #FFFFFF;
-        background-color: alpha(#4A3048, 0.55);
+        background-color: alpha(#4A3048, 0.70);
         border-radius: 999px;
         padding: 2px 14px;
         margin-top: 2px;
@@ -857,7 +1104,7 @@ fn load_theme_css() {
     .card-subtitle {
         font-size: 10pt;
         color: #FFFFFF;
-        background-color: alpha(#6E4A5E, 0.40);
+        background-color: alpha(#6E4A5E, 0.66);
         border-radius: 999px;
         padding: 2px 12px;
         margin-bottom: 3px;
@@ -867,6 +1114,13 @@ fn load_theme_css() {
     .stage {
         background-color: transparent;
     }
+    .stage.narrow-stage .stage-big {
+        font-size: 20pt;
+        padding: 6px 20px;
+    }
+    .stage.narrow-stage .stage-sub {
+        font-size: 9.5pt;
+    }
 
     /* 大状态字：舞台主视觉（宽屏 26pt / 窄屏状态条 13pt 各有一份）。
        深紫玻璃胶囊托底 + 白字：在亮樱花背景上保持高对比，不依赖投影。 */
@@ -874,30 +1128,39 @@ fn load_theme_css() {
         font-size: 26pt;
         font-weight: 800;
         color: #FFFFFF;
-        letter-spacing: 3px;
-        background-color: alpha(#4A3048, 0.62);
+        background-color: alpha(#4A3048, 0.70);
         border-radius: 999px;
         padding: 8px 30px;
         box-shadow: 0 2px 12px alpha(#2d1420, 0.25);
     }
-    .stage-big.stat-ok {
-        color: #FFD3E2;
+    .stage-big.stat-ok,
+    .stage-big.stat-success {
+        color: #FFE0EC;
+    }
+    .stage-big.stat-busy {
+        color: #FFE7F0;
     }
     .stage-big.stat-warn {
+        color: #FFE2A8;
+    }
+    .stage-big.stat-off {
+        color: #F1DDE8;
+    }
+    .stage-big.stat-failed {
         color: #FFC9BE;
     }
     .stage-sub {
         font-size: 11pt;
         color: #FFFFFF;
-        background-color: alpha(#6E4A5E, 0.40);
+        background-color: alpha(#6E4A5E, 0.65);
         border-radius: 999px;
         padding: 2px 14px;
     }
 
     /* 状态胶囊：圆角胶囊 + 状态圆点（客户端/进程/服务/网卡） */
     .pill {
-        background-color: alpha(#ffffff, 0.55);
-        border: 1px solid alpha(#ffffff, 0.75);
+        background-color: alpha(#ffffff, 0.68);
+        border: 1px solid alpha(#ffffff, 0.82);
         border-radius: 999px;
         padding: 5px 14px;
         box-shadow:
@@ -912,19 +1175,39 @@ fn load_theme_css() {
     .pill-dot {
         border-radius: 999px;
     }
+    flowbox,
+    flowboxchild {
+        background-color: transparent;
+    }
+    flowboxchild {
+        padding: 0;
+        outline: none;
+    }
     .pill-dot.dot-ok {
-        background-color: #FF6F91;
-        box-shadow: 0 0 6px alpha(#FF6F91, 0.7);
+        background-color: @ok;
+        box-shadow: 0 0 6px alpha(@ok, 0.7);
+    }
+    .pill-dot.dot-busy {
+        background-color: #D98AA6;
+        box-shadow: 0 0 8px alpha(#D98AA6, 0.65);
     }
     .pill-dot.dot-warn {
-        background-color: #C63F38;
-        box-shadow: 0 0 6px alpha(#C63F38, 0.5);
+        background-color: @warn;
+        box-shadow: 0 0 6px alpha(@warn, 0.55);
+    }
+    .pill-dot.dot-off {
+        background-color: @off;
+        box-shadow: 0 0 4px alpha(@off, 0.35);
+    }
+    .pill-dot.dot-failed {
+        background-color: @bad;
+        box-shadow: 0 0 6px alpha(@bad, 0.5);
     }
 
     /* ---- 窄屏顶部状态条：玻璃胶囊，状态一目了然 ---- */
     .compact-status {
-        background-color: alpha(#ffffff, 0.55);
-        border: 1px solid alpha(#ffffff, 0.75);
+        background-color: alpha(#ffffff, 0.68);
+        border: 1px solid alpha(#ffffff, 0.82);
         border-radius: 18px;
         padding: 8px 16px;
         box-shadow:
@@ -936,11 +1219,21 @@ fn load_theme_css() {
         font-weight: 700;
         color: #4A3048;
     }
-    .compact-state.stat-ok {
+    .compact-state.stat-ok,
+    .compact-state.stat-success {
         color: #C14D7C;
     }
+    .compact-state.stat-busy {
+        color: #8C4A6B;
+    }
     .compact-state.stat-warn {
-        color: #C63F38;
+        color: @warn;
+    }
+    .compact-state.stat-off {
+        color: @off;
+    }
+    .compact-state.stat-failed {
+        color: @bad;
     }
     .compact-sub {
         font-size: 9.5pt;
@@ -955,7 +1248,8 @@ fn load_theme_css() {
     .net-info {
         font-size: 8.5pt;
         color: #6E5568;
-        padding: 0 2px 3px 76px;
+        /* 与表单输入框左边缘对齐：图标 18 + 间距 10 + label 64 + 间距 10 + 行内边距 2 */
+        padding: 0 2px 3px 104px;
     }
     /* 连接详情行：账号 / 状态 / 最近认证结果（标签与值由 markup 分色） */
     .conn-row {
@@ -966,7 +1260,7 @@ fn load_theme_css() {
         font-size: 10pt;
         font-weight: 600;
         color: #FFFFFF;
-        background-color: alpha(#4A3048, 0.45);
+        background-color: alpha(#4A3048, 0.68);
         border-radius: 999px;
         padding: 2px 12px;
     }
@@ -1042,6 +1336,21 @@ fn load_theme_css() {
             0 2px 6px alpha(#502846, 0.12),
             inset 0 2px 6px alpha(#8a4a6b, 0.15);
     }
+    button:focus-visible {
+        outline: 2px solid alpha(#FFFFFF, 0.92);
+        outline-offset: 2px;
+    }
+    button:disabled {
+        opacity: 0.48;
+    }
+    button.btn-glow:disabled,
+    button.btn-ghost:disabled {
+        background-image: none;
+        background-color: alpha(#ffffff, 0.24);
+        color: alpha(#4A3048, 0.58);
+        border-color: alpha(#ffffff, 0.35);
+        box-shadow: none;
+    }
 
     /* ---- 浮层（popover）：深紫玻璃 + 浅色字，与文字胶囊同一套语言 ----
        白玻璃浅底让行文字在亮背景上发飘（用户反馈"字体和阴影很奇怪"）。
@@ -1098,7 +1407,8 @@ fn load_theme_css() {
         padding: 4px 10px;
         box-shadow: inset 0 1px 2px alpha(#8a4a6b, 0.10);
     }
-    dropdown:focus {
+    dropdown:focus,
+    dropdown:focus-within {
         border-color: alpha(#FF6F91, 0.65);
         box-shadow:
             0 0 0 2px alpha(#FF6F91, 0.20),
@@ -1158,12 +1468,21 @@ fn load_theme_css() {
     }
 
     switch:checked {
-        background-color: #FF6F91;
-        border-color: alpha(#FF6F91, 0.7);
+        background-color: @ok;
+        border-color: alpha(@ok, 0.7);
     }
     switch {
         background-color: alpha(#9a6a92, 0.35);
         border: 1px solid alpha(#b98fb0, 0.45);
+        transition: background-color 160ms ease-out, border-color 160ms ease-out;
+    }
+    switch:hover {
+        background-color: alpha(#b98fb0, 0.55);
+        border-color: alpha(#d6aecb, 0.65);
+    }
+    switch:checked:hover {
+        background-color: #FF85A3;
+        border-color: alpha(#FF85A3, 0.8);
     }
 
 
@@ -1194,13 +1513,21 @@ fn load_theme_css() {
 
 fn set_busy(ui: &Ui, busy: bool) {
     ui.busy.store(busy, Ordering::Relaxed);
-    // 忙碌期间禁用全部交互控件：避免控件仍是可点外观（手状光标）却
-    // 被 busy 保护吞掉点击，让用户误以为点击无效。
-    ui.connect.set_sensitive(!busy);
-    ui.disconnect.set_sensitive(!busy);
+    apply_control_state(ui);
+}
+
+/// 统一计算控件可用性：busy / 刷新中 / 客户端缺失三个约束一起生效。
+/// 刷新中只禁用自启开关（它会在结果落地时被程序化 set_active），其余操作
+/// 仍可继续；不能用一个静默 return 假装开关可用。
+fn apply_control_state(ui: &Ui) {
+    let busy = ui.busy.load(Ordering::Relaxed);
+    let refreshing = ui.refreshing.load(Ordering::Relaxed);
+    let missing = ui.client_missing.load(Ordering::Relaxed);
+    ui.connect.set_sensitive(!busy && !missing);
+    ui.disconnect.set_sensitive(!busy && !missing);
     ui.install.set_sensitive(!busy);
     ui.refresh.set_sensitive(!busy);
-    ui.autostart.set_sensitive(!busy);
+    ui.autostart.set_sensitive(!busy && !refreshing && !missing);
     ui.more.set_sensitive(!busy);
     ui.banner.set_sensitive(!busy);
     ui.nic.set_sensitive(!busy);
@@ -1209,6 +1536,31 @@ fn set_busy(ui: &Ui, busy: bool) {
     for row in &ui.diag {
         row.set_sensitive(!busy);
     }
+}
+
+/// 客户端缺失时把安装按钮升为主操作；已安装时恢复普通幽灵按钮。
+fn apply_install_affordance(ui: &Ui, missing: bool) {
+    ui.install.remove_css_class("suggested-action");
+    ui.install.remove_css_class("btn-glow");
+    ui.install.remove_css_class("btn-ghost");
+    if missing {
+        ui.install.add_css_class("suggested-action");
+        ui.install.add_css_class("btn-glow");
+        ui.install
+            .set_tooltip_text(Some("安装官方客户端后才能连接校园网"));
+    } else {
+        ui.install.add_css_class("btn-ghost");
+        ui.install.set_tooltip_text(None);
+    }
+}
+
+/// 程序化同步开关位置。`autostart_syncing` 是同步重入保护：set_active 会
+/// 立刻发出 notify，若没有这层标记，刷新/回滚把开关拨回 false 会被当成
+/// 用户点击去 disable-service，反过来破坏服务状态。
+fn set_autostart_silent(ui: &Ui, active: bool) {
+    ui.autostart_syncing.store(true, Ordering::SeqCst);
+    ui.autostart.set_active(active);
+    ui.autostart_syncing.store(false, Ordering::SeqCst);
 }
 
 fn toast(ui: &Ui, text: &str) {
@@ -1229,8 +1581,13 @@ where
     }
     set_busy(ui, true);
     toast(ui, busy_message);
-    ui.scene.set_mode(scene::Mode::Connecting);
-    ui.link.set_mode(scene::Mode::Connecting);
+    let connection_action = ok_message.is_some();
+    if connection_action {
+        // 连接一开始就进入明确的忙碌文案，不能继续显示上一次的"未连接"。
+        ui.set_stage("认证中…", StageTone::Busy);
+        ui.scene.set_mode(scene::Mode::Connecting);
+        ui.link.set_mode(scene::Mode::Connecting);
+    }
 
     // 阻塞调用（pkexec 等待、systemctl、官方客户端运行）放在独立线程执行：
     // glib::spawn_future 在主上下文线程上运行，阻塞体会冻结整个界面（实测：
@@ -1245,31 +1602,41 @@ where
             .next()
             .await
             .unwrap_or_else(|| Err(anyhow::anyhow!("后台任务异常退出")));
-        let message = match result {
-            Ok(()) => None,
-            Err(err) if !err.to_string().is_empty() => Some(err.to_string()),
-            Err(err) => Some(err.to_string()),
-        };
-        match message {
-            Some(err) => {
+        match result {
+            Err(err) if connection_action && system::is_auth_unconfirmed(&err) => {
+                // 官方客户端没有协议级成功回调，超时/崩溃后无法断定失败：
+                // 保持中性提示并立即刷新真实链路，绝不写"最近认证成功"。
+                ui_done.scene.set_mode(scene::Mode::Idle);
+                ui_done.link.set_mode(scene::Mode::Idle);
+                ui_done.hold_stage("认证结果未确认", StageTone::Warn);
+                toast(&ui_done, "认证结果未确认，正在刷新真实连接状态…");
+            }
+            Err(err) => {
                 ui_done.scene.set_mode(scene::Mode::Failed);
                 ui_done.link.set_mode(scene::Mode::Failed);
-                if ok_message.is_some() {
-                    ui_done.set_stage("连接失败", false);
+                if connection_action {
+                    ui_done.hold_stage("连接失败", StageTone::Failed);
+                    if let Ok(mut guard) = ui_done.last_auth.lock() {
+                        *guard = Some(LastAuth {
+                            ok: false,
+                            summary: err.to_string(),
+                            at: Instant::now(),
+                        });
+                    }
                 }
-                toast(&ui_done, &err);
+                toast(&ui_done, &err.to_string());
             }
-            None => {
+            Ok(()) => {
                 if let Some(text) = ok_message {
                     ui_done.scene.set_mode(scene::Mode::Success);
                     ui_done.link.set_mode(scene::Mode::Success);
-                    ui_done.set_stage(text, true);
-                    // 连接动作成功：记录最近认证结果（连接详情区显示）
+                    ui_done.hold_stage(text, StageTone::Success);
+                    // 只有确认成功才写最近认证结果；未知结果走上面的分支。
                     if let Ok(mut guard) = ui_done.last_auth.lock() {
                         *guard = Some(LastAuth {
                             ok: true,
                             summary: String::new(),
-                            at: std::time::Instant::now(),
+                            at: Instant::now(),
                         });
                     }
                 } else {
@@ -1371,8 +1738,9 @@ fn run_service_toggle(ui: &Ui, on: bool, settings: config::Settings) {
         };
         match message {
             Some(err) => {
-                // 失败：回滚开关（busy 为 true，回滚触发的 notify 会被 busy 保护跳过）
-                ui_done.autostart.set_active(!on);
+                // 失败：回滚开关。busy 与 autostart_syncing 双保险，回滚触发的
+                // notify 绝不会被当成用户操作再次启用/禁用服务。
+                set_autostart_silent(&ui_done, !on);
                 ui_done.scene.set_mode(scene::Mode::Failed);
                 ui_done.link.set_mode(scene::Mode::Failed);
                 toast(&ui_done, &err);
@@ -1431,7 +1799,7 @@ where
             None => {
                 ui_done.scene.set_mode(scene::Mode::Idle);
                 ui_done.link.set_mode(scene::Mode::Idle);
-                ui_done.set_stage("未连接", false);
+                ui_done.set_stage("未连接", StageTone::Off);
                 toast(&ui_done, "已断开");
             }
         }
@@ -1613,23 +1981,11 @@ fn do_connect(ui: &Ui) {
         toast(&settings_ui, "密码留空，将尝试复用已保存的密码");
     }
     let _ = config::save(&settings);
-    let last_auth = settings_ui.last_auth.clone();
     run_backend(
         &settings_ui,
         "正在连接…",
-        Some("已连接"),
-        move || {
-            let result = system::authenticate(&settings, &password);
-            // 失败时记录最近认证结果（连接详情区显示）
-            if let (Err(err), Ok(mut guard)) = (&result, last_auth.lock()) {
-                *guard = Some(LastAuth {
-                    ok: false,
-                    summary: err.to_string(),
-                    at: std::time::Instant::now(),
-                });
-            }
-            result
-        },
+        Some("认证成功"),
+        move || system::authenticate(&settings, &password),
     );
 }
 
@@ -1678,13 +2034,16 @@ fn wire_events(ui: &Ui) {
     ui.autostart.connect_active_notify(move |switch| {
         let ui = autostart_ui.clone();
         let on = switch.is_active();
-        if ui.busy.load(Ordering::Relaxed) || ui.refreshing.load(Ordering::Relaxed) {
+        if ui.autostart_syncing.load(Ordering::Relaxed)
+            || ui.busy.load(Ordering::Relaxed)
+            || ui.refreshing.load(Ordering::Relaxed)
+        {
             return;
         }
         let settings = ui.settings();
         if on {
             if !settings.save_password {
-                switch.set_active(false);
+                set_autostart_silent(&ui, false);
                 toast(
                     &ui,
                     "开机自动认证需要保存密码：unit 里没有口令，请先打开「保存密码」",
@@ -1694,7 +2053,7 @@ fn wire_events(ui: &Ui) {
             match config::validate(&settings) {
                 Ok(()) => run_service_toggle(&ui, true, settings),
                 Err(err) => {
-                    switch.set_active(false);
+                    set_autostart_silent(&ui, false);
                     toast(&ui, &err.to_string());
                 }
             }
@@ -1777,50 +2136,96 @@ struct StatusView {
     preview: String,
     net_text: String,
     autostart_enabled: bool,
-    /// 认证客户端进程是否在运行。
+    /// 认证客户端进程是否在运行（Running 才算）。
     client_running: bool,
-    /// 有线路径探测结果：`Some(true)` = 会话保持、网络可用。
-    online: Option<bool>,
-    /// 副行与连接状态用的详情文本（时长 / 会话保持 / 未连接）。
+    /// 官方客户端是否已安装。
+    client_installed: bool,
+    /// 物理载波四态：Up/Down/Missing/Unknown。
+    carrier: netcheck::CarrierState,
+    /// 有线路径探测三态：Reachable/Unreachable/Unknown。
+    probe: netcheck::ProbeOutcome,
+    /// 探测 Unknown 时用于"网卡地址证据"的两个硬条件。
+    has_ipv4: bool,
+    has_default_route: bool,
+    /// 副行用的详情文本（时长 / 会话保持 / 未连接原因 / 未知原因）。
     detail: String,
     active_nic: String,
     banner_show: bool,
     banner_title: String,
     banner_action: BannerAction,
-    wifi_radio_enabled: bool,
+    wifi_radio_enabled: Option<bool>,
     interfaces: Option<Vec<String>>,
     /// run.log 里的最近一次判定（会话内记录为空时回退展示）。
     last_auth_log: Option<(String, bool, String)>,
+    /// 首轮加载尚未拿到真实状态。
+    detecting: bool,
 }
 
 impl StatusView {
     fn loading() -> Self {
         Self {
             pills: vec![
-                ("客户端 加载中…".to_string(), "dot-warn"),
-                ("进程 加载中…".to_string(), "dot-warn"),
-                ("服务 加载中…".to_string(), "dot-warn"),
-                ("网卡 加载中…".to_string(), "dot-warn"),
+                ("客户端 检测中…".to_string(), "dot-busy"),
+                ("进程 检测中…".to_string(), "dot-busy"),
+                ("服务 检测中…".to_string(), "dot-busy"),
+                ("网卡 检测中…".to_string(), "dot-busy"),
             ],
             preview: "暂无日志".to_string(),
-            net_text: "未获取到 IP".to_string(),
+            net_text: "检测中…".to_string(),
             autostart_enabled: false,
             client_running: false,
-            online: None,
-            detail: "未连接".to_string(),
+            client_installed: false,
+            carrier: netcheck::CarrierState::Unknown,
+            probe: netcheck::ProbeOutcome::Unknown,
+            has_ipv4: false,
+            has_default_route: false,
+            detail: "检测中…".to_string(),
             active_nic: String::new(),
             banner_show: false,
             banner_title: String::new(),
             banner_action: BannerAction::None,
-            wifi_radio_enabled: true,
+            wifi_radio_enabled: None,
             interfaces: None,
             last_auth_log: None,
+            detecting: true,
         }
     }
 
-    /// 网络是否可用：客户端在运行，或探测确认有线路径可用（会话保持）。
-    fn connected(&self) -> bool {
-        self.client_running || self.online == Some(true)
+    fn link_state(&self) -> LinkState {
+        classify_link(
+            &self.carrier,
+            &self.probe,
+            self.client_running,
+            self.has_ipv4,
+            self.has_default_route,
+        )
+    }
+
+    fn headline_and_tone(&self) -> (&'static str, StageTone) {
+        if self.detecting {
+            ("检测中…", StageTone::Busy)
+        } else {
+            let link = self.link_state();
+            (link.headline(), link.tone())
+        }
+    }
+
+    fn state_detail(&self) -> String {
+        if self.detecting {
+            "检测中…".to_string()
+        } else {
+            self.link_state().detail_text()
+        }
+    }
+}
+
+fn format_uptime(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{} 分钟", secs / 60)
+    } else {
+        format!("{} 小时 {} 分", secs / 3600, (secs % 3600) / 60)
     }
 }
 
@@ -1838,8 +2243,11 @@ fn refresh_status_polled(ui: &Ui) {
 /// 刷新状态：后台读 system 状态，完成后回主线程更新舞台大状态字、
 /// 状态胶囊、日志预览与自启开关。
 fn refresh_status(ui: &Ui) {
+    let generation = ui.refresh_generation.fetch_add(1, Ordering::SeqCst) + 1;
     let ui_done = ui.clone();
-    ui.refreshing.store(true, Ordering::Relaxed);
+    ui.refreshing.store(true, Ordering::SeqCst);
+    // 刷新期间自启开关明确置灰（而不是保持可点、回调里静默 return）。
+    apply_control_state(ui);
     // 状态读取（journalctl/systemctl/ps/IP 命令）也是阻塞 I/O：放到工作线程，
     // 避免 10 秒轮询在主循环上造成界面卡顿；结果经 futures-channel 异步送回。
     glib::spawn_future_local(async move {
@@ -1851,28 +2259,36 @@ fn refresh_status(ui: &Ui) {
             let nics = system::wired_interfaces();
             let active_nic = nics
                 .iter()
-                .find(|name| system::interface_has_carrier(name))
+                .find(|name| matches!(netcheck::carrier_state(name), netcheck::CarrierState::Up))
                 .cloned()
                 .unwrap_or_else(|| nics.first().cloned().unwrap_or_default());
-            // 有线路径探测（客户端不在运行时才有意义；绑定网卡、绕代理、无 DNS）。
-            // 这是"客户端没在运行但网络其实可用"的唯一可靠信号：官方客户端在
-            // 会话建立后仍可能 SIGSEGV，进程状态说明不了会话是否还在。
-            let client_running = status.client_running;
-            let online = if client_running {
-                None
-            } else {
-                netcheck::wired_path_reachable(&active_nic)
-            };
+            let carrier = netcheck::carrier_state(&active_nic);
+            // 客户端在运行时也要探测，才能区分"运行且可达"与"运行但未确认"；
+            // probe_wired_path 对载波 Down/Missing 会直接短路，不会额外发包。
+            let probe = netcheck::probe_wired_path(&active_nic);
+            let has_ipv4 = !active_nic.is_empty() && system::interface_has_ipv4(&active_nic);
+            let has_default_route =
+                !active_nic.is_empty() && system::interface_has_default_route(&active_nic);
+
+            let client_process = status.client_process;
+            let client_running = matches!(&client_process, system::ClientProcessState::Running);
+            let link = classify_link(
+                &carrier,
+                &probe,
+                client_running,
+                has_ipv4,
+                has_default_route,
+            );
 
             let client = if status.client_installed {
                 ("客户端 已安装".to_string(), "dot-ok")
             } else {
-                ("客户端 未安装".to_string(), "dot-warn")
+                ("客户端 未安装".to_string(), "dot-failed")
             };
-            let proc = if client_running {
-                ("进程 运行中".to_string(), "dot-ok")
-            } else {
-                ("进程 未运行".to_string(), "dot-warn")
+            let proc = match &client_process {
+                system::ClientProcessState::Running => ("进程 运行中".to_string(), "dot-ok"),
+                system::ClientProcessState::NotRunning => ("进程 未运行".to_string(), "dot-off"),
+                system::ClientProcessState::Unknown => ("进程 未知".to_string(), "dot-off"),
             };
             // 服务 pill：按 systemd 实际状态分四态。inactive 是"已启用但当前没在
             // 运行"（ExecCondition 跳过、或已跑完退出），与 failed（停止重试）不同；
@@ -1881,38 +2297,51 @@ fn refresh_status(ui: &Ui) {
                 match status.service_active.as_str() {
                     "active" => ("服务 运行中".to_string(), "dot-ok"),
                     // ExecStartPost 里的 NM 恢复要睡 8 秒，这期间单元是 activating。
-                    "activating" => ("服务 启动中".to_string(), "dot-warn"),
-                    "failed" => ("服务 已停止重试".to_string(), "dot-warn"),
-                    "inactive" => ("服务 待命".to_string(), "dot-ok"),
-                    other => (format!("服务 {other}"), "dot-warn"),
-                }
-            } else {
-                ("服务 未启用".to_string(), "dot-warn")
-            };
-            let nic = nics
-                .iter()
-                .map(|name| {
-                    if system::interface_has_carrier(name) {
-                        format!("{name} 已插线")
-                    } else {
-                        format!("{name} 无网线")
+                    "activating" if status.service_sub == "auto-restart" => {
+                        ("服务 等待重试".to_string(), "dot-warn")
                     }
+                    "activating" => ("服务 启动中".to_string(), "dot-busy"),
+                    "deactivating" => ("服务 停止中".to_string(), "dot-busy"),
+                    "failed" => ("服务 已停止重试".to_string(), "dot-failed"),
+                    "inactive" => ("服务 待命".to_string(), "dot-off"),
+                    "unknown" => ("服务 未知".to_string(), "dot-off"),
+                    other => (format!("服务 {other}"), "dot-off"),
+                }
+            } else if status.service_enabled == "unknown" {
+                ("服务 未知".to_string(), "dot-off")
+            } else if status.service_active == "active" {
+                ("服务 运行中·未设开机".to_string(), "dot-ok")
+            } else {
+                ("服务 未启用".to_string(), "dot-off")
+            };
+
+            let mut any_carrier_up = false;
+            let nic_text = nics
+                .iter()
+                .map(|name| match netcheck::carrier_state(name) {
+                    netcheck::CarrierState::Up => {
+                        any_carrier_up = true;
+                        format!("{name} 已插线")
+                    }
+                    netcheck::CarrierState::Down => format!("{name} 无网线"),
+                    netcheck::CarrierState::Missing => format!("{name} 不存在"),
+                    netcheck::CarrierState::Unknown => format!("{name} 未知"),
                 })
                 .collect::<Vec<_>>()
                 .join(" / ");
-            let nic_pill = if nic.is_empty() {
-                ("网卡 无网卡".to_string(), "dot-warn")
-            } else if nic.contains("已插线") {
+            let nic_pill = if nic_text.is_empty() {
+                ("网卡 无网卡".to_string(), "dot-off")
+            } else if any_carrier_up {
                 ("网卡 已插线".to_string(), "dot-ok")
+            } else if matches!(&carrier, netcheck::CarrierState::Down) {
+                ("网卡 无网线".to_string(), "dot-off")
             } else {
-                ("网卡 无网线".to_string(), "dot-warn")
+                ("网卡 状态未知".to_string(), "dot-off")
             };
 
             // 预览区：优先客户端日志、回退清洗后的 journal 摘要；最多 4 行
             let preview = log_preview(&status.last_log);
 
-            // 连接状态 / 副行（网卡 · 时长）
-            let wifi_radio_enabled = status.wifi_radio_enabled;
             // 网络详情：当前网卡的 IP 与网关（认证成功后"拿到 IP 没"最直观）
             let net_text = if active_nic.is_empty() {
                 "未获取到 IP".to_string()
@@ -1926,26 +2355,29 @@ fn refresh_status(ui: &Ui) {
                     (None, _) => "未获取到 IP".to_string(),
                 }
             };
-            let detail = if let Some(secs) = status.client_uptime_seconds {
-                if secs < 60 {
-                    format!("已连接 {secs}s")
-                } else if secs < 3600 {
-                    format!("已连接 {} 分钟", secs / 60)
-                } else {
-                    format!("已连接 {} 小时 {} 分", secs / 3600, (secs % 3600) / 60)
+            let detail = match (&link, status.client_uptime_seconds) {
+                (LinkState::Connected { evidence }, Some(secs)) => {
+                    format!("{} · {evidence}", format_uptime(secs))
                 }
-            } else if client_running {
-                "已连接".to_string()
-            } else if online == Some(true) {
-                // 客户端不在运行、但会话仍保持：说清楚"网络可用"而不是"未连接"。
-                "会话保持".to_string()
-            } else {
-                "未连接".to_string()
+                (LinkState::Connected { evidence }, None) => evidence.clone(),
+                (LinkState::RunningUnverified, Some(secs)) => {
+                    format!("已运行 {} · 路径待确认", format_uptime(secs))
+                }
+                (LinkState::RunningUnverified, None) => "客户端运行中 · 路径待确认".to_string(),
+                (LinkState::Disconnected { reason }, _) => reason.clone(),
+                (LinkState::Unknown { reason }, _) => reason.clone(),
             };
 
-            // 横幅优先级：客户端迁移 > 服务不安全 > 服务模板过旧 > 服务停止重试。
-            // 只有"客户端迁移/服务停止重试"给按钮；模板迁移按提示开关一次自启即可。
-            let (banner_show, banner_title, banner_action) = if status.client_requires_migration {
+            // 横幅优先级：客户端未安装 > 客户端迁移 > 服务不安全 > 服务模板过旧
+            // > 服务停止重试。未安装时安装是唯一出路，banner 与主按钮都指向安装。
+            let (banner_show, banner_title, banner_action) = if !status.client_installed {
+                (
+                    true,
+                    "未安装官方客户端：请点击「安装客户端」选择官方 ZIP 安装包，安装完成后再连接"
+                        .to_string(),
+                    BannerAction::InstallClient,
+                )
+            } else if status.client_requires_migration {
                 (
                     true,
                     "检测到旧版客户端，请重新安装官方客户端完成安全迁移".to_string(),
@@ -1980,98 +2412,135 @@ fn refresh_status(ui: &Ui) {
                 net_text,
                 autostart_enabled: status.service_enabled == "enabled",
                 client_running,
-                online,
+                client_installed: status.client_installed,
+                carrier,
+                probe,
+                has_ipv4,
+                has_default_route,
                 detail,
                 active_nic,
                 banner_show,
                 banner_title,
                 banner_action,
-                wifi_radio_enabled,
+                wifi_radio_enabled: status.wifi_radio_enabled,
                 // Option：工作线程异常时必须是 None，不能把"没探到网卡"
                 // 当成真实结果去清空用户的下拉框。
                 interfaces: Some(nics),
                 last_auth_log: system::last_auth_from_log(),
+                detecting: false,
             };
             let _ = tx.unbounded_send(view);
         });
-        let view = rx.next().await.unwrap_or_else(StatusView::loading);
+        let maybe_view = rx.next().await;
 
-        // 状态胶囊：圆点 + 值
-        let dot_classes = ["dot-ok", "dot-warn"];
-        for ((dot, value), (text, cls)) in ui_done.pills.iter().zip(view.pills.iter()) {
-            value.set_label(text);
-            for c in dot_classes {
-                dot.remove_css_class(c);
+        // 慢的旧轮询结果直接丢弃：只有 generation 仍匹配才允许写界面，
+        // 决不能让旧结果覆盖刚完成的新状态或清掉新一轮的 refreshing。
+        if ui_done.refresh_generation.load(Ordering::SeqCst) != generation {
+            return;
+        }
+        let view = match maybe_view {
+            Some(view) => view,
+            None if !ui_done.has_status.load(Ordering::SeqCst) => StatusView::loading(),
+            None => {
+                // 已经展示过真实状态：保留上一帧，不把界面打回"检测中"。
+                ui_done.refreshing.store(false, Ordering::SeqCst);
+                apply_control_state(&ui_done);
+                return;
             }
-            dot.add_css_class(cls);
-        }
-        // 大状态字（舞台 + 窄屏状态条）：客户端在运行或探测确认网络可用都算已连接
-        let connected = view.connected();
-        ui_done.set_stage(if connected { "已连接" } else { "未连接" }, connected);
-        // 副行：网卡 · 详情
-        let mut sub = if view.active_nic.is_empty() {
-            view.detail.clone()
-        } else {
-            format!("{} · {}", view.active_nic, view.detail)
         };
-        if !view.wifi_radio_enabled {
-            sub.push_str(" · Wi-Fi 已禁用");
-        }
-        ui_done.stage_sub.set_label(&sub);
-        ui_done.compact_sub.set_label(&sub);
-        ui_done.log_preview.set_label(&view.preview);
-        ui_done.net_info.set_label(&view.net_text);
-        // 连接详情区：账号 / 状态 / 最近认证结果（标签浅色、值深色，状态语义着色）
-        let account = ui_done.username.text();
-        ui_done.detail_account.set_markup(&format!(
-            "<span color='#6E5568'>认证账号</span> <span color='#3E2B3A'>{}</span>",
-            glib::markup_escape_text(&account)
-        ));
-        let (state_text, state_color) = if view.client_running {
-            (view.detail.clone(), "#C14D7C")
-        } else if view.online == Some(true) {
-            ("已连接（会话保持）".to_string(), "#C14D7C")
-        } else {
-            ("未连接".to_string(), "#3E2B3A")
-        };
-        ui_done.detail_state.set_markup(&format!(
-            "<span color='#6E5568'>连接状态</span> <span color='{state_color}'><b>{}</b></span>",
-            glib::markup_escape_text(&state_text)
-        ));
-        let session = ui_done
-            .last_auth
-            .lock()
-            .map(|guard| (*guard).clone())
-            .unwrap_or_else(|poison| poison.into_inner().clone());
-        let (last_text, last_color) = match session.as_ref() {
-            Some(record) => last_auth_text(Some(record)),
-            // 会话内没有记录（应用重启过）时回退到官方日志里的最近一次判定。
-            None => log_auth_text(view.last_auth_log.as_ref()),
-        };
-        ui_done.detail_last.set_markup(&format!(
-            "<span color='#6E5568'>最近认证</span> <span color='{last_color}'><b>{}</b></span>",
-            glib::markup_escape_text(&last_text)
-        ));
-        // 横幅：迁移提示 / 服务失败恢复；按钮动作按当前状态分派
-        *ui_done
-            .banner_action
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner()) = view.banner_action;
-        ui_done.banner.set_title(&view.banner_title);
-        ui_done.banner.set_button_label(match view.banner_action {
-            BannerAction::InstallClient => Some("现在处理"),
-            BannerAction::RestartService => Some("重新尝试"),
-            BannerAction::None => None,
-        });
-        ui_done.banner.set_revealed(view.banner_show);
-        if !ui_done.busy.load(Ordering::Relaxed) {
-            ui_done.autostart.set_active(view.autostart_enabled);
-        }
-        if let Some(names) = view.interfaces {
-            ui_done.sync_interfaces(&names);
-        }
-        ui_done.refreshing.store(false, Ordering::Relaxed);
+        apply_status_view(&ui_done, &view);
+        ui_done.has_status.store(true, Ordering::SeqCst);
+        ui_done.refreshing.store(false, Ordering::SeqCst);
+        apply_control_state(&ui_done);
     });
+}
+
+/// 把一轮状态结果落到控件上。所有文本更新集中在这里，方便保证舞台大字、
+/// 窄屏状态条、胶囊与连接详情始终使用同一份 LinkState。
+fn apply_status_view(ui: &Ui, view: &StatusView) {
+    for ((dot, value), (text, cls)) in ui.pills.iter().zip(view.pills.iter()) {
+        value.set_label(text);
+        for c in ["dot-ok", "dot-busy", "dot-warn", "dot-off", "dot-failed"] {
+            dot.remove_css_class(c);
+        }
+        dot.add_css_class(cls);
+    }
+
+    let (headline, tone) = view.headline_and_tone();
+    if !ui.stage_hold_active() {
+        ui.set_stage(headline, tone);
+    }
+    let mut sub = if view.active_nic.is_empty() {
+        view.detail.clone()
+    } else {
+        format!("{} · {}", view.active_nic, view.detail)
+    };
+    if view.wifi_radio_enabled == Some(false) {
+        sub.push_str(" · Wi-Fi 已禁用");
+    }
+    if view.detecting {
+        ui.stage_sub.set_label("正在检测网络状态…");
+        ui.compact_sub.set_label("正在检测网络状态…");
+    } else {
+        ui.stage_sub.set_label(&sub);
+        ui.compact_sub.set_label(&sub);
+    }
+    ui.log_preview.set_label(&view.preview);
+    ui.net_info.set_label(&view.net_text);
+
+    // 连接详情区：账号 / 状态 / 最近认证结果（值按 LinkState 语义着色）
+    let account = ui.username.text();
+    ui.detail_account.set_markup(&format!(
+        "<span color='#6E5568'>认证账号</span> <span color='#3E2B3A'>{}</span>",
+        glib::markup_escape_text(&account)
+    ));
+    let state_text = view.state_detail();
+    let state_color = if view.detecting {
+        StageTone::Busy.detail_color()
+    } else {
+        view.link_state().tone().detail_color()
+    };
+    ui.detail_state.set_markup(&format!(
+        "<span color='#6E5568'>连接状态</span> <span color='{state_color}'><b>{}</b></span>",
+        glib::markup_escape_text(&state_text)
+    ));
+
+    let session = ui
+        .last_auth
+        .lock()
+        .map(|guard| (*guard).clone())
+        .unwrap_or_else(|poison| poison.into_inner().clone());
+    let (last_text, last_color) = match session.as_ref() {
+        Some(record) => last_auth_text(Some(record)),
+        // 会话内没有记录（应用重启过）时回退到官方日志里的最近一次判定。
+        None => log_auth_text(view.last_auth_log.as_ref()),
+    };
+    ui.detail_last.set_markup(&format!(
+        "<span color='#6E5568'>最近认证</span> <span color='{last_color}'><b>{}</b></span>",
+        glib::markup_escape_text(&last_text)
+    ));
+
+    // 横幅：安装引导 / 迁移提示 / 服务失败恢复；按钮动作按当前状态分派
+    *ui.banner_action
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner()) = view.banner_action;
+    ui.banner.set_title(&view.banner_title);
+    ui.banner.set_button_label(match view.banner_action {
+        BannerAction::InstallClient => Some("安装客户端"),
+        BannerAction::RestartService => Some("重新尝试"),
+        BannerAction::None => None,
+    });
+    ui.banner.set_revealed(view.banner_show);
+
+    let missing = !view.detecting && !view.client_installed;
+    ui.client_missing.store(missing, Ordering::SeqCst);
+    apply_install_affordance(ui, missing);
+    if !ui.busy.load(Ordering::Relaxed) {
+        set_autostart_silent(ui, view.autostart_enabled);
+    }
+    if let Some(names) = &view.interfaces {
+        ui.sync_interfaces(names);
+    }
 }
 
 #[cfg(test)]
@@ -2088,6 +2557,91 @@ mod tests {
     const JOURNAL_LOG: &str = "10月 01 16:49:46 archlinux systemd[1]: Starting RJSchoolClient...\n\
         10月 01 16:49:46 archlinux systemd[1]: Started RJSchoolClient.\n\
         10月 01 16:49:47 archlinux rjsupplicant-helper[151664]: eno1 已可访问外网（认证会话保持），跳过开机认证";
+
+    #[test]
+    fn loading_never_claims_disconnected() {
+        let view = StatusView::loading();
+        assert_eq!(view.headline_and_tone().0, "检测中…");
+        assert_eq!(view.state_detail(), "检测中…");
+        assert!(!view.client_installed);
+    }
+
+    #[test]
+    fn reachable_probe_is_connected_even_without_client() {
+        let state = classify_link(
+            &netcheck::CarrierState::Up,
+            &netcheck::ProbeOutcome::Reachable,
+            false,
+            false,
+            false,
+        );
+        assert!(matches!(state, LinkState::Connected { .. }));
+        assert_eq!(state.headline(), "已连接");
+    }
+
+    #[test]
+    fn carrier_down_is_disconnected_and_beats_probe() {
+        let state = classify_link(
+            &netcheck::CarrierState::Down,
+            &netcheck::ProbeOutcome::Reachable,
+            true,
+            true,
+            true,
+        );
+        assert!(matches!(state, LinkState::Disconnected { .. }));
+        assert_eq!(state.headline(), "未连接");
+    }
+
+    #[test]
+    fn running_client_with_unconfirmed_probe_is_yellow_not_disconnected() {
+        let state = classify_link(
+            &netcheck::CarrierState::Up,
+            &netcheck::ProbeOutcome::Unknown,
+            true,
+            false,
+            false,
+        );
+        assert_eq!(state, LinkState::RunningUnverified);
+        assert_eq!(state.tone(), StageTone::Warn);
+    }
+
+    #[test]
+    fn unknown_probe_without_client_is_neutral_unknown() {
+        let state = classify_link(
+            &netcheck::CarrierState::Unknown,
+            &netcheck::ProbeOutcome::Unknown,
+            false,
+            false,
+            false,
+        );
+        assert!(matches!(state, LinkState::Unknown { .. }));
+        assert_eq!(state.headline(), "状态未知");
+        assert_eq!(state.tone(), StageTone::Off);
+    }
+
+    #[test]
+    fn unknown_probe_with_ipv4_and_default_route_is_connected() {
+        let state = classify_link(
+            &netcheck::CarrierState::Unknown,
+            &netcheck::ProbeOutcome::Unknown,
+            false,
+            true,
+            true,
+        );
+        assert!(matches!(state, LinkState::Connected { .. }));
+    }
+
+    #[test]
+    fn unreachable_probe_without_client_is_disconnected() {
+        let state = classify_link(
+            &netcheck::CarrierState::Up,
+            &netcheck::ProbeOutcome::Unreachable,
+            false,
+            true,
+            true,
+        );
+        assert!(matches!(state, LinkState::Disconnected { .. }));
+    }
 
     #[test]
     fn preview_prefers_client_section_over_journal() {

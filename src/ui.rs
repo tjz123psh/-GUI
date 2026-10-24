@@ -2229,6 +2229,20 @@ fn format_uptime(secs: u64) -> String {
     }
 }
 
+/// 选择状态探测的网卡：优先用户当前选中且仍存在的网卡；其次第一块载波
+/// 已连接的网卡；最后退回列表第一项。选中网卡被拔出/改名时不能继续拿它
+/// 的旧名字去探测，否则会显示一个不存在的接口。
+fn pick_active_nic(selected: &str, nics: &[String]) -> String {
+    if !selected.is_empty() && nics.iter().any(|name| name == selected) {
+        return selected.to_string();
+    }
+    nics.iter()
+        .find(|name| matches!(netcheck::carrier_state(name), netcheck::CarrierState::Up))
+        .cloned()
+        .or_else(|| nics.first().cloned())
+        .unwrap_or_default()
+}
+
 /// 定时轮询专用入口：上一轮还没回来就跳过本次，避免 `journalctl`/`systemctl`
 /// 偶发卡住时 10 秒一次无限累积工作线程与子进程。
 /// 手动刷新和动作完成后的刷新仍直接走 `refresh_status`——那是用户明确意图，
@@ -2244,6 +2258,10 @@ fn refresh_status_polled(ui: &Ui) {
 /// 状态胶囊、日志预览与自启开关。
 fn refresh_status(ui: &Ui) {
     let generation = ui.refresh_generation.fetch_add(1, Ordering::SeqCst) + 1;
+    // 用户选中的网卡就是认证目标，状态探测必须优先用它；多网卡时不能
+    // 因为另一块网卡先被枚举到就报错对象。控件只在主线程读，读到的值
+    // 随闭包进入工作线程。
+    let selected_nic = ui.selected_nic();
     let ui_done = ui.clone();
     ui.refreshing.store(true, Ordering::SeqCst);
     // 刷新期间自启开关明确置灰（而不是保持可点、回调里静默 return）。
@@ -2257,11 +2275,7 @@ fn refresh_status(ui: &Ui) {
             // 每轮重新探测：网卡可能后接/消失（USB 网卡、驱动重载），旧实现把
             // 构建期的快照存进 Ui 后永不更新，新网卡既选不到也看不到状态。
             let nics = system::wired_interfaces();
-            let active_nic = nics
-                .iter()
-                .find(|name| matches!(netcheck::carrier_state(name), netcheck::CarrierState::Up))
-                .cloned()
-                .unwrap_or_else(|| nics.first().cloned().unwrap_or_default());
+            let active_nic = pick_active_nic(&selected_nic, &nics);
             let carrier = netcheck::carrier_state(&active_nic);
             // 客户端在运行时也要探测，才能区分"运行且可达"与"运行但未确认"；
             // probe_wired_path 对载波 Down/Missing 会直接短路，不会额外发包。
@@ -2641,6 +2655,14 @@ mod tests {
             true,
         );
         assert!(matches!(state, LinkState::Disconnected { .. }));
+    }
+
+    #[test]
+    fn prefers_the_selected_nic_when_it_still_exists() {
+        let nics = vec!["enp0s0".to_string(), "eno1".to_string()];
+        assert_eq!(pick_active_nic("eno1", &nics), "eno1");
+        assert_eq!(pick_active_nic("", &nics), pick_active_nic("", &nics));
+        assert_eq!(pick_active_nic("", &[]), "");
     }
 
     #[test]

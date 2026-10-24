@@ -13,7 +13,9 @@
 - **GUI 交互与视觉**：连接开始立即「认证中…」；状态胶囊改 FlowBox（760/940/960 档自动 2×2，不再裁切）；客户端缺失时安装横幅 + 连接/自启禁用；自启开关加 `autostart_syncing` 重入保护，回滚不再反向执行 disable-service；所有动态文本加 ellipsize/宽度约束；大状态字去掉 `max_width_chars` 与 letter-spacing（修复「已连…」截断）；提高玻璃胶囊/标题/表单对比度、统一状态色令牌、补 focus-visible/disabled/hover、headerbar 32px、降低卡片阴影、修正 net-info 对齐；链路图圆头线帽/Success 拖尾/Failed 虚线/局部裁剪光晕；场景 Idle 停帧、图标纹理缓存，降低静态 CPU。
 - **安装/引导脚本**：测试模式路径先 `realpath -m` 再校验，封堵 `/tmp/../etc` 越界；删除对 `$HOME` 可写 wrapper 的 sudo 执行回退（断开失败即中止卸载）；显式 `RJSUPPLICANT_ZIP` 强制 SHA-256 校验（除非显式 `RJSUPPLICANT_ALLOW_UNVERIFIED_ZIP=1`）；root 客户端已装时跳过学校 ZIP 下载；curl 3 次重试 + 超时、git clone/fetch 退避重试；安装时检测 libadwaita 运行时并给出可操作修复（本轮本机即因 `pacman -Rns kate kooha` 连带卸载 libadwaita 导致 GUI 无法启动）。
 
-验证：Rust 97 项测试（35 lib + 50 GUI + 12 helper，另 1 项真机探测 ignored）全过；`clippy --all-targets -D warnings`、`fmt --check`、release 构建、`bash -n`、shellcheck 四脚本、`tests/bootstrap.sh`、`tests/install_uninstall.sh`、desktop/XML 校验、`git diff --check` 全绿；KWin 1920×1080 实机截图复核 640/960/1280 三档（窄列单栏/紧凑舞台+2×2 胶囊/完整舞台），修复「已连…」截断与进程未知。未验证：错误密码的真实英文终局、polkit 取消/保留、真重启开机路径。
+验证：Rust 98 项测试（35 lib + 51 GUI + 12 helper，另 1 项真机探测 ignored）全过；`clippy --all-targets -D warnings`、`fmt --check`、release 构建、`bash -n`、shellcheck 四脚本、`tests/bootstrap.sh`、`tests/install_uninstall.sh`、desktop/XML 校验、`git diff --check` 全绿；KWin 1920×1080 实机截图复核 640/960/1280 三档（窄列单栏/紧凑舞台+2×2 胶囊/完整舞台），修复「已连…」截断与进程未知。未验证：错误密码的真实英文终局、polkit 取消/保留、真重启开机路径。
+
+部署（2026-10-24）：本机由 `pacman -Rns kate kooha` 连带卸载的 `libadwaita` 已恢复（`libadwaita 1:1.10.0-1` + 依赖 `ministream 0.99.1-1`，来自本机 pacman 缓存）；`scripts/install.sh` 重新构建并安装 GUI/helper/policy/nicshim，GUI sha256 `7c417208d2d1d90fa2477505027c8777d1785434351c13dac1fd5a56e7486143`，helper sha256 `1ca8eb2c4caf26dfd9a7c9f0e2aa6245030f00c77fad5884487a6575d901e763`；开机认证服务保持 `enabled + active`，认证客户端 PID 2308 未受影响；部署后 GUI 启动、状态显示「已连接 / 进程运行中 / 服务运行中 / 网卡已插线」、IP 192.168.129.140、最近认证成功。
 
 ## Unreleased - 2026-10-02
 

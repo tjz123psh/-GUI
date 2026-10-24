@@ -478,7 +478,7 @@ xmllint --noout data/io.github.pang.RjSupplicantGui.policy
 git diff --check
 ```
 
-当前 Rust 测试共 97 项（35 lib + 50 GUI + 12 helper，另有 1 项真实探测 ignored），覆盖设置参数校验、新旧认证命令构造、密码标准输入校验、helper 参数拒绝、固定 root service、旧 service 路径拒绝、systemd 参数转义、认证轮询判定优先级（早退优先于日志标记、成功不被"认证失败"字样翻盘）、认证日志偏移前进与截断/坏字节恢复、ZIP 路径/源文件/符号链接校验、权限收紧、客户端安装、wrapper 生成和失败回滚、提权目标 root-owned 闸门、`command_exists` 执行位判定与提权有界等待（超时须终止并回收子进程）；另有 2 个隔离 shell 回归脚本，分别覆盖 curl 引导下载/校验/覆盖保护，以及安装卸载、root-owned 产物、不安全 ZIP、回滚、服务清理、拒绝以 root 执行用户可写 wrapper 和配置保留。
+当前 Rust 测试共 98 项（35 lib + 51 GUI + 12 helper，另有 1 项真实探测 ignored），覆盖设置参数校验、新旧认证命令构造、密码标准输入校验、helper 参数拒绝、固定 root service、旧 service 路径拒绝、systemd 参数转义、认证轮询判定优先级（早退优先于日志标记、成功不被"认证失败"字样翻盘）、认证日志偏移前进与截断/坏字节恢复、ZIP 路径/源文件/符号链接校验、权限收紧、客户端安装、wrapper 生成和失败回滚、提权目标 root-owned 闸门、`command_exists` 执行位判定与提权有界等待（超时须终止并回收子进程）；另有 2 个隔离 shell 回归脚本，分别覆盖 curl 引导下载/校验/覆盖保护，以及安装卸载、root-owned 产物、不安全 ZIP、回滚、服务清理、拒绝以 root 执行用户可写 wrapper 和配置保留。
 
 GitHub Actions 的 `Verify` 工作流使用 `archlinux:latest` 容器执行同一组检查，避免 Ubuntu 较旧的 libadwaita 版本与正式目标不一致。工作流在 push、pull request 和手动触发时运行，并使用 `Cargo.lock` 的锁定依赖。
 

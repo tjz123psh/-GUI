@@ -4,10 +4,10 @@ use rjsupplicant_gui::netcheck;
 use rjsupplicant_gui::privileged::{
     AuthLineKind, AuthOptions, CLIENT_DIR, CLIENT_WRAPPER_PATH, HelperRequest, SERVICE_PATH,
     auth_line_reason, classify_auth_text, client_binary_path, client_log_path,
-    service_content_uses_owned_paths, service_file,
+    service_content_safe_to_stop, service_content_uses_owned_paths, service_file,
 };
 use std::fs;
-use std::io::{IsTerminal, Read, Write};
+use std::io::{BufRead, IsTerminal, Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
@@ -24,7 +24,10 @@ fn main() -> ExitCode {
         Ok(code) => code,
         Err(err) => {
             eprintln!("rjsupplicant-helper: {err:#}");
-            ExitCode::FAILURE
+            // systemd ExecCondition 把 1-254 当作“跳过”。helper 自身错误
+            // （参数、权限、模板校验失败）必须用 255，否则开机认证会被
+            // 静默跳过且单元不算失败、不会重试。
+            ExitCode::from(255)
         }
     }
 }
@@ -215,6 +218,15 @@ fn authenticate(options: &AuthOptions) -> Result<AuthConclusion> {
     if netcheck::carrier_up(&options.nic) == Some(false) {
         anyhow::bail!("{} 没有检测到网线连接，请检查网线后重试", options.nic);
     }
+    // 已有会话时不再启动第二个客户端：服务已 active 的连接再点“连接”会
+    // 出现两个 root 客户端争同一网卡/同一份 run.log，互相把对方结果当本轮。
+    if netcheck::wired_path_reachable(&options.nic) == Some(true) {
+        println!("{} 有线路径已可用，复用现有认证会话", options.nic);
+        return Ok(AuthConclusion::Confirmed);
+    }
+    if service_is_active() {
+        anyhow::bail!("开机认证服务正在运行；请先在应用中点击“断开”，再手动连接");
+    }
     let args = client_arguments(options, true);
     let log_path = client_log_path();
     let mut log_offset = fs::metadata(&log_path).map(|meta| meta.len()).unwrap_or(0);
@@ -387,15 +399,14 @@ fn new_log_tail(path: &Path, offset: &mut u64) -> Option<String> {
         return None;
     }
     file.seek(SeekFrom::Start(*offset)).ok()?;
-    let mut text = String::new();
-    if file.read_to_string(&mut text).is_err() {
-        // 含非法 UTF-8 字节：这段永远解析不出来，同样跳过它，避免每次轮询
-        // 都在同一处失败并返回 None（旧行为会让成败判定永久失效）。
-        *offset = size;
-        return None;
-    }
-    *offset = size;
-    Some(text)
+    let mut bytes = Vec::new();
+    file.take(size - *offset).read_to_end(&mut bytes).ok()?;
+    // 只消费以换行结尾的完整行：客户端可能分多次写入，若把半行
+    // “Succ” 也推进掉，后续 “ess\n” 将永远拼不回 Success。
+    let last_newline = bytes.iter().rposition(|byte| *byte == b'\n')?;
+    let complete = &bytes[..=last_newline];
+    *offset += complete.len() as u64;
+    Some(String::from_utf8_lossy(complete).into_owned())
 }
 
 fn read_auth_password() -> Result<Option<String>> {
@@ -405,7 +416,9 @@ fn read_auth_password() -> Result<Option<String>> {
         eprint!("校园网密码（直接回车复用官方客户端已保存的密码）：");
         std::io::stderr().flush()?;
         let mut input = String::new();
-        let read_result = stdin.read_line(&mut input);
+        // 上限与管道/非终端路径一致，避免粘贴超大内容让 root helper 分配巨量内存。
+        let mut limited = stdin.lock().take((MAX_PASSWORD_BYTES + 2) as u64);
+        let read_result = limited.read_line(&mut input);
         drop(echo_guard);
         eprintln!();
         read_result?;
@@ -419,6 +432,10 @@ fn read_auth_password() -> Result<Option<String>> {
     stdin
         .take((MAX_PASSWORD_BYTES + 1) as u64)
         .read_to_end(&mut input)?;
+    // `echo password | helper` 会把末尾换行一并送来；不剥掉就会拿错密码。
+    while matches!(input.last(), Some(b'\n' | b'\r')) {
+        input.pop();
+    }
     validate_password_input(input)
 }
 
@@ -488,14 +505,26 @@ fn disconnect() -> Result<()> {
 
 fn enable_service(options: &AuthOptions) -> Result<()> {
     ensure_client_installed()?;
-    write_service_file(&service_file(options))?;
+    // 开机单元不带口令，只能依赖官方客户端自己保存的密码；绕过 GUI 直接
+    // 经 polkit 调用 enable-service 时也必须拒绝，否则开机必然认证失败。
+    if !options.save_password {
+        anyhow::bail!("开启开机认证前必须允许官方客户端保存密码（-S 1）");
+    }
+    let content = service_file(options);
+    if !service_content_uses_owned_paths(&content) {
+        anyhow::bail!("内部服务模板校验失败，拒绝写入 systemd 单元");
+    }
+    write_service_file(&content)?;
     run_checked(SYSTEMCTL, &["daemon-reload"], "重新加载 systemd 失败")?;
     run_checked(SYSTEMCTL, &["enable", SERVICE_NAME], "启用开机认证失败")?;
     run_checked(SYSTEMCTL, &["restart", SERVICE_NAME], "启动开机认证失败")
 }
 
 fn disable_service() -> Result<()> {
-    ensure_service_is_safe()?;
+    // disable --now 会执行 ExecStop（固定 wrapper），先确认客户端本体安全，
+    // 防止 wrapper/垫片被替换后借这一次 root 操作执行他人代码。
+    ensure_client_installed()?;
+    ensure_service_can_stop()?;
     run_checked(
         SYSTEMCTL,
         &["disable", "--now", SERVICE_NAME],
@@ -521,6 +550,14 @@ fn client_arguments(options: &AuthOptions, include_password: bool) -> Vec<String
         args.push(password.clone());
     }
     args
+}
+
+fn service_is_active() -> bool {
+    Command::new(SYSTEMCTL)
+        .args(["is-active", "--quiet", SERVICE_NAME])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 fn ensure_client_installed() -> Result<()> {
@@ -551,6 +588,83 @@ fn ensure_service_is_safe() -> Result<()> {
     let content = fs::read_to_string(SERVICE_PATH).context("无法读取 systemd 服务文件")?;
     if !service_content_uses_owned_paths(&content) {
         anyhow::bail!("拒绝执行引用旧用户路径的 systemd 服务，请先重新启用以完成迁移");
+    }
+    ensure_dropins_safe()?;
+    Ok(())
+}
+
+/// 停止/禁用专用校验：允许旧模板（没有 ExecStartPost/ExecCondition），
+/// 但 ExecStart/ExecStop 必须仍指向固定 root-owned wrapper。
+fn ensure_service_can_stop() -> Result<()> {
+    let metadata = fs::symlink_metadata(SERVICE_PATH).context("无法检查 systemd 服务文件")?;
+    if !metadata.file_type().is_file() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+        anyhow::bail!("拒绝操作非 root-owned 或可写的旧 systemd 服务，请先重新启用以完成迁移");
+    }
+    let content = fs::read_to_string(SERVICE_PATH).context("无法读取 systemd 服务文件")?;
+    if !service_content_safe_to_stop(&content) {
+        anyhow::bail!("拒绝执行引用旧用户路径的 systemd 服务，请先重新启用以完成迁移");
+    }
+    ensure_dropins_safe()?;
+    Ok(())
+}
+
+/// drop-in 会覆盖/追加主单元指令，必须与主文件同等校验。当前安装的
+/// 10-no-wait-online.conf 只改 [Unit] 的 Wants/After，属于允许范围。
+fn ensure_dropins_safe() -> Result<()> {
+    const DIRS: [&str; 2] = [
+        "/etc/systemd/system/rjsupplicant.service.d",
+        "/usr/lib/systemd/system/rjsupplicant.service.d",
+    ];
+    const FORBIDDEN_PREFIXES: [&str; 9] = [
+        "Exec",
+        "Environment",
+        "User=",
+        "Group=",
+        "RootDirectory=",
+        "BindPaths=",
+        "StandardOutput=",
+        "StandardError=",
+        "OnFailure=",
+    ];
+    for dir in DIRS {
+        let Ok(entries) = fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("conf") {
+                continue;
+            }
+            let metadata = fs::symlink_metadata(&path)
+                .with_context(|| format!("无法检查 drop-in {}", path.display()))?;
+            if !metadata.file_type().is_file()
+                || metadata.uid() != 0
+                || metadata.mode() & 0o022 != 0
+            {
+                anyhow::bail!(
+                    "拒绝加载非 root-owned 或可写的 systemd drop-in：{}",
+                    path.display()
+                );
+            }
+            let content = fs::read_to_string(&path)
+                .with_context(|| format!("无法读取 drop-in {}", path.display()))?;
+            for line in content.lines() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() || trimmed.starts_with(['#', ';', '[']) {
+                    continue;
+                }
+                if FORBIDDEN_PREFIXES
+                    .iter()
+                    .any(|prefix| trimmed.starts_with(prefix))
+                {
+                    anyhow::bail!(
+                        "systemd drop-in 含不允许的指令：{}（{}）",
+                        trimmed,
+                        path.display()
+                    );
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -744,12 +858,48 @@ mod tests {
             .expect("打开日志追加")
             .write_all("认证成功\n".as_bytes())
             .expect("追加认证成功");
+        let recovered = new_log_tail(&path, &mut offset).expect("坏字节后的正常行应可读");
+        assert!(
+            recovered.contains("认证成功"),
+            "跳过坏字节后应能继续判定：{recovered:?}"
+        );
         assert_eq!(
-            new_log_tail(&path, &mut offset).as_deref(),
-            Some("认证成功\n"),
-            "跳过坏字节后应能继续判定"
+            offset,
+            fs::metadata(&path).expect("读取日志长度").len(),
+            "坏字节 + 完整行应把偏移推进到文件末尾"
         );
 
+        fs::remove_file(&path).expect("清理临时日志");
+    }
+
+    #[test]
+    fn new_log_tail_waits_for_a_complete_line() {
+        use std::io::Write;
+
+        let path = std::env::temp_dir().join(format!(
+            "rjsupplicant-helper-log-partial-{}",
+            std::process::id()
+        ));
+        fs::write(&path, "").expect("创建空日志");
+        let mut offset = 0;
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("打开日志追加")
+            .write_all(b"Succ")
+            .expect("写入半行");
+        assert_eq!(new_log_tail(&path, &mut offset), None, "半行不能消费");
+        assert_eq!(offset, 0, "半行不能推进偏移");
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("打开日志追加")
+            .write_all(b"ess\n")
+            .expect("补全行");
+        assert_eq!(
+            new_log_tail(&path, &mut offset).as_deref(),
+            Some("Success\n")
+        );
         fs::remove_file(&path).expect("清理临时日志");
     }
 

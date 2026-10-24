@@ -6,13 +6,28 @@ pub const CLIENT_DIR: &str = "/usr/lib/rjsupplicant";
 pub const CLIENT_WRAPPER_PATH: &str = "/usr/lib/rjsupplicant-gui/rjsupplicant";
 pub const SERVICE_PATH: &str = "/etc/systemd/system/rjsupplicant.service";
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct AuthOptions {
     pub username: String,
     pub nic: String,
     pub dhcp: bool,
     pub save_password: bool,
     pub password: Option<String>,
+}
+
+/// 手写 Debug：`password` 永远只打印 `<redacted>`，避免任何日志/错误链
+/// 意外把明文口令带入 journal 或 GUI toast。
+impl std::fmt::Debug for AuthOptions {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AuthOptions")
+            .field("username", &self.username)
+            .field("nic", &self.nic)
+            .field("dhcp", &self.dhcp)
+            .field("save_password", &self.save_password)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 /// 官方客户端 run.log 的单行判定结果。
@@ -287,7 +302,7 @@ pub fn service_file(options: &AuthOptions) -> String {
          ExecStartPost=\"{HELPER_PATH}\" restore-network\n\
          Restart=on-failure\n\
          RestartSec=15\n\
-         TimeoutStartSec=30\n\
+         TimeoutStartSec=60\n\
          TimeoutStopSec=15\n\
          WorkingDirectory={workdir}\n\
          \n\
@@ -345,28 +360,28 @@ pub fn service_content_uses_owned_paths(content: &str) -> bool {
         if trimmed.is_empty() || trimmed.starts_with(['#', ';']) || trimmed.starts_with('[') {
             continue;
         }
-        if line.starts_with("Exec") {
-            if line.starts_with(&expected_program)
-                && let Some(nic) = service_start_nic(line)
+        if trimmed.starts_with("Exec") {
+            if trimmed.starts_with(&expected_program)
+                && let Some(nic) = service_start_nic(trimmed)
             {
                 start_count += 1;
                 start_nic = Some(nic);
-            } else if line == expected_stop {
+            } else if trimmed == expected_stop {
                 stop_count += 1;
-            } else if line == expected_post {
+            } else if trimmed == expected_post {
                 post_count += 1;
-            } else if let Some(nic) = service_condition_nic(line) {
+            } else if let Some(nic) = service_condition_nic(trimmed) {
                 condition_count += 1;
                 condition_nic = Some(nic);
             } else {
                 return false;
             }
-        } else if line.starts_with("WorkingDirectory=") {
-            if line != expected_workdir {
+        } else if trimmed.starts_with("WorkingDirectory=") {
+            if trimmed != expected_workdir {
                 return false;
             }
             workdir_count += 1;
-        } else if line.starts_with("Environment") {
+        } else if trimmed.starts_with("Environment") {
             return false;
         } else {
             let key = trimmed.split('=').next().unwrap_or_default().trim();
@@ -382,6 +397,53 @@ pub fn service_content_uses_owned_paths(content: &str) -> bool {
         && workdir_count == 1
         && condition_count <= 1
         && (condition_count == 0 || condition_nic == start_nic)
+}
+
+/// 停止/禁用场景的安全校验：只需要 ExecStop 指向固定 root-owned wrapper，
+/// ExecStart 也必须是固定路径（证明这是本项目生成的单元），但不要求当前模板
+/// 一定带 ExecStartPost/ExecCondition——否则旧模板会陷入"想禁用却被告知先
+/// 重新启用"的迁移死锁。`systemctl disable --now` 实际只会执行 ExecStop。
+pub fn service_content_safe_to_stop(content: &str) -> bool {
+    let expected_start = format!("ExecStart=\"{CLIENT_WRAPPER_PATH}\"");
+    let expected_stop = format!("ExecStop=\"{CLIENT_WRAPPER_PATH}\" -q");
+    let expected_post = format!("ExecStartPost=\"{HELPER_PATH}\" restore-network");
+    let expected_workdir = format!(
+        "WorkingDirectory={}",
+        Path::new(CLIENT_DIR).join(current_arch_dir()).display()
+    );
+    let mut start_count = 0;
+    let mut stop_count = 0;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with(['#', ';']) || trimmed.starts_with('[') {
+            continue;
+        }
+        if trimmed.starts_with("Exec") {
+            if trimmed == expected_stop {
+                stop_count += 1;
+            } else if trimmed.starts_with(&expected_start) && service_start_nic(trimmed).is_some() {
+                start_count += 1;
+            } else if trimmed == expected_post || service_condition_nic(trimmed).is_some() {
+                // 停止不会执行这两类行；只要求它们也引用固定路径。
+            } else {
+                return false;
+            }
+        } else if trimmed.starts_with("WorkingDirectory=") {
+            if trimmed != expected_workdir {
+                return false;
+            }
+        } else if trimmed.starts_with("Environment") {
+            return false;
+        } else {
+            let key = trimmed.split('=').next().unwrap_or_default().trim();
+            if !SAFE_SERVICE_KEYS.contains(&key) {
+                return false;
+            }
+        }
+    }
+
+    start_count == 1 && stop_count == 1
 }
 
 /// 单元模板是否为当前版本（带"已联网/无网线则跳过"的 ExecCondition）。
@@ -490,7 +552,9 @@ fn validate_username(username: &str) -> Result<()> {
 
 fn validate_nic(nic: &str) -> Result<()> {
     if nic.is_empty()
-        || nic.len() > 32
+        || nic.len() >= libc::IFNAMSIZ
+        || nic == "."
+        || nic == ".."
         || !nic
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | ':' | '-'))
@@ -798,6 +862,53 @@ mod tests {
             "",
         );
         assert!(!service_content_uses_owned_paths(&legacy));
+    }
+
+    #[test]
+    fn debug_never_prints_the_password() {
+        let text = format!("{:?}", options());
+        assert!(text.contains("<redacted>"));
+        assert!(!text.contains("secret"));
+    }
+
+    #[test]
+    fn rejects_impossible_interface_names() {
+        for bad in [".", "..", &"a".repeat(16)] {
+            assert!(validate_nic(bad).is_err(), "应拒绝网卡名 {bad:?}");
+        }
+        assert!(validate_nic("eno1").is_ok());
+        assert!(validate_nic("enp4s0.20").is_ok());
+    }
+
+    #[test]
+    fn rejects_exec_directive_hidden_behind_leading_whitespace() {
+        let content = service_file(&options());
+        let injected = content.replace("ExecStop=", " ExecStop=/tmp/evil\nExecStop=");
+        assert!(
+            !service_content_uses_owned_paths(&injected),
+            "前导空格的 ExecStop 不能被当成安全单元"
+        );
+        assert!(!service_content_safe_to_stop(&injected));
+    }
+
+    #[test]
+    fn old_template_without_condition_can_still_be_stopped() {
+        let content = service_file(&options());
+        let legacy = content
+            .lines()
+            .filter(|line| {
+                !line.starts_with("ExecStartPost=") && !line.starts_with("ExecCondition=")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !service_content_uses_owned_paths(&legacy),
+            "缺少 ExecStartPost 的旧模板不应被当成当前模板"
+        );
+        assert!(
+            service_content_safe_to_stop(&legacy),
+            "旧模板仍必须可以安全停止/禁用"
+        );
     }
 
     #[test]

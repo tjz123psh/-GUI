@@ -790,7 +790,14 @@ fn build_window(app: &adw::Application) -> Ui {
         .build();
     autostart_row.add_prefix(&icon_image(ICON_ROUTER, 18));
     autostart_row.add_suffix(&autostart);
-    console.append(&autostart_row);
+    // ActionRow 只能放进 GtkListBox；直接塞进 Box 会触发 libadwaita 的
+    // "placed into GtkBox" 警告，并且行样式/键盘导航不完整。
+    let autostart_list = gtk::ListBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .css_classes(["autostart-list"])
+        .build();
+    autostart_list.append(&autostart_row);
+    console.append(&autostart_list);
 
     // ---- 主要操作按钮行：连接（主）/ 断开（次）----
     let connect = button_with_icon("连接校园网", ICON_CONNECT);
@@ -1268,6 +1275,12 @@ fn load_theme_css() {
     /* ---- 控制台内 ActionRow 文字：玻璃上必须用深紫 ---- */
 
     /* 控制台行压缩：全部行在 820px 高度内完整放下（固定布局，无滚动） */
+    .console .autostart-list {
+        background: transparent;
+        border: none;
+        box-shadow: none;
+        padding: 0;
+    }
     .console row {
         min-height: 26px;
         padding: 1px 8px;

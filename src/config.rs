@@ -1,6 +1,6 @@
 use std::fs;
 #[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 pub const APP_ID: &str = "io.github.pang.RjSupplicantGui";
@@ -25,10 +25,14 @@ impl Default for Settings {
     }
 }
 
+/// 配置文件最大 64 KiB：配置只有四行；同机用户若把路径换成 /dev/zero、
+/// FIFO 或超大文件，O_NONBLOCK + 大小上限能保证 GUI 启动不被拖死/OOM。
+const MAX_SETTINGS_BYTES: u64 = 64 * 1024;
+
 pub fn load() -> Settings {
     let mut settings = Settings::default();
 
-    let Ok(content) = fs::read_to_string(settings_path()) else {
+    let Ok(content) = read_settings_file() else {
         return settings;
     };
 
@@ -51,6 +55,25 @@ pub fn load() -> Settings {
     settings
 }
 
+fn read_settings_file() -> anyhow::Result<String> {
+    use std::io::Read;
+
+    let path = settings_path();
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    let file = options.open(&path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > MAX_SETTINGS_BYTES {
+        anyhow::bail!("设置文件不是普通文件或过大");
+    }
+    let mut content = String::new();
+    file.take(MAX_SETTINGS_BYTES + 1)
+        .read_to_string(&mut content)?;
+    Ok(content)
+}
+
 /// 只认明确字面量。旧写法 `value != "false"` 会把 `0`/`no`/`off`/空值/拼错
 /// 全部读成 true，手改配置文件的人会得到与所见相反的行为。
 fn parse_flag(value: &str, fallback: bool) -> bool {
@@ -69,7 +92,7 @@ pub fn save(settings: &Settings) -> anyhow::Result<()> {
         .parent()
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
-    fs::create_dir_all(&parent)?;
+    ensure_private_config_dir(&parent)?;
 
     let content = format!(
         "username={}\nnic={}\ndhcp={}\nsave_password={}\n",
@@ -80,7 +103,15 @@ pub fn save(settings: &Settings) -> anyhow::Result<()> {
     );
     // 先写临时文件再 rename：原来的 create+truncate 就地改写，进程在两步之间
     // 被杀就留下半截配置，而下一次 load 会静默回落默认值（等于账号丢失）。
-    let temporary = parent.join(format!(".settings.conf.{}.tmp", std::process::id()));
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let temporary = parent.join(format!(
+        ".settings.conf.{}.{}.tmp",
+        std::process::id(),
+        nonce
+    ));
     let result = (|| -> anyhow::Result<()> {
         use std::io::Write;
         let mut options = fs::OpenOptions::new();
@@ -93,6 +124,10 @@ pub fn save(settings: &Settings) -> anyhow::Result<()> {
         #[cfg(unix)]
         fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))?;
         fs::rename(&temporary, &path)?;
+        // rename 的目录项要 fsync 后才保证掉电持久；失败不影响本次保存结果。
+        if let Ok(dir) = fs::File::open(&parent) {
+            let _ = dir.sync_all();
+        }
         Ok(())
     })();
     if result.is_err() {
@@ -128,11 +163,17 @@ pub fn validate(settings: &Settings) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// 只接受绝对路径的 XDG/HOME：相对路径会让配置读写跟随当前目录，
+/// 从不受信任目录启动 GUI 时可被投喂配置或写错位置。
+fn absolute_env_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name)
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+}
+
 pub fn settings_path() -> PathBuf {
-    // 空字符串按“未设置”处理：否则 XDG_CONFIG_HOME="" 会拼出依赖当前目录的
-    // 相对路径，配置可能被写进任意目录。
-    if let Some(config_home) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
-        return PathBuf::from(config_home).join("rjsupplicant-gui/settings.conf");
+    if let Some(config_home) = absolute_env_path("XDG_CONFIG_HOME") {
+        return config_home.join("rjsupplicant-gui/settings.conf");
     }
 
     home_dir().join(".config/rjsupplicant-gui/settings.conf")
@@ -163,18 +204,67 @@ fn bin_dir() -> PathBuf {
 }
 
 fn data_home() -> PathBuf {
-    if let Some(data_home) = std::env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
-        return PathBuf::from(data_home);
+    if let Some(data_home) = absolute_env_path("XDG_DATA_HOME") {
+        return data_home;
     }
 
     home_dir().join(".local/share")
 }
 
 fn home_dir() -> PathBuf {
-    std::env::var_os("HOME")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
+    if let Some(home) = absolute_env_path("HOME") {
+        return home;
+    }
+    // HOME 缺失/相对时不能回退到 "."（会把配置写进当前目录）。用 passwd
+    // 数据库兜底；仍拿不到就返回一个必然写不进去的路径，让错误显式暴露。
+    #[cfg(unix)]
+    unsafe {
+        let entry = libc::getpwuid(libc::getuid());
+        if !entry.is_null() {
+            let dir = (*entry).pw_dir;
+            if !dir.is_null() {
+                let value = std::ffi::CStr::from_ptr(dir).to_string_lossy().into_owned();
+                let path = PathBuf::from(value);
+                if path.is_absolute() {
+                    return path;
+                }
+            }
+        }
+    }
+    PathBuf::from("/nonexistent")
+}
+
+/// 配置目录必须是 0700：settings.conf 自身是 0600，但目录可写时同机用户
+/// 可以 rename/替换整个文件。已存在但过宽的目录直接收紧；收紧失败则让
+/// 保存失败，而不是继续写进不可信目录。
+fn ensure_private_config_dir(path: &Path) -> anyhow::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_dir() {
+                anyhow::bail!("配置目录不是目录：{}", path.display());
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if metadata.uid() != unsafe { libc::geteuid() } {
+                    anyhow::bail!("配置目录不属于当前用户：{}", path.display());
+                }
+                if metadata.mode() & 0o077 != 0 {
+                    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+                }
+            }
+            Ok(())
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            let mut builder = fs::DirBuilder::new();
+            builder.recursive(true);
+            #[cfg(unix)]
+            builder.mode(0o700);
+            builder.create(path)?;
+            Ok(())
+        }
+        Err(err) => Err(err.into()),
+    }
 }
 
 /// 架构目录名以 `privileged::client_arch_dir` 为唯一来源；此前这里按指针宽度

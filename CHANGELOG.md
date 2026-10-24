@@ -15,6 +15,8 @@
 
 验证：Rust 98 项测试（35 lib + 51 GUI + 12 helper，另 1 项真机探测 ignored）全过；`clippy --all-targets -D warnings`、`fmt --check`、release 构建、`bash -n`、shellcheck 四脚本、`tests/bootstrap.sh`、`tests/install_uninstall.sh`、desktop/XML 校验、`git diff --check` 全绿；KWin 1920×1080 实机截图复核 640/960/1280 三档（窄列单栏/紧凑舞台+2×2 胶囊/完整舞台），修复「已连…」截断与进程未知。未验证：错误密码的真实英文终局、polkit 取消/保留、真重启开机路径。
 
+后台审计吸收（同日）：提权目标 `ensure_root_owned_program` 现在逐级校验到 `/` 的父目录（root-owned、组/其他不可写、非符号链接），封堵“检查后替换父目录”的竞态；配置目录强制 0700、`settings.conf` 以 `O_NOFOLLOW|O_NONBLOCK` 打开并限制 64 KiB、临时文件加随机后缀且 rename 后 fsync 父目录、HOME/XDG 只接受绝对路径（缺失时用 passwd 兜底）；客户端安装失败时保留 staging 备份、回滚 rename 失败不再静默吞掉，root 安装目录与 wrapper 只接受 root-owned 不可写目录，wrapper 只加载 root-owned 且组/其他不可写的 `nicshim.so`；`systemd_quote` 补 `$` 与控制字符处理。仍未消除（设计边界，已记录）：helper 接受用户选择的官方 ZIP（无内置哈希白名单）、ZIP 解压大小/条目数无硬上限、ZIP central directory 仍依赖 `unzip` 文本清单校验。
+
 部署（2026-10-24）：本机由 `pacman -Rns kate kooha` 连带卸载的 `libadwaita` 已恢复（`libadwaita 1:1.10.0-1` + 依赖 `ministream 0.99.1-1`，来自本机 pacman 缓存）；`scripts/install.sh` 重新构建并安装 GUI/helper/policy/nicshim，GUI sha256 `fd86a5b80dbedb830ee6f8a9ba8d1e65018af4971e9cb8c98f9cf3d613846b84`，helper sha256 `1ca8eb2c4caf26dfd9a7c9f0e2aa6245030f00c77fad5884487a6575d901e763`；开机认证服务保持 `enabled + active`，认证客户端 PID 2308 未受影响；部署后 GUI 启动、状态显示「已连接 / 进程运行中 / 服务运行中 / 网卡已插线」、IP 192.168.129.140、最近认证成功。
 
 ## Unreleased - 2026-10-02

@@ -23,7 +23,13 @@ pub fn install_official_client(zip_path: &Path, app_dir: &Path, client_path: &Pa
         install_official_client_inner(&staged_archive, &staging, app_dir, client_path)
     })();
 
-    let _ = fs::remove_dir_all(&staging);
+    // 成功才清理 staging；失败时保留旧安装备份（previous-installation）和
+    // 现场，避免“回滚也失败 + 唯一旧副本被删”的双重故障。
+    if result.is_ok() {
+        let _ = fs::remove_dir_all(&staging);
+    } else {
+        eprintln!("客户端安装失败，已保留恢复现场：{}", staging.display());
+    }
     result
 }
 
@@ -34,7 +40,7 @@ pub fn install_official_client(zip_path: &Path, app_dir: &Path, client_path: &Pa
 /// 逻辑。写入复用 `write_wrapper_temp` + `rename` 的原子替换，失败时清理临时
 /// 文件，不留下半写状态。
 pub fn install_wrapper_only(bin_dir: &Path) -> Result<()> {
-    fs::create_dir_all(bin_dir).context("无法创建客户端 wrapper 目录")?;
+    ensure_trusted_install_dir(bin_dir)?;
     let app_dir = Path::new(crate::privileged::CLIENT_DIR);
     let client_path = bin_dir.join("rjsupplicant");
     let wrapper_temp = write_wrapper_temp(bin_dir, &wrapper_script(app_dir, bin_dir))?;
@@ -114,9 +120,9 @@ fn install_official_client_inner(
     make_client_binaries_executable(&extracted)?;
 
     let bin_dir = client_path.parent().context("无法确定用户程序目录")?;
-    fs::create_dir_all(bin_dir).context("无法创建用户程序目录")?;
+    ensure_trusted_install_dir(bin_dir)?;
     let app_parent = app_dir.parent().context("无法确定客户端安装目录")?;
-    fs::create_dir_all(app_parent).context("无法创建客户端安装目录")?;
+    ensure_trusted_install_dir(app_parent)?;
     let wrapper_temp = write_wrapper_temp(bin_dir, &wrapper_script(app_dir, bin_dir))?;
 
     let previous = staging.join("previous-installation");
@@ -126,22 +132,70 @@ fn install_official_client_inner(
         return Err(err).context("无法暂存旧客户端目录");
     }
     if let Err(err) = fs::rename(&extracted, app_dir) {
-        if had_previous {
-            let _ = fs::rename(&previous, app_dir);
-        }
+        let restore = restore_previous(&previous, app_dir, had_previous);
         let _ = fs::remove_file(&wrapper_temp);
-        return Err(err).context("无法安装新的客户端目录");
+        return Err(err).context(format!("无法安装新的客户端目录{restore}"));
     }
 
     if let Err(err) = fs::rename(&wrapper_temp, client_path) {
-        let _ = fs::remove_dir_all(app_dir);
-        if had_previous {
-            let _ = fs::rename(&previous, app_dir);
+        let removed = fs::remove_dir_all(app_dir);
+        if let Err(remove_err) = removed {
+            let _ = fs::remove_file(&wrapper_temp);
+            anyhow::bail!(
+                "无法安装官方客户端 wrapper：{err}；且新客户端目录无法清理：{remove_err}；旧安装备份保留在 {}",
+                previous.display()
+            );
         }
+        let restore = restore_previous(&previous, app_dir, had_previous);
         let _ = fs::remove_file(&wrapper_temp);
-        return Err(err).context("无法安装官方客户端 wrapper");
+        return Err(err).context(format!("无法安装官方客户端 wrapper{restore}"));
     }
 
+    Ok(())
+}
+
+/// 回滚旧客户端目录；恢复失败时明确把备份路径告诉用户，绝不静默吞掉。
+fn restore_previous(previous: &Path, app_dir: &Path, had_previous: bool) -> String {
+    if !had_previous {
+        return String::new();
+    }
+    match fs::rename(previous, app_dir) {
+        Ok(()) => "（已恢复旧客户端）".to_string(),
+        Err(err) => format!(
+            "；旧客户端恢复失败：{err}；备份仍保留在 {}",
+            previous.display()
+        ),
+    }
+}
+
+/// 安装目录（root helper 路径）必须 root-owned、组/其他不可写、非符号链接。
+/// 非 root 运行（单测/开发）时只创建目录，不做属主限制。
+fn ensure_trusted_install_dir(path: &Path) -> Result<()> {
+    let euid = unsafe { libc::geteuid() };
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_dir() {
+                anyhow::bail!("安装路径不是目录：{}", path.display());
+            }
+            if euid == 0 {
+                use std::os::unix::fs::MetadataExt;
+                if metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+                    anyhow::bail!(
+                        "安装目录必须 root-owned 且不可被他人写入：{}",
+                        path.display()
+                    );
+                }
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            let mut builder = fs::DirBuilder::new();
+            builder.recursive(true);
+            #[cfg(unix)]
+            builder.mode(0o755);
+            builder.create(path)?;
+        }
+        Err(err) => return Err(err).context("无法检查客户端安装目录"),
+    }
     Ok(())
 }
 
@@ -303,8 +357,13 @@ fn wrapper_script(app_dir: &Path, bin_dir: &Path) -> String {
          # 官方 2014 客户端在 FlClash/TUN 存在时对 getifaddrs 的 ifa_addr==NULL\n\
          # 条目无空指针检查，必崩；垫片不存在时静默跳过（不影响旧安装）。\n\
          shim={}\n\
-         if [[ -r \"${{shim}}\" ]]; then\n\
-           export LD_PRELOAD=\"${{shim}}\"\n\
+         # 只有 root-owned 且组/其他不可写的垫片才允许 LD_PRELOAD；\n\
+         # 目录被放宽时宁可让旧客户端退回无垫片模式，也不加载他人可写的 .so。\n\
+         if [[ -f \"${{shim}}\" && \"$(/usr/bin/stat -c %u \"${{shim}}\" 2>/dev/null)\" == \"0\" ]]; then\n\
+           shim_mode=$(/usr/bin/stat -c %a \"${{shim}}\" 2>/dev/null || echo 0)\n\
+           if (( (0${{shim_mode}}) & 022 == 0 )); then\n\
+             export LD_PRELOAD=\"${{shim}}\"\n\
+           fi\n\
          fi\n\
          cd \"${{arch_dir}}\"\n\
          export LD_LIBRARY_PATH=\"${{arch_dir}}/lib\"\n\
@@ -482,7 +541,10 @@ mod tests {
         );
 
         assert!(script.contains("shim='/usr/lib/rjsupplicant-gui/nicshim.so'"));
-        assert!(script.contains("if [[ -r \"${shim}\" ]]; then"));
+        // 只有 root-owned 且组/其他不可写的垫片才允许加载。
+        assert!(script.contains("if [[ -f \"${shim}\""));
+        assert!(script.contains("stat -c %u"));
+        assert!(script.contains("& 022 == 0"));
         // 必须覆盖而不是追加 LD_PRELOAD：不能把用户/环境的 preload 带进
         // 以 root 运行的官方客户端进程。
         assert!(script.contains("export LD_PRELOAD=\"${shim}\""));

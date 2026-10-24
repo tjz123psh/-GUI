@@ -464,14 +464,38 @@ pub fn open_live_log() -> Result<()> {
 /// 与 helper 侧 `is_secure_root_executable`、`install.sh` 的同名检查保持一致：
 /// 否则一个能写 `$HOME` 的进程只要替换掉 legacy wrapper，就能借用户的一次授权拿到 root。
 fn ensure_root_owned_program(program: &str) -> Result<()> {
+    let path = Path::new(program);
+    if !path.is_absolute() {
+        anyhow::bail!("拒绝提权执行相对路径程序：{program}");
+    }
+    // 只校验最终文件不够：父目录可写时，攻击者可以在 symlink_metadata 检查
+    // 通过后、pkexec/sudo 真正 execve 前替换文件或目录。逐级校验到 `/`，
+    // 任何一级非 root-owned、组/其他可写或符号链接都拒绝。
+    for ancestor in path.ancestors().skip(1) {
+        let metadata = fs::symlink_metadata(ancestor)
+            .with_context(|| format!("无法检查提权路径的父目录：{}", ancestor.display()))?;
+        if !metadata.file_type().is_dir() || !trusted_root_owner(&metadata) {
+            anyhow::bail!(
+                "拒绝提权执行位于不可信目录下的程序：{}（父目录 {} 非 root-owned 或他人可写）",
+                program,
+                ancestor.display()
+            );
+        }
+    }
     let metadata = fs::symlink_metadata(program)
         .with_context(|| format!("无法检查待提权执行的程序：{program}"))?;
-    if !metadata.file_type().is_file() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+    if !metadata.file_type().is_file() || !trusted_root_owner(&metadata) {
         anyhow::bail!(
             "拒绝提权执行非 root-owned 或他人可写的程序：{program}；请用 scripts/install.sh 安装 root-owned helper 后重试"
         );
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn trusted_root_owner(metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    metadata.uid() == 0 && metadata.mode() & 0o022 == 0
 }
 
 /// 终端回退：kitty/foot/alacritty/xterm 在被执行命令退出后才关闭，因此等待终端
@@ -612,7 +636,9 @@ fn systemd_quote(value: &str) -> String {
     let escaped = value
         .replace('\\', "\\\\")
         .replace('"', "\\\"")
-        .replace('%', "%%");
+        .replace('%', "%%")
+        .replace('$', "$$")
+        .replace(['\n', '\r', '\0'], " ");
     format!("\"{escaped}\"")
 }
 

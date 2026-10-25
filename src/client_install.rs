@@ -361,7 +361,7 @@ fn wrapper_script(app_dir: &Path, bin_dir: &Path) -> String {
          # 目录被放宽时宁可让旧客户端退回无垫片模式，也不加载他人可写的 .so。\n\
          if [[ -f \"${{shim}}\" && \"$(/usr/bin/stat -c %u \"${{shim}}\" 2>/dev/null)\" == \"0\" ]]; then\n\
            shim_mode=$(/usr/bin/stat -c %a \"${{shim}}\" 2>/dev/null || echo 0)\n\
-           if (( (0${{shim_mode}}) & 022 == 0 )); then\n\
+           if (( ((0${{shim_mode}}) & 022) == 0 )); then\n\
              export LD_PRELOAD=\"${{shim}}\"\n\
            fi\n\
          fi\n\
@@ -544,7 +544,7 @@ mod tests {
         // 只有 root-owned 且组/其他不可写的垫片才允许加载。
         assert!(script.contains("if [[ -f \"${shim}\""));
         assert!(script.contains("stat -c %u"));
-        assert!(script.contains("& 022 == 0"));
+        assert!(script.contains("& 022) == 0"));
         // 必须覆盖而不是追加 LD_PRELOAD：不能把用户/环境的 preload 带进
         // 以 root 运行的官方客户端进程。
         assert!(script.contains("export LD_PRELOAD=\"${shim}\""));
@@ -555,6 +555,31 @@ mod tests {
             .find("exec \"${arch_dir}/rjsupplicant\"")
             .expect("定位客户端 exec");
         assert!(shim_pos < exec_pos);
+    }
+
+    #[test]
+    fn wrapper_shim_permission_check_evaluates_correctly_in_bash() {
+        // 真实调用 bash 验证算术表达式优先级（((0${shim_mode}) & 022) == 0）
+        // 确保 root 且非组/其他可写（0755/0750/0700）正常放行，可写（0777/0775/0757）被拦截
+        let eval_mode = |mode: &str| -> bool {
+            let cmd = format!(
+                "shim_mode='{}'\nif (( ((0${{shim_mode}}) & 022) == 0 )); then exit 0; else exit 1; fi",
+                mode
+            );
+            std::process::Command::new("bash")
+                .arg("-c")
+                .arg(cmd)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        assert!(eval_mode("755"));
+        assert!(eval_mode("750"));
+        assert!(eval_mode("700"));
+        assert!(!eval_mode("777"));
+        assert!(!eval_mode("775"));
+        assert!(!eval_mode("757"));
+        assert!(!eval_mode("022"));
     }
 
     #[test]

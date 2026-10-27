@@ -1019,8 +1019,11 @@ fn load_theme_css() {
         outline: none;
     }
 
-    /* ---- 标题栏：全透明浮层，背景图贯穿到窗口顶部；标题做成胶囊徽章 ---- */
-    headerbar {
+    /* ---- 标题栏：全透明浮层，背景图贯穿到窗口顶部；标题做成胶囊徽章 ----
+       注意不能只写 headerbar：libadwaita 的 AdwHeaderBar 真正刷底色的是
+       windowhandle 子节点，漏掉它会被用户主题的 headerbar > windowhandle 补成实色。 */
+    headerbar,
+    headerbar > windowhandle {
         background-color: transparent;
         background-image: none;
         box-shadow: none;
@@ -1517,10 +1520,14 @@ fn load_theme_css() {
     // 告警写到 stderr。这里不静默处理：启动冒烟要求 stderr 为空，任何 CSS 语法
     // 错误都会以 `Gtk-WARNING ... parser error` 立刻暴露出来。
     provider.load_from_string(css);
+    // 本窗口是全自绘皮肤，不跟随系统 GTK 主题：~/.config/gtk-4.0/gtk.css
+    // （Noctalia 主题桥）以 USER(800) 优先级注入，会覆盖 APPLICATION(600)
+    // 的透明 headerbar 与玻璃输入框，把标题栏/entry 涂成 @headerbar_bg_color
+    // （实测 #1a1111），整窗变成"黑标题栏 + 浅色卡片"的割裂样式。
     gtk::style_context_add_provider_for_display(
         &display,
         &provider,
-        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        gtk::STYLE_PROVIDER_PRIORITY_USER + 1,
     );
 }
 

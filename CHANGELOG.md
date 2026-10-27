@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased - 2026-10-27
+
+### GTK 用户主题覆盖修复（niri + Noctalia 主题桥下的黑标题栏 / 深色输入框）
+
+用户反馈 niri 下客户端「GUI 有点难看」。同一二进制切换 `XDG_CONFIG_HOME` 做 A/B 实机对照，确认与 niri 无关：`~/.config/gtk-4.0/gtk.css`（Noctalia GTK4 主题桥）以 `GTK_STYLE_PROVIDER_PRIORITY_USER`（800）注入，压过应用自带 CSS（`APPLICATION`，600）。
+
+- **顶部黑条**：libadwaita 的 `AdwHeaderBar` 实际刷底色的是子节点 `windowhandle`；原规则只把 `headerbar` 设透明，用户主题的 `headerbar > windowhandle { background-color: @headerbar_bg_color }`（#1a1111）仍然生效。修复：透明规则同时覆盖 `headerbar > windowhandle`。
+- **账号/密码输入框变深色**：用户主题的 `entry, spinbutton { background-color: @view_bg_color; color: @view_fg_color; }` 在 800 优先级覆盖应用的 600 优先级 `entry` 规则。修复：应用是全自绘皮肤，provider 提到 `STYLE_PROVIDER_PRIORITY_USER + 1`（801），让皮肤规则优先于用户主题。
+
+验证：`cargo fmt --all --check`、`cargo test --locked`（40 lib + 51 GUI + 13 helper，1 项真机探测 ignored）、`cargo clippy --locked --all-targets -- -D warnings`、`cargo build --locked --release`、`git diff --check` 全绿；niri 1920×1080 实机截图确认标题栏透明、输入框恢复白玻璃样式。GUI 部署到 `~/.local/bin/rjsupplicant-gui`，sha256 `b7394bc5192aea02622ce323e7d69f17c5f7e72a1b2690daadc5e5f37aa4a32e`。
+
 ## Unreleased - 2026-10-24
 
 ### 状态可信度 / 认证判定 / GUI 与安装脚本加固轮（batch 蜂群：4 路只读审计 + 4 个写集互斥 worker + 主代理整合）
